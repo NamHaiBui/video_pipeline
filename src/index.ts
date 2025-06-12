@@ -1,6 +1,6 @@
 import path from 'path';
 import fs from 'fs'
-import { downloadVideoAudioOnlyWithProgress,downloadVideoNoAudioWithProgress, downloadVideoWithProgress, getVideoMetadata } from './lib/ytdlpWrapper.js';
+import { downloadVideoAudioOnlyWithProgress, downloadVideoNoAudioWithProgress, downloadVideoWithProgress, getVideoMetadata, downloadAndMergeVideo } from './lib/ytdlpWrapper.js';
 import { ProgressInfo } from './types.js';
 
 const downloadsDir = path.resolve(process.cwd(), 'downloads');
@@ -33,16 +33,16 @@ async function main(): Promise<void> {
         console.error('Error fetching metadata:', error.message);
     }
 
-    console.log('\n--- 2. Downloading Video With No Audio with Progress ---');
+    console.log('\n--- 2. Downloading Video with Audio Merge ---');
     try {
-        const downloadedFilePath = await downloadVideoNoAudioWithProgress(TEST_VIDEO_URL_2, {
-            outputFilename: '%(title)s [%(id)s].%(ext)s',
+        const downloadedFilePath = await downloadAndMergeVideo(TEST_VIDEO_URL_2, {
+            outputFilename: '%(title)s [%(id)s].mp4',
             onProgress: (progress: ProgressInfo) => {
-                process.stdout.write(`\rDownload Progress: ${progress.percent} | ETA: ${progress.eta} | Speed: ${progress.speed}`);
+                process.stdout.write(`\rDownload Progress: ${progress.percent} | ETA: ${progress.eta} | Speed: ${progress.speed} | ${progress.raw}`);
             }
         });
         process.stdout.write('\n');
-        console.log(`Video download completed! Saved to (approximate): ${downloadedFilePath}`);
+        console.log(`Video download and merge completed! Saved to: ${downloadedFilePath}`);
     } catch (error: any) {
         process.stdout.write('\n');
         console.error('Error downloading video:', error.message);

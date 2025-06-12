@@ -15,13 +15,21 @@ import {
   downloadVideoAudioOnlyWithProgress as downloadAudioNoVideoWithProgress, 
   downloadVideoNoAudioWithProgress, 
   getVideoMetadata,
-  mergeVideoAudio
+  mergeVideoAudio,
+  downloadAndMergeVideo
 } from './lib/ytdlpWrapper.js';
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/urlUtils.js';
+import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './scripts/update_ytdlp.js';
 
 import dotenv from 'dotenv';
 
-dotenv.config();
+// Load environment-specific configuration
+if (process.env.LOCALSTACK === 'true') {
+  console.log('🧪 Loading LocalStack environment configuration...');
+  dotenv.config({ path: '.env.localstack' });
+} else {
+  dotenv.config();
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -51,7 +59,7 @@ app.use('/downloads', express.static(downloadsDir));
 
 /**
  * POST /api/download
- * Starts a new download job for both video-only and audio-only files
+ * Starts a new download job for video with merged audio
  */
 app.post('/api/download', async (req: Request<{}, {}, DownloadRequest>, res: Response<DownloadResponse>) => {
   try {
@@ -318,7 +326,7 @@ async function cleanupTempFiles(files: string[]): Promise<void> {
 }
 
 /**
- * Process download job asynchronously
+ * Process download job asynchronously with video+audio merge
  */
 async function processDownload(jobId: string, url: string): Promise<void> {
   let job = downloadJobs.get(jobId);
@@ -327,16 +335,13 @@ async function processDownload(jobId: string, url: string): Promise<void> {
     return;
   }
 
-  const tempFiles: string[] = [];
-
   try {
     // 1. Fetch Metadata
     job.status = 'downloading_metadata';
-    // Ensure progress object exists
     if (!job.progress) {
         job.progress = {};
     }
-    downloadJobs.set(jobId, { ...job }); // Update status in the map
+    downloadJobs.set(jobId, { ...job });
     console.log(`Job ${jobId}: Status changed to 'downloading_metadata'. Fetching metadata for ${url}`);
 
     let metadata: VideoMetadata;
@@ -349,8 +354,9 @@ async function processDownload(jobId: string, url: string): Promise<void> {
         return;
       }
       job.metadata = metadata;
-      // Status will be changed to 'downloading' next, or 'error' if downloads fail.
-      downloadJobs.set(jobId, { ...job }); // Save metadata
+      downloadJobs.set(jobId, { ...job });
+      
+      // Save metadata to file
       const metadataFilename = `${jobId}_metadata.json`;
       const metadataPath = path.join(downloadsDir, metadataFilename);
       
@@ -358,17 +364,15 @@ async function processDownload(jobId: string, url: string): Promise<void> {
         await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
         console.log(`Job ${jobId}: Metadata saved to ${metadataPath}`);
         
-        // Store metadata file path in job
         if (!job.filePaths) job.filePaths = {};
-        job.filePaths.metadataPath = metadataFilename; // Store relative filename for download access
+        job.filePaths.metadataPath = metadataFilename;
       } catch (writeError: any) {
         console.error(`Job ${jobId}: Failed to save metadata file:`, writeError);
-        // Don't fail the entire job if metadata writing fails, just log it
       }
       console.log(`Job ${jobId}: Metadata fetched successfully.`);
     } catch (metaError: any) {
       console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
-      job = downloadJobs.get(jobId); // Re-fetch job
+      job = downloadJobs.get(jobId);
       if (job) {
         job.status = 'error';
         job.error = `Failed to fetch metadata: ${metaError?.message || String(metaError)}`;
@@ -378,107 +382,95 @@ async function processDownload(jobId: string, url: string): Promise<void> {
       return; 
     }
 
-    // 2. Proceed with File Downloads
+    // 2. Start Video Download with Merge
     job = downloadJobs.get(jobId);
     if (!job || job.status === 'error') { 
-        console.warn(`Job ${jobId} not found or in error state before starting file downloads.`);
+        console.warn(`Job ${jobId} not found or in error state before starting downloads.`);
         return;
     }
     
     job.status = 'downloading';
     if (!job.filePaths) job.filePaths = {};
     if (!job.progress) job.progress = {}; 
-
     downloadJobs.set(jobId, { ...job }); 
-    console.log(`Job ${jobId}: Status changed to 'downloading'. Starting file downloads.`);
+    console.log(`Job ${jobId}: Status changed to 'downloading'. Starting video+audio download and merge.`);
 
-    const updateJobFilepath = (type: 'video' | 'audio', path: string) => {
-        const currentJobState = downloadJobs.get(jobId);
-        if (currentJobState) {
-            if (!currentJobState.filePaths) currentJobState.filePaths = {};
-            if (type === 'video') currentJobState.filePaths.videoPath = path;
-            if (type === 'audio') currentJobState.filePaths.audioPath = path;
+    // Generate output filename using metadata
+    let outputFilename = '%(title)s [%(id)s].mp4';
+    if (metadata) {
+      // Create a safe filename from metadata
+      const safeTitle = metadata.title.replace(/[<>:"/\\|?*]/g, '_').substring(0, 100);
+      outputFilename = `${safeTitle} [${metadata.id}].mp4`;
+    }
+
+    try {
+      // Use the new merged download function
+      const mergedFilePath = await downloadAndMergeVideo(url, {
+        outputDir: downloadsDir,
+        outputFilename: outputFilename,
+        onProgress: (progressInfo: ProgressInfo) => {
+          const currentJobState = downloadJobs.get(jobId);
+          if (currentJobState) {
+            if (!currentJobState.progress) currentJobState.progress = {};
+            
+            // Determine which stage of the process we're in based on the progress message
+            if (progressInfo.raw.startsWith('Video:')) {
+              currentJobState.progress.video = {
+                ...progressInfo,
+                raw: progressInfo.raw.replace('Video: ', '')
+              };
+            } else if (progressInfo.raw.startsWith('Audio:')) {
+              currentJobState.progress.audio = {
+                ...progressInfo,
+                raw: progressInfo.raw.replace('Audio: ', '')
+              };
+            } else if (progressInfo.raw.includes('Merging') || progressInfo.raw.includes('merge')) {
+              currentJobState.status = 'merging';
+              currentJobState.progress.merged = progressInfo;
+            } else {
+              // General progress update
+              currentJobState.progress.merged = progressInfo;
+            }
             downloadJobs.set(jobId, { ...currentJobState });
-            console.log(`Job ${jobId}: ${type} download completed and path set: ${path}`);
+          }
         }
-    };
+      });
 
-    const videoDownloadPromise = downloadVideoNoAudioWithProgress(url, {
-      onProgress: (progressInfo: ProgressInfo) => {
-        const currentJobState = downloadJobs.get(jobId);
-        if (currentJobState) {
-          if (!currentJobState.progress) currentJobState.progress = {};
-          currentJobState.progress.video = progressInfo;
-          downloadJobs.set(jobId, { ...currentJobState });
-        }
+      // Update job with final merged file path
+      const finalJobState = downloadJobs.get(jobId);
+      if (finalJobState) {
+        if (!finalJobState.filePaths) finalJobState.filePaths = {};
+        finalJobState.filePaths.mergedPath = path.basename(mergedFilePath); // Store relative filename
+        finalJobState.status = 'completed';
+        finalJobState.completedAt = new Date();
+        
+        // Final progress update
+        if (!finalJobState.progress) finalJobState.progress = {};
+        finalJobState.progress.merged = {
+          percent: '100%',
+          eta: '0s',
+          speed: '',
+          raw: 'Download and merge completed successfully!'
+        };
+        
+        downloadJobs.set(jobId, { ...finalJobState });
+        
+        console.log(`Job ${jobId}: download and merge completed successfully.`);
+        console.log(`Final merged file: ${mergedFilePath}`);
       }
-    }).then(path => {
-      updateJobFilepath('video', path);
-      return path;
-    });
 
-    const audioDownloadPromise = downloadAudioNoVideoWithProgress(url, { // Using the alias
-      onProgress: (progressInfo: ProgressInfo) => {
-        const currentJobState = downloadJobs.get(jobId);
-        if (currentJobState) {
-          if (!currentJobState.progress) currentJobState.progress = {};
-          currentJobState.progress.audio = progressInfo;
-          downloadJobs.set(jobId, { ...currentJobState });
-        }
+    } catch (downloadError: any) {
+      console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
+      const errorJobState = downloadJobs.get(jobId);
+      if (errorJobState) {
+        errorJobState.status = 'error';
+        errorJobState.error = `Download and merge failed: ${downloadError?.message || String(downloadError)}`;
+        errorJobState.completedAt = new Date();
+        downloadJobs.set(jobId, { ...errorJobState });
       }
-    }).then(path => {
-      updateJobFilepath('audio', path);
-      return path;
-    });
-
-    // Wait for both downloads to complete or fail
-    const results = await Promise.allSettled([videoDownloadPromise, audioDownloadPromise]);
-    
-    const finalJobState = downloadJobs.get(jobId);
-    if (!finalJobState) {
-      console.warn(`Job ${jobId} not found when trying to finalize.`);
-      return;
     }
 
-    let overallSuccess = true;
-    let errorMessages = finalJobState.error ? [finalJobState.error] : [];
-
-    results.forEach((result, index) => {
-      const type = index === 0 ? 'Video' : 'Audio';
-      if (result.status === 'rejected') {
-        overallSuccess = false;
-        const reason = result.reason as Error;
-        console.error(`Job ${jobId}: ${type} download failed in Promise.allSettled: ${reason?.message || String(reason)}`);
-        errorMessages.push(`${type} download failed: ${reason?.message || String(reason)}`);
-      } else {
-        // Ensure file paths are set from fulfilled promises if not already by .then()
-        // This should be redundant if .then() worked, but good for safety.
-        if (index === 0 && !finalJobState.filePaths?.videoPath) {
-            if(!finalJobState.filePaths) finalJobState.filePaths = {};
-            finalJobState.filePaths.videoPath = result.value;
-        }
-        if (index === 1 && !finalJobState.filePaths?.audioPath) {
-            if(!finalJobState.filePaths) finalJobState.filePaths = {};
-            finalJobState.filePaths.audioPath = result.value;
-        }
-      }
-    });
-
-    if (overallSuccess && finalJobState.filePaths?.videoPath && finalJobState.filePaths?.audioPath) {
-      finalJobState.status = 'completed';
-      console.log(`Download job ${jobId} completed successfully.`);
-      console.log(`Video: ${finalJobState.filePaths.videoPath}`);
-      console.log(`Audio: ${finalJobState.filePaths.audioPath}`);
-    } else {
-      finalJobState.status = 'error';
-      finalJobState.error = errorMessages.join('; ');
-      console.error(`Download job ${jobId} finished with errors: ${finalJobState.error}`);
-    }
-    
-    finalJobState.completedAt = new Date();
-    downloadJobs.set(jobId, { ...finalJobState });
-
-  } catch (error: any) { // Catch errors from synchronous parts or unhandled promise rejections
+  } catch (error: any) {
     console.error(`Overall error in processDownload for job ${jobId}:`, error);
     const criticalFailureJob = downloadJobs.get(jobId);
     if (criticalFailureJob) {
@@ -500,6 +492,56 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
+// Manual yt-dlp update endpoint
+app.post('/api/update-ytdlp', async (req: Request, res: Response) => {
+  try {
+    const { nightly = false, force = false } = req.body;
+    const options: UpdateOptions = {
+      useNightly: nightly,
+      forceUpdate: force
+    };
+    
+    console.log(`🔄 Manual yt-dlp update requested via API (${nightly ? 'nightly' : 'stable'}, force: ${force})`);
+    const wasUpdated = await checkAndUpdateYtdlp(options);
+    
+    res.json({
+      success: true,
+      updated: wasUpdated,
+      version: nightly ? 'nightly' : 'stable',
+      message: wasUpdated 
+        ? `yt-dlp has been updated to the latest ${nightly ? 'nightly' : 'stable'} version` 
+        : `yt-dlp is already up to date (${nightly ? 'nightly' : 'stable'})`,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error: any) {
+    console.error('❌ Manual yt-dlp update failed:', error.message);
+    res.status(500).json({
+      success: false,
+      updated: false,
+      message: `Update failed: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Get yt-dlp update status endpoint
+app.get('/api/update-status', (req: Request, res: Response) => {
+  try {
+    const status = getUpdateStatus();
+    res.json({
+      success: true,
+      ...status,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: `Failed to get update status: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // Serve a simple API documentation page
 app.get('/', (req: Request, res: Response) => {
   res.json({
@@ -517,7 +559,9 @@ app.get('/', (req: Request, res: Response) => {
       'Start Download': 'POST /api/download with { "url": "https://youtube.com/watch?v=..." }',
       'Check Status': 'GET /api/job/{jobId}',
       'List All Jobs': 'GET /api/jobs',
-      'Search Videos': 'GET /api/search/{query}?maxResults=10'
+      'Search Videos': 'GET /api/search/{query}?maxResults=10',
+      'Update yt-dlp': 'POST /api/update-ytdlp with { "nightly": true/false, "force": true/false }',
+      'Update Status': 'GET /api/update-status'
     }
   });
 });
@@ -530,12 +574,59 @@ app.use((error: Error, req: Request, res: Response, next: any) => {
   });
 });
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`🚀 YouTube Download Server running on port ${PORT}`);
-  console.log(`📍 API Documentation: http://localhost:${PORT}/`);
-  console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
-  console.log(`📁 Downloads: http://localhost:${PORT}/downloads/`);
-});
+// Startup function with yt-dlp update check and periodic monitoring
+async function startServer(): Promise<void> {
+  console.log('🔧 Performing startup checks...');
+  
+  // Read configuration from environment variables
+  const useNightly = process.env.YTDLP_USE_NIGHTLY === 'true';
+  
+  const updateOptions: UpdateOptions = {
+    useNightly
+  };
+  
+  try {
+    // Check for yt-dlp updates before starting the server
+    console.log(`📦 Checking for yt-dlp updates (${useNightly ? 'nightly' : 'stable'})...`);
+    const wasUpdated = await checkAndUpdateYtdlp(updateOptions);
+    
+    if (wasUpdated) {
+      console.log(`✅ yt-dlp has been updated to the latest ${useNightly ? 'nightly' : 'stable'} version`);
+    } else {
+      console.log(`ℹ️ yt-dlp is already up to date (${useNightly ? 'nightly' : 'stable'}) or update was not needed`);
+    }
+    
+    // Periodic update checks disabled for cloud deployment
+    // Updates will be handled via container orchestration or manual API calls
+    console.log('⏸️ Periodic update checks are disabled for cloud deployment');
+    
+    // Start the server
+    app.listen(PORT, () => {
+      console.log(`🚀 YouTube Download Server running on port ${PORT}`);
+      console.log(`📍 API Documentation: http://localhost:${PORT}/`);
+      console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
+      console.log(`📁 Downloads: http://localhost:${PORT}/downloads/`);
+      console.log(`📦 Update Status: http://localhost:${PORT}/api/update-status`);
+      console.log(`🔄 Manual Update: POST http://localhost:${PORT}/api/update-ytdlp`);
+      console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
+      console.log('✨ Server startup completed successfully');
+    });
+    
+  } catch (error: any) {
+    console.error('❌ Failed to start server:', error.message);
+    console.error('💡 Server will start anyway, but yt-dlp might not be up to date');
+    
+    app.listen(PORT, () => {
+      console.log(`🚀 YouTube Download Server running on port ${PORT} (with warnings)`);
+      console.log(`📍 API Documentation: http://localhost:${PORT}/`);
+      console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
+      console.log(`📁 Downloads: http://localhost:${PORT}/downloads/`);
+      console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
+      console.log('⚠️ Server started with update check failure');
+    });
+  }
+}
+
+startServer();
 
 export default app;

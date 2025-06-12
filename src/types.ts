@@ -57,6 +57,14 @@ export interface DownloadOptions {
   poToken?: string;
   userAgent?: string;
   additionalHeaders?: string[];
+  // AWS S3 upload options
+  s3Upload?: {
+    enabled: boolean;
+    audioKeyPrefix?: string;
+    videoKeyPrefix?: string;
+    metadataKeyPrefix?: string;
+    deleteLocalAfterUpload?: boolean;
+  };
 }
 
 export interface CommandResult {
@@ -67,15 +75,17 @@ export interface CommandResult {
 export interface DownloadJob {
   id: string;
   url: string;
-  status: 'pending' | 'downloading_metadata'| 'downloading' | 'completed' | 'error';
+  status: 'pending' | 'downloading_metadata'| 'downloading' | 'merging' | 'completed' | 'error';
   progress: {
     video?: ProgressInfo;
     audio?: ProgressInfo;
+    merged?: ProgressInfo;
   };
   metadata?: VideoMetadata;
   filePaths?: {
     videoPath?: string;
     audioPath?: string;
+    mergedPath?: string;
     metadataPath?: string;
   };
   error?: string;

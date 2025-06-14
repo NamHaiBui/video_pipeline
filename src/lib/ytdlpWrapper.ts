@@ -5,6 +5,8 @@ import fs from 'fs';
 import { VideoMetadata, ProgressInfo, DownloadOptions, CommandResult } from '../types.js';
 import { S3Service, createS3ServiceFromEnv } from './s3Service.js';
 import { DynamoDBService, createDynamoDBServiceFromEnv } from './dynamoService.js';
+import { isValidYouTubeUrl } from './urlUtils.js';
+import { generateAudioS3Key, generateVideoS3Key, getAudioBucketName, getVideoBucketName } from './s3KeyUtils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,14 +14,40 @@ const __dirname = path.dirname(__filename);
 // --- Paths to Local Binaries ---
 const BIN_DIR = path.resolve(__dirname, '..', '..', 'bin');
 const YTDLP_PATH = path.join(BIN_DIR, 'yt-dlp');
-const FFMPEG_PATH = path.join(BIN_DIR, 'ffmpeg'); 
-// Default output directory for downloads
-const DEFAULT_OUTPUT_DIR = path.resolve(__dirname, '..', '..', 'downloads');
+const FFMPEG_PATH = path.join(BIN_DIR, 'ffmpeg');
 
-// Ensure default output directory exists
-if (!fs.existsSync(DEFAULT_OUTPUT_DIR)) {
-  fs.mkdirSync(DEFAULT_OUTPUT_DIR, { recursive: true });
-}
+// Podcast processing constants
+const PODCAST = {
+  MIN_DURATION_MINUTES: 5,
+  PREFERRED_AUDIO_FORMATS: ['mp3', 'opus', 'aac', 'm4a'],
+  DEFAULT_AUDIO_QUALITY: 'bestaudio[ext=mp3]/bestaudio',
+} as const;
+
+const PODCAST_INDICATORS = {
+  TITLE_KEYWORDS: [
+    'podcast', 'interview', 'talk', 'discussion', 'conversation',
+    'episode', 'show', 'radio', 'chat', 'dialogue'
+  ],
+  DESCRIPTION_KEYWORDS: [
+    'subscribe', 'episode', 'guest', 'host', 'interview',
+    'podcast', 'discussion', 'listen', 'audio'
+  ],
+  CHANNEL_INDICATORS: [
+    'podcast', 'radio', 'interview', 'talk show', 'discussions'
+  ],
+} as const;
+
+// Default output directory for podcast downloads
+const DEFAULT_OUTPUT_DIR = path.resolve(__dirname, '..', '..', 'downloads');
+const PODCAST_OUTPUT_DIR = path.resolve(__dirname, '..', '..', 'downloads', 'podcasts');
+const AUDIO_OUTPUT_DIR = path.resolve(__dirname, '..', '..', 'downloads', 'audio');
+
+// Ensure output directories exist
+[DEFAULT_OUTPUT_DIR, PODCAST_OUTPUT_DIR, AUDIO_OUTPUT_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+});
 
 /**
  * Checks if the required binaries exist and are executable.
@@ -30,6 +58,55 @@ function checkBinaries(): void {
   }
   if (!fs.existsSync(FFMPEG_PATH)) {
     throw new Error(`ffmpeg not found at ${FFMPEG_PATH}. Run 'npm run setup' or 'npm install'.`);
+  }
+}
+
+/**
+ * Check if content appears to be podcast-like based on metadata
+ */
+function isPodcastContent(metadata: VideoMetadata): boolean {
+  const title = (metadata.title || '').toLowerCase();
+  const description = (metadata.description || '').toLowerCase();
+  const uploader = (metadata.uploader || '').toLowerCase();
+  
+  // Check title for podcast indicators
+  const titleMatch = PODCAST_INDICATORS.TITLE_KEYWORDS.some(keyword => 
+    title.includes(keyword.toLowerCase())
+  );
+  
+  // Check description for podcast indicators
+  const descriptionMatch = PODCAST_INDICATORS.DESCRIPTION_KEYWORDS.some(keyword => 
+    description.includes(keyword.toLowerCase())
+  );
+  
+  // Check channel name for podcast indicators
+  const channelMatch = PODCAST_INDICATORS.CHANNEL_INDICATORS.some(keyword => 
+    uploader.includes(keyword.toLowerCase())
+  );
+  
+  // Check duration (podcasts are typically longer)
+  const durationMatch = metadata.duration ? metadata.duration >= (PODCAST.MIN_DURATION_MINUTES * 60) : false;
+  
+  return titleMatch || descriptionMatch || channelMatch || durationMatch;
+}
+
+/**
+ * Get optimal audio format for podcast content
+ */
+function getPodcastAudioFormat(): string {
+  const preferredFormat = process.env.PREFERRED_AUDIO_FORMAT || 'mp3';
+  
+  // Podcast-optimized format selection
+  switch (preferredFormat.toLowerCase()) {
+    case 'opus':
+      return 'bestaudio[ext=opus]/bestaudio[acodec=opus]/bestaudio';
+    case 'aac':
+      return 'bestaudio[ext=aac]/bestaudio[acodec=aac]/bestaudio';
+    case 'm4a':
+      return 'bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio';
+    default:
+      // Default to MP3 for best compatibility
+      return 'bestaudio[ext=mp3]/bestaudio[acodec=mp3]/bestaudio';
   }
 }
 
@@ -224,21 +301,22 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
   }
 }
 
-export function downloadVideoAudioOnlyWithProgress(videoUrl: string, options: DownloadOptions = {}): Promise<string> {
+export function downloadPodcastAudioWithProgress(videoUrl: string, options: DownloadOptions = {}): Promise<string> {
   checkBinaries();
   return new Promise((resolve, reject) => {
-    const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
-    const outputFilenameTemplate = options.outputFilename || '%(title)s [%(id)s].%(ext)s';
-    const format = options.format || 'bestaudio[ext=mp3]/bestaudio';
+    const outputDir = options.outputDir || PODCAST_OUTPUT_DIR;
+    const outputFilenameTemplate = options.outputFilename || '%(uploader)s - %(title)s [%(id)s].%(ext)s';
+    const format = options.format || getPodcastAudioFormat();
     
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
     }
-    const outputPathAndFilename = path.join(outputDir,'audio', outputFilenameTemplate);
+    const outputPathAndFilename = path.join(outputDir, outputFilenameTemplate);
     
     const baseArgs = buildYtdlpArgs(videoUrl, outputPathAndFilename, format, options, ['-x']);
 
-    console.log(`Starting audio download for: ${videoUrl}`);
+    console.log(`Starting podcast audio download for: ${videoUrl}`);
+    console.log(`Using format: ${format}`);
     console.log(`Executing: ${YTDLP_PATH} ${baseArgs.join(' ')}`);
     
     const ytdlpProcess: ChildProcess = spawn(YTDLP_PATH, baseArgs); 
@@ -272,28 +350,50 @@ export function downloadVideoAudioOnlyWithProgress(videoUrl: string, options: Do
                 percent: '100%',
                 eta: '0s',
                 speed: '',
-                raw: 'Download Complete'
+                raw: 'Podcast Audio Download Complete'
             });
             const finalPath = downloadedFilePath || outputPathAndFilename.replace(/%\([\w_]+\)\w/g, '').replace('[]', '').trim();
-            console.log(`Audio download finished successfully (exit code ${code}). Output: ${finalPath}`);
+            console.log(`Podcast audio download finished successfully (exit code ${code}). Output: ${finalPath}`);
             
             // Upload to S3 if enabled
             if (options.s3Upload?.enabled) {
                 try {
                     const s3Service = createS3ServiceFromEnv();
                     if (s3Service) {
-                        console.log('🚀 Uploading audio file to S3...');
-                        const uploadResult = await s3Service.uploadAudioFile(finalPath, options.s3Upload.audioKeyPrefix);
+                        console.log('🚀 Uploading podcast audio to S3...');
+                        
+                        // Get video metadata to create proper slug-based naming
+                        let videoMetadata = null;
+                        try {
+                          videoMetadata = await getVideoMetadata(videoUrl);
+                        } catch (metaError) {
+                          console.warn('Could not fetch metadata for S3 naming, using fallback', metaError);
+                        }
+                        
+                        let audioKey: string;
+                        if (videoMetadata) {
+                          audioKey = generateAudioS3Key(videoMetadata);
+                        } else {
+                          // Fallback naming
+                          const filename = path.basename(finalPath);
+                          audioKey = `podcasts/audio/${filename}`;
+                        }
+                        
+                        const bucketName = getAudioBucketName();
+                        const uploadResult = await s3Service.uploadFile(finalPath, bucketName, audioKey);
                         
                         if (uploadResult.success) {
-                            console.log(`✅ Audio uploaded to S3: ${uploadResult.location}`);
+                            console.log(`✅ Podcast audio uploaded to S3: ${uploadResult.location}`);
                             
-                            // Delete local file if requested
-                            if (options.s3Upload.deleteLocalAfterUpload) {
+                            // Always delete local file after successful S3 upload (ephemeral storage)
+                            try {
                                 await s3Service.deleteLocalFile(finalPath);
+                                console.log(`🗑️ Deleted local audio file after S3 upload: ${path.basename(finalPath)}`);
+                            } catch (deleteError) {
+                                console.warn(`⚠️ Failed to delete local audio file: ${deleteError}`);
                             }
                         } else {
-                            console.error(`❌ Failed to upload audio to S3: ${uploadResult.error}`);
+                            console.error(`❌ Failed to upload podcast audio to S3: ${uploadResult.error}`);
                         }
                     } else {
                         console.warn('⚠️ S3 service not available, skipping upload');
@@ -316,7 +416,7 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
     return new Promise((resolve, reject) => {
         const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
         const outputFilenameTemplate = options.outputFilename || '%(title)s [%(id)s].%(ext)s';
-        const format = options.format || 'bestvideo[ext=mp4]/best[ext=mp4]/best';
+        const format = options.format || 'bestvideo[height<=480][ext=mp4]/best[height<=480][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]/best';
 
         if (!fs.existsSync(outputDir)) {
             fs.mkdirSync(outputDir, { recursive: true });
@@ -376,7 +476,7 @@ export function downloadVideoWithProgress(videoUrl: string, options: DownloadOpt
   return new Promise((resolve, reject) => {
     const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
     const outputFilenameTemplate = options.outputFilename || '%(title)s [%(id)s].%(ext)s';
-    const format = options.format || 'bestvideo+bestaudio/best';
+    const format = options.format || 'bestvideo[height<=480]+bestaudio/best[height<=480]/bestvideo+bestaudio/best';
 
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
@@ -490,7 +590,7 @@ export function mergeVideoAudio(videoPath: string, audioPath: string, outputPath
 /**
  * Download video and audio separately, then merge them into a single file
  */
-export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions = {}): Promise<string> {
+export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions = {}): Promise<any> {
   checkBinaries();
   return new Promise(async (resolve, reject) => {
     const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
@@ -530,7 +630,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         }
       });
 
-      const audioDownloadPromise = downloadVideoAudioOnlyWithProgress(videoUrl, {
+      const audioDownloadPromise = downloadPodcastAudioWithProgress(videoUrl, {
         ...options,
         outputDir: tempDir,
         outputFilename: `audio_${Date.now()}_${outputFilenameTemplate.replace('.%(ext)s', '.%(ext)s')}`,
@@ -544,16 +644,90 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         }
       });
 
-      // Wait for both downloads to complete
-      console.log('Waiting for both video and audio downloads to complete...');
-      const [videoPath, audioPath] = await Promise.all([videoDownloadPromise, audioDownloadPromise]);
+      // Don't wait for both - handle them separately so we can process audio immediately
+      console.log('Processing audio and video downloads separately...');
       
-      tempVideoPath = videoPath;
-      tempAudioPath = audioPath;
-
-      console.log('Both downloads completed successfully!');
+      // Handle audio download separately to upload immediately when it's done
+      let uploadedAudioInfo = null;
+      const audioPromise = audioDownloadPromise.then(async (audioPath: string) => {
+        tempAudioPath = audioPath;
+        console.log(`Audio download completed successfully: ${audioPath}`);
+        
+        // Upload audio to S3 immediately if S3 is enabled
+        if (options.onProgress) {
+          options.onProgress({
+            percent: '100%',
+            eta: '0s',
+            speed: '',
+            raw: `Audio: Download completed, uploading to S3...`
+          });
+        }
+        
+        try {
+          const s3Service = createS3ServiceFromEnv();
+          if (s3Service && isValidYouTubeUrl(videoUrl)) {
+            // Get video metadata to create proper slug-based naming
+            let videoMetadata = null;
+            try {
+              videoMetadata = await getVideoMetadata(videoUrl);
+            } catch (metaError) {
+              console.warn('Could not fetch metadata for S3 naming, using fallback', metaError);
+            }
+            
+            let s3AudioKey: string;
+            if (videoMetadata) {
+              s3AudioKey = generateAudioS3Key(videoMetadata);
+            } else {
+              // Fallback to video ID if metadata unavailable
+              const videoId = new URL(videoUrl).searchParams.get('v');
+              s3AudioKey = videoId ? `audio/${videoId}.mp3` : `audio/audio_${Date.now()}.mp3`;
+            }
+            
+            console.log(`Immediately uploading audio file to S3: ${s3AudioKey}`);
+            const bucketName = getAudioBucketName();
+            const uploadResult = await s3Service.uploadFile(audioPath, bucketName, s3AudioKey);
+            
+            if (uploadResult.success) {
+              console.log(`✅ Audio immediately uploaded to S3: ${uploadResult.location}`);
+              uploadedAudioInfo = {
+                bucket: uploadResult.bucket,
+                key: uploadResult.key,
+                location: uploadResult.location
+              };
+              
+              if (options.onProgress) {
+                options.onProgress({
+                  percent: '100%',
+                  eta: '0s',
+                  speed: '',
+                  raw: `Audio: Upload to S3 completed!`
+                });
+              }
+            } else {
+              console.error(`❌ Failed to upload audio to S3: ${uploadResult.error}`);
+            }
+          }
+        } catch (error: any) {
+          console.error(`❌ Error uploading audio to S3: ${error.message}`);
+        }
+        
+        return audioPath;
+      });
+      
+      // Wait for video download
+      tempVideoPath = await videoDownloadPromise;
+      console.log(`Video download completed successfully: ${tempVideoPath}`);
+      
+      // Wait for audio processing to complete before proceeding
+      await audioPromise;
+      
+      console.log('Both downloads processed successfully!');
       console.log(`Video: ${tempVideoPath}`);
       console.log(`Audio: ${tempAudioPath}`);
+      
+      // Store the audio path and upload info for later use
+      const audioOnlyPath = tempAudioPath;
+      const audioS3Info = uploadedAudioInfo;
 
       // Generate final merged file path
       finalMergedPath = path.join(outputDir, outputFilenameTemplate.replace('%(ext)s', 'mp4'));
@@ -580,13 +754,12 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       // Merge video and audio with validation
       await mergeVideoAudioWithValidation(tempVideoPath, tempAudioPath, finalMergedPath, options);
 
-      console.log('Cleaning up temporary files...');
-      // Clean up temp files
+      console.log('Cleaning up temporary video file...');
+      // Clean up temp video file only, keep audio file for later use
       try {
         if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
-        if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
       } catch (cleanupError) {
-        console.warn('Warning: Failed to clean up temporary files:', cleanupError);
+        console.warn('Warning: Failed to clean up temporary video file:', cleanupError);
       }
 
       if (options.onProgress) {
@@ -598,7 +771,17 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         });
       }
 
-      console.log(`Video download and merge completed successfully: ${finalMergedPath}`);
+      // Create a result object that includes the merged path and audio information
+      const resultObj = {
+        mergedPath: finalMergedPath,
+        audioPath: audioOnlyPath,
+        audioS3Info: audioS3Info
+      };
+      
+      // Return the result object instead of just the string
+
+      console.log(`Video download and merge completed successfully: ${resultObj.mergedPath}`);
+      console.log(`Audio downloaded to: ${resultObj.audioPath}`);
       
       // Upload to S3 if enabled
       if (options.s3Upload?.enabled) {
@@ -606,14 +789,37 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
           const s3Service = createS3ServiceFromEnv();
           if (s3Service) {
             console.log('🚀 Uploading merged video file to S3...');
-            const uploadResult = await s3Service.uploadVideoFile(finalMergedPath, options.s3Upload.videoKeyPrefix);
+            
+            // Get video metadata to create proper slug-based naming
+            let videoMetadata = null;
+            try {
+              videoMetadata = await getVideoMetadata(videoUrl);
+            } catch (metaError) {
+              console.warn('Could not fetch metadata for S3 naming, using fallback', metaError);
+            }
+            
+            let videoKey: string;
+            if (videoMetadata) {
+              const videoExtension = path.extname(finalMergedPath);
+              videoKey = generateVideoS3Key(videoMetadata, videoExtension);
+            } else {
+              // Fallback naming
+              const filename = path.basename(finalMergedPath);
+              videoKey = `video/${filename}`;
+            }
+            
+            const bucketName = getVideoBucketName();
+            const uploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
             
             if (uploadResult.success) {
               console.log(`✅ Video uploaded to S3: ${uploadResult.location}`);
               
-              // Delete local file if requested
-              if (options.s3Upload.deleteLocalAfterUpload) {
+              // Always delete local file after successful S3 upload (ephemeral storage)
+              try {
                 await s3Service.deleteLocalFile(finalMergedPath);
+                console.log(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
+              } catch (deleteError) {
+                console.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
               }
             } else {
               console.error(`❌ Failed to upload video to S3: ${uploadResult.error}`);
@@ -626,7 +832,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         }
       }
       
-      resolve(finalMergedPath);
+      resolve(resultObj);
 
     } catch (error: any) {
       console.error(`Error during download and merge process: ${error.message}`);

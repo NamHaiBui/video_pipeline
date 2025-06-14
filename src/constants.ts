@@ -1,6 +1,6 @@
 /**
- * Application Constants
- * Centralized location for all application constants
+ * Podcast Pipeline Constants
+ * Centralized location for all podcast processing constants
  */
 
 // =============================================================================
@@ -10,6 +10,7 @@
 export const SERVER = {
   DEFAULT_PORT: 3000,
   DEFAULT_HOST: 'localhost',
+  SERVICE_NAME: 'podcast-pipeline',
 } as const;
 
 // =============================================================================
@@ -17,55 +18,83 @@ export const SERVER = {
 // =============================================================================
 
 export const DIRECTORIES = {
-  VIDEO_INPUT: './input',
-  VIDEO_OUTPUT: './output',
+  PODCAST_INPUT: './input/podcasts',
+  PODCAST_OUTPUT: './output/podcasts',
+  AUDIO_OUTPUT: './output/audio',
   TEMP: './temp',
   DOWNLOADS: './downloads',
+  TRANSCRIPTS: './output/transcripts',
+  METADATA: './output/metadata',
 } as const;
 
 // =============================================================================
-// VIDEO PROCESSING
+// PODCAST PROCESSING
 // =============================================================================
 
-export const VIDEO = {
-  DEFAULT_QUALITY: '720p',
-  SUPPORTED_FORMATS: ['mp4', 'avi', 'mov', 'mkv'],
+export const PODCAST = {
+  // Audio quality settings optimized for speech
+  DEFAULT_AUDIO_QUALITY: 'bestaudio[ext=mp3]/bestaudio',
+  PREFERRED_AUDIO_FORMATS: ['mp3', 'opus', 'aac', 'm4a'],
+  
+  // Video formats (kept minimal, mainly for backup/reference)
+  SUPPORTED_VIDEO_FORMATS: ['mp4', 'webm'],
+  
+  // Processing preferences
+  PRIORITIZE_AUDIO: true,
   DEFAULT_YT_DLP_PATH: 'yt-dlp',
+  
+  // Content filtering for podcasts
+  MIN_DURATION_MINUTES: 5, // Skip very short videos
+  MAX_DURATION_HOURS: 10,  // Skip extremely long videos
+  
+  // Podcast-specific metadata
+  DEFAULT_GENRE: 'Podcast',
+  CONTENT_CATEGORIES: [
+    'interview',
+    'discussion', 
+    'educational',
+    'news',
+    'entertainment',
+    'technology',
+    'business',
+    'health',
+    'science',
+  ],
 } as const;
 
 // =============================================================================
-// RATE LIMITING
+// RATE LIMITING (Podcast-focused)
 // =============================================================================
 
 export const RATE_LIMIT = {
-  // Download rate limiting
-  DOWNLOAD_WINDOW_MS: 900000, // 15 minutes
-  MAX_DOWNLOADS_PER_WINDOW: 5,
-  RETRY_AFTER_MESSAGE: '15 minutes',
+  // Podcast download rate limiting (more conservative for longer content)
+  DOWNLOAD_WINDOW_MS: 1800000, // 30 minutes (longer window for podcast processing)
+  MAX_DOWNLOADS_PER_WINDOW: 3,  // Fewer concurrent downloads for longer content
+  RETRY_AFTER_MESSAGE: '30 minutes',
   
   // General API rate limiting
   GENERAL_WINDOW_MS: 60 * 1000, // 1 minute
-  GENERAL_MAX_REQUESTS: 100,
+  GENERAL_MAX_REQUESTS: 50,     // Reduced for podcast processing
   
-  // Progressive slowdown
-  SLOWDOWN_DELAY_AFTER: 2,
-  SLOWDOWN_DELAY_MS: 500,
+  // Progressive slowdown for podcast processing
+  SLOWDOWN_DELAY_AFTER: 1,      // Slower after first download
+  SLOWDOWN_DELAY_MS: 1000,      // 1 second delay
 } as const;
 
 // =============================================================================
-// RETRY CONFIGURATION
+// RETRY CONFIGURATION (Podcast-specific)
 // =============================================================================
 
 export const RETRY = {
   MAX_RETRIES: 3,
-  BACKOFF_MS: 1000,
+  BACKOFF_MS: 2000,             // Longer backoff for podcast content
   BACKOFF_MULTIPLIER: 2,
-  MAX_BACKOFF_MS: 30000,
-  MAX_DOWNLOAD_RETRIES: 3,
+  MAX_BACKOFF_MS: 60000,        // 1 minute max backoff
+  MAX_DOWNLOAD_RETRIES: 2,      // Fewer retries for long content
 } as const;
 
 // =============================================================================
-// RETRYABLE ERROR PATTERNS
+// RETRYABLE ERROR PATTERNS (Podcast-focused)
 // =============================================================================
 
 export const RETRYABLE_ERRORS = [
@@ -78,7 +107,49 @@ export const RETRYABLE_ERRORS = [
   'HTTP Error 503',
   'HTTP Error 502',
   'temporary failure',
+  'Sign in to confirm your age',    // Common for podcast/long-form content
+  'Video unavailable',
+  'This video is not available',
 ] as const;
+
+// =============================================================================
+// PODCAST CONTENT DETECTION
+// =============================================================================
+
+export const PODCAST_INDICATORS = {
+  TITLE_KEYWORDS: [
+    'podcast',
+    'interview',
+    'talk',
+    'discussion',
+    'conversation',
+    'episode',
+    'show',
+    'radio',
+    'chat',
+    'dialogue',
+  ],
+  
+  DESCRIPTION_KEYWORDS: [
+    'subscribe',
+    'episode',
+    'guest',
+    'host',
+    'interview',
+    'podcast',
+    'discussion',
+    'listen',
+    'audio',
+  ],
+  
+  CHANNEL_INDICATORS: [
+    'podcast',
+    'radio',
+    'interview',
+    'talk show',
+    'discussions',
+  ],
+} as const;
 
 // =============================================================================
 // LOGGING
@@ -86,12 +157,12 @@ export const RETRYABLE_ERRORS = [
 
 export const LOGGING = {
   DEFAULT_LEVEL: 'info',
-  SERVICE_NAME: 'video-pipeline',
+  SERVICE_NAME: 'podcast-pipeline',
   DEFAULT_ENVIRONMENT: 'development',
   
   // CloudWatch
-  DEFAULT_LOG_GROUP: 'video-pipeline-logs',
-  DEFAULT_LOG_STREAM: 'app-stream',
+  DEFAULT_LOG_GROUP: 'podcast-pipeline-logs',
+  DEFAULT_LOG_STREAM: 'podcast-processor',
   DEFAULT_AWS_REGION: 'us-east-1',
 } as const;
 
@@ -108,20 +179,26 @@ export const METRICS = {
     KILOBYTES: 'Kilobytes',
     MEGABYTES: 'Megabytes',
     GIGABYTES: 'Gigabytes',
+    MINUTES: 'Minutes',
+    HOURS: 'Hours',
   },
   
   NAMES: {
-    JOB_STARTED: 'JobStarted',
-    JOB_COMPLETED: 'JobCompleted',
-    JOB_FAILED: 'JobFailed',
-    JOB_RETRIED: 'JobRetried',
-    JOB_DURATION: 'JobDuration',
-    DOWNLOAD_STARTED: 'DownloadStarted',
-    DOWNLOAD_COMPLETED: 'DownloadCompleted',
-    DOWNLOAD_SIZE: 'DownloadSize',
-    ACTIVE_JOBS: 'ActiveJobs',
+    PODCAST_STARTED: 'PodcastProcessingStarted',
+    PODCAST_COMPLETED: 'PodcastProcessingCompleted',
+    PODCAST_FAILED: 'PodcastProcessingFailed',
+    PODCAST_RETRIED: 'PodcastProcessingRetried',
+    PODCAST_DURATION: 'PodcastProcessingDuration',
+    AUDIO_EXTRACTION_STARTED: 'AudioExtractionStarted',
+    AUDIO_EXTRACTION_COMPLETED: 'AudioExtractionCompleted',
+    AUDIO_SIZE: 'AudioFileSize',
+    TRANSCRIPTION_STARTED: 'TranscriptionStarted',
+    TRANSCRIPTION_COMPLETED: 'TranscriptionCompleted',
+    ACTIVE_PODCAST_JOBS: 'ActivePodcastJobs',
     API_REQUEST: 'ApiRequest',
     RATE_LIMIT_HIT: 'RateLimitHit',
+    CONTENT_DURATION: 'ContentDuration',
+    PODCAST_EPISODES_PROCESSED: 'PodcastEpisodesProcessed',
   },
 } as const;
 
@@ -148,8 +225,9 @@ export const HTTP_STATUS = {
 // =============================================================================
 
 export const DOWNLOAD_TYPES = {
-  VIDEO: 'video',
   AUDIO: 'audio',
+  VIDEO: 'video', // Kept for backward compatibility
+  PODCAST: 'podcast',
 } as const;
 
 // =============================================================================
@@ -255,10 +333,11 @@ export const ERROR_MESSAGES = {
 // =============================================================================
 
 export const SUCCESS_MESSAGES = {
-  DOWNLOAD_STARTED: 'Download started successfully',
-  DOWNLOAD_COMPLETED: 'Download completed successfully',
-  JOB_CREATED: 'Job created successfully',
+  PODCAST_PROCESSING_STARTED: 'Podcast processing started successfully',
+  AUDIO_EXTRACTION_COMPLETED: 'Audio extraction completed successfully',
+  PODCAST_EPISODE_CREATED: 'Podcast episode created successfully',
   METADATA_FETCHED: 'Video metadata fetched successfully',
+  TRANSCRIPTION_STARTED: 'Transcription started successfully',
 } as const;
 
 // =============================================================================
@@ -276,15 +355,6 @@ export const BINARY_PATHS = {
 // =============================================================================
 
 export const FILE_EXTENSIONS = {
-  VIDEO: {
-    MP4: '.mp4',
-    AVI: '.avi',
-    MOV: '.mov',
-    MKV: '.mkv',
-    WEBM: '.webm',
-    FLV: '.flv',
-    WMV: '.wmv',
-  },
   AUDIO: {
     MP3: '.mp3',
     WAV: '.wav',
@@ -292,19 +362,56 @@ export const FILE_EXTENSIONS = {
     AAC: '.aac',
     OGG: '.ogg',
     M4A: '.m4a',
+    OPUS: '.opus',
+    WEBM: '.webm', // Audio webm
   },
+  VIDEO: {
+    MP4: '.mp4',
+    WEBM: '.webm',
+    MKV: '.mkv',
+  },
+  TRANSCRIPTS: {
+    TXT: '.txt',
+    SRT: '.srt',
+    VTT: '.vtt',
+    JSON: '.json',
+  },
+  METADATA: {
+    JSON: '.json',
+    XML: '.xml',
+  },
+} as const;
+
+// =============================================================================
+// PODCAST-SPECIFIC ENVIRONMENT VARIABLES
+// =============================================================================
+
+export const PODCAST_ENV_VARS = {
+  // Podcast processing
+  PODCAST_CONVERSION_ENABLED: 'PODCAST_CONVERSION_ENABLED',
+  PODCAST_TOPIC_KEYWORDS: 'PODCAST_TOPIC_KEYWORDS',
+  PODCAST_PERSON_KEYWORDS: 'PODCAST_PERSON_KEYWORDS',
+  PODCAST_AI_ANALYSIS_ENABLED: 'PODCAST_AI_ANALYSIS_ENABLED',
+  
+  // Audio processing
+  PREFERRED_AUDIO_FORMAT: 'PREFERRED_AUDIO_FORMAT',
+  AUDIO_QUALITY: 'AUDIO_QUALITY',
+  
+  // Transcription
+  TRANSCRIPTION_ENABLED: 'TRANSCRIPTION_ENABLED',
+  TRANSCRIPTION_SERVICE: 'TRANSCRIPTION_SERVICE',
+  
+  // Content filtering
+  MIN_PODCAST_DURATION: 'MIN_PODCAST_DURATION',
+  MAX_PODCAST_DURATION: 'MAX_PODCAST_DURATION',
 } as const;
 
 // =============================================================================
 // EXPORT TYPES
 // =============================================================================
 
-export type VideoFormat = typeof VIDEO.SUPPORTED_FORMATS[number];
+export type PodcastFormat = typeof PODCAST.PREFERRED_AUDIO_FORMATS[number];
 export type DownloadType = typeof DOWNLOAD_TYPES[keyof typeof DOWNLOAD_TYPES];
 export type MetricUnit = typeof METRICS.UNITS[keyof typeof METRICS.UNITS];
 export type RetryableError = typeof RETRYABLE_ERRORS[number];
-
-
-export const AWS_DATABASE = {
-    
-}
+export type PodcastCategory = typeof PODCAST.CONTENT_CATEGORIES[number];

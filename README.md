@@ -1,14 +1,18 @@
-# Video Pipeline - TypeScript
+# Podcast Processing Pipeline - TypeScript
 
-A portable Node.js application that wraps yt-dlp and ffmpeg for video downloading and processing, now fully converted to TypeScript.
+A comprehensive podcast processing pipeline built with TypeScript and Node.js that converts YouTube videos into podcast episodes with automatic audio extraction, metadata processing, and cloud storage integration.
 
 ## Features
 
-- **TypeScript**: Full type safety and better development experience
-- **Video Metadata Extraction**: Get detailed information about videos
-- **Progressive Downloads**: Download videos with real-time progress tracking
-- **Portable Binaries**: Automatically downloads and manages yt-dlp and ffmpeg binaries
-- **Type Definitions**: Complete type definitions for all video metadata and API responses
+- 🎙️ **YouTube to Podcast Conversion**: Automatically process YouTube videos as podcast episodes
+- 🎧 **High-Quality Audio Extraction**: Extract podcast-optimized audio in MP3, AAC, or Opus formats
+- ☁️ **AWS Cloud Integration**: Upload to S3 buckets with organized folder structure
+- 🗄️ **DynamoDB Storage**: Store podcast episode metadata and processing status
+- 📊 **Real-time Progress Tracking**: Monitor processing jobs with detailed progress updates
+- 🔍 **Content Analysis**: AI-powered content categorization and guest detection
+- 📋 **Podcast Metadata**: Automatic generation of podcast-standard metadata
+- 🌊 **SQS Queue Processing**: Scalable job processing with AWS SQS integration
+- 🧪 **LocalStack Support**: Full local development environment with AWS emulation
 
 ## Installation
 
@@ -31,6 +35,37 @@ npm run dev
 ```bash
 npm start
 ```
+
+### LocalStack Testing (AWS S3 Simulation)
+
+```bash
+# Quick start with LocalStack
+npm run test:localstack
+
+# Or step-by-step:
+npm run localstack:init    # Start LocalStack and create S3 buckets
+npm run localstack:test    # Test S3 connectivity
+npm run server:localstack  # Start server with LocalStack config
+```
+
+See [LOCALSTACK-TESTING.md](LOCALSTACK-TESTING.md) for detailed LocalStack setup and testing instructions.
+
+### SQS Integration
+
+The server includes integrated SQS polling that automatically processes jobs from an AWS SQS queue:
+
+```bash
+# Start the server with SQS polling enabled (enabled by default in docker-compose)
+ENABLE_SQS_POLLING=true npm run server
+
+# Test SQS integration with LocalStack
+npm run test:job-queue
+
+# Start the server with LocalStack and SQS polling
+npm run server:sqs:localstack
+```
+
+See [INTEGRATED-SQS.md](docs/INTEGRATED-SQS.md) for detailed setup and configuration instructions.
 
 ### Manual Binary Setup
 
@@ -60,18 +95,18 @@ The project includes comprehensive type definitions for:
 ### Example Usage
 
 ```typescript
-import { getVideoMetadata, downloadVideoWithProgress } from './lib/ytdlpWrapper.js';
+import { getVideoMetadata, downloadAndMergeVideo } from './lib/ytdlpWrapper.js';
 import { ProgressInfo } from './types.js';
 
 // Get video metadata with full type safety
 const metadata = await getVideoMetadata('https://youtube.com/watch?v=...');
 console.log(metadata.title, metadata.uploader);
 
-// Download with progress callback
-await downloadVideoWithProgress('https://youtube.com/watch?v=...', {
-  outputFilename: 'Custom - %(title)s.%(ext)s',
+// Download video with audio merged
+await downloadAndMergeVideo('https://youtube.com/watch?v=...', {
+  outputFilename: 'Custom - %(title)s.mp4',
   onProgress: (progress: ProgressInfo) => {
-    console.log(`Progress: ${progress.percent}`);
+    console.log(`Progress: ${progress.percent} - ${progress.raw}`);
   }
 });
 ```

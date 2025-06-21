@@ -10,8 +10,6 @@ export interface S3Config {
   audioBucket: string;
   videoBucket: string;
   metadataBucket?: string;
-  endpointUrl?: string; // For LocalStack support
-  forcePathStyle?: boolean; // For LocalStack support
 }
 
 export interface S3UploadResult {
@@ -30,7 +28,6 @@ export class S3Service {
     this.config = config;
     
     // Initialize S3 client with credentials from environment or config
-    // Support for LocalStack with custom endpoint
     const clientConfig: any = {
       region: config.region,
       credentials: config.accessKeyId && config.secretAccessKey ? {
@@ -38,12 +35,6 @@ export class S3Service {
         secretAccessKey: config.secretAccessKey,
       } : undefined, // Uses default credential chain if not provided
     };
-
-    // Add LocalStack-specific configuration
-    if (config.endpointUrl) {
-      clientConfig.endpoint = config.endpointUrl;
-      clientConfig.forcePathStyle = config.forcePathStyle ?? true; // LocalStack requires path-style
-    }
 
     this.s3Client = new S3Client(clientConfig);
   }
@@ -196,6 +187,7 @@ export class S3Service {
         Bucket: bucket,
         Key: key,
         Body: content,
+        ACL: 'public-read',
         ContentType: contentType,
         Metadata: {
           'upload-timestamp': new Date().toISOString(),
@@ -283,19 +275,51 @@ export class S3Service {
   }
 
   /**
-   * Delete local file after successful S3 upload
+   * Delete local file after successful S3 upload and clean up empty directories
    */
   async deleteLocalFile(filePath: string): Promise<boolean> {
     try {
       if (fs.existsSync(filePath)) {
+        const fileDir = path.dirname(filePath);
         fs.unlinkSync(filePath);
         console.log(`🗑️ Deleted local file: ${filePath}`);
+        
+        // Try to clean up empty parent directories
+        await this.cleanupEmptyDirectories(fileDir);
+        
         return true;
       }
       return false;
     } catch (error: any) {
       console.error(`Failed to delete local file ${filePath}:`, error.message);
       return false;
+    }
+  }
+
+  /**
+   * Recursively clean up empty directories (private helper method)
+   */
+  private async cleanupEmptyDirectories(dirPath: string, stopAtRoot: string = process.cwd()): Promise<void> {
+    try {
+      if (!fs.existsSync(dirPath) || dirPath === stopAtRoot || dirPath === path.dirname(dirPath)) {
+        return;
+      }
+      
+      const files = fs.readdirSync(dirPath);
+      
+      if (files.length === 0) {
+        fs.rmdirSync(dirPath);
+        console.log(`🗑️ Removed empty directory: ${path.basename(dirPath)}`);
+        
+        // Recursively clean up parent directory if it's now empty
+        const parentDir = path.dirname(dirPath);
+        if (parentDir !== stopAtRoot && parentDir !== dirPath) {
+          await this.cleanupEmptyDirectories(parentDir, stopAtRoot);
+        }
+      }
+    } catch (error: any) {
+      // Silently ignore directory cleanup errors to avoid disrupting main flow
+      console.debug(`Note: Could not clean up directory ${dirPath}: ${error.message}`);
     }
   }
 }
@@ -314,27 +338,16 @@ export function createS3ServiceFromEnv(): S3Service | null {
     return null;
   }
 
-  // Check for LocalStack configuration
-  const isLocalStack = process.env.LOCALSTACK === 'true';
-  const endpointUrl = process.env.AWS_ENDPOINT_URL || (isLocalStack ? 'http://localhost:4566' : undefined);
-
   const config: S3Config = {
     region,
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     audioBucket,
     videoBucket,
-    metadataBucket,
-    endpointUrl,
-    forcePathStyle: isLocalStack
+    metadataBucket
   };
 
-  if (isLocalStack) {
-    console.log('🧪 Initializing S3 service for LocalStack testing');
-    console.log(`🔗 LocalStack endpoint: ${endpointUrl}`);
-  } else {
-    console.log(`🏗️ Initializing S3 service for AWS region: ${region}`);
-  }
+  console.log(`🏗️ Initializing S3 service for AWS region: ${region}`);
   
   console.log(`🔊 Audio bucket: ${audioBucket}`);
   console.log(`📹 Video bucket: ${videoBucket}`);

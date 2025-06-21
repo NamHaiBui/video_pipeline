@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # bgutil-ytdlp-pot-provider service (dependency)
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    ports:
+      - "4416:4416"
+    restart: unless-stopped
+    networks:
+      - video-pipeline-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4416', (res) => process.exit(0)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Main video pipeline application
+  video-pipeline:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: video-pipeline
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - ENABLE_SQS_POLLING=true
+      - S3_UPLOAD_ENABLED=true
+      - PODCAST_CONVERSION_ENABLED=true
+      
+      # AWS Configuration
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      
+      # S3 Configuration
+      - S3_AUDIO_BUCKET=${S3_AUDIO_BUCKET}
+      - S3_VIDEO_BUCKET=${S3_VIDEO_BUCKET}
+      
+      # DynamoDB Configuration
+      - DYNAMODB_PODCAST_EPISODES_TABLE=${DYNAMODB_PODCAST_EPISODES_TABLE}
+      
+      # SQS Configuration
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - VIDEO_TRIMMING_QUEUE_URL=${VIDEO_TRIMMING_QUEUE_URL:-https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming}
+      
+      # YouTube API (optional)
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
+      
+      # Processing Configuration
+      - MAX_CONCURRENT_JOBS=2
+      - POLLING_INTERVAL_MS=30000
+      - DEFAULT_VIDEO_QUALITY=720p
+      - PREFERRED_AUDIO_FORMAT=mp3
+      
+      # Logging
+      - LOG_LEVEL=info
+      
+      # bgutil provider
+      - BGUTIL_PROVIDER_URL=http://bgutil-provider:4416
+      
+    volumes:
+      - video-pipeline-data:/app/data
+    depends_on:
+      bgutil-provider:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - video-pipeline-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  video-pipeline-data:
+
+networks:
+  video-pipeline-network:
+    driver: bridge
+    name: video-pipeline-network

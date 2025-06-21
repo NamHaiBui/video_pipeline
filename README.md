@@ -12,7 +12,6 @@ A comprehensive podcast processing pipeline built with TypeScript and Node.js th
 - 🔍 **Content Analysis**: AI-powered content categorization and guest detection
 - 📋 **Podcast Metadata**: Automatic generation of podcast-standard metadata
 - 🌊 **SQS Queue Processing**: Scalable job processing with AWS SQS integration
-- 🧪 **LocalStack Support**: Full local development environment with AWS emulation
 
 ## Installation
 
@@ -36,20 +35,6 @@ npm run dev
 npm start
 ```
 
-### LocalStack Testing (AWS S3 Simulation)
-
-```bash
-# Quick start with LocalStack
-npm run test:localstack
-
-# Or step-by-step:
-npm run localstack:init    # Start LocalStack and create S3 buckets
-npm run localstack:test    # Test S3 connectivity
-npm run server:localstack  # Start server with LocalStack config
-```
-
-See [LOCALSTACK-TESTING.md](LOCALSTACK-TESTING.md) for detailed LocalStack setup and testing instructions.
-
 ### SQS Integration
 
 The server includes integrated SQS polling that automatically processes jobs from an AWS SQS queue:
@@ -57,15 +42,9 @@ The server includes integrated SQS polling that automatically processes jobs fro
 ```bash
 # Start the server with SQS polling enabled (enabled by default in docker-compose)
 ENABLE_SQS_POLLING=true npm run server
-
-# Test SQS integration with LocalStack
-npm run test:job-queue
-
-# Start the server with LocalStack and SQS polling
-npm run server:sqs:localstack
 ```
 
-See [INTEGRATED-SQS.md](docs/INTEGRATED-SQS.md) for detailed setup and configuration instructions.
+See [ECS_DEPLOYMENT_GUIDE.md](ECS_DEPLOYMENT_GUIDE.md) for detailed AWS ECS deployment instructions.
 
 ### Manual Binary Setup
 
@@ -75,11 +54,20 @@ npm run setup
 
 ## Scripts
 
+### Main Scripts
 - `npm run build` - Compile TypeScript to JavaScript
 - `npm run dev` - Run TypeScript directly with tsx
 - `npm start` - Build and run the compiled JavaScript
 - `npm run setup` - Download required binaries
 - `npm run clean` - Remove compiled output
+
+### Test Scripts
+- `npm run test:metadata-only` - Test metadata extraction only
+- `npm run test:slug-filename` - Test filename slug generation
+- `npm run test:slug-integration` - Test complete slug integration
+- `npm run test:complete-slug` - Test complete slug functionality
+- `npm run test:video-slug` - Test video slug generation
+- `npm run test:trimming-queue` - Test video trimming queue functionality
 
 ## TypeScript Features
 
@@ -141,6 +129,48 @@ This project has been fully converted from JavaScript to TypeScript, providing:
 - **Runtime**: `axios`, `progress`
 - **Development**: `typescript`, `tsx`, `@types/node`, `@types/progress`
 
-## License
+## Configuration
 
-ISC
+### Environment Variables
+
+The pipeline supports various environment variables for configuration:
+
+#### AWS Services
+
+- `AWS_REGION`: AWS region for services (default: us-east-1)
+- `AWS_ACCESS_KEY_ID`: AWS access key for authentication
+- `AWS_SECRET_ACCESS_KEY`: AWS secret key for authentication
+
+#### S3 Configuration
+
+- `S3_UPLOAD_ENABLED`: Enable S3 uploads (true/false)
+- `AUDIO_BUCKET_NAME`: S3 bucket for audio files
+- `VIDEO_BUCKET_NAME`: S3 bucket for video files
+
+#### DynamoDB Configuration
+
+- `DYNAMODB_PODCAST_EPISODES_TABLE`: Table name for podcast episodes (default: PodcastEpisodeStoreTest)
+
+#### SQS Configuration
+
+- `SQS_QUEUE_URL`: URL for the main processing queue
+- `VIDEO_TRIMMING_QUEUE_URL`: URL for the video trimming queue (triggered when processing is complete)
+- `ENABLE_SQS_POLLING`: Enable/disable SQS polling (default: true)
+- `SQS_MAX_MESSAGES`: Maximum messages to receive per poll (default: 10)
+- `SQS_WAIT_TIME`: Long polling wait time in seconds (default: 20)
+
+#### Video Trimming Integration
+
+- When podcast processing is complete (both `quotes_audio_status` and `chunking_status` are "COMPLETED"), the system automatically queues a message to the video trimming SQS queue specified by `VIDEO_TRIMMING_QUEUE_URL`
+- Default queue: `https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming`
+- Message format: `{"id": "episode-id"}`
+
+#### Other Configuration
+
+- `PORT`: Server port (default: 3000)
+- `YOUTUBE_API_KEY`: YouTube Data API key for search functionality
+- `PREFERRED_AUDIO_FORMAT`: Audio format preference (mp3/aac/opus, default: mp3)
+- `YTDLP_USE_NIGHTLY`: Use nightly builds of yt-dlp (true/false)
+- `PODCAST_CONVERSION_ENABLED`: Enable podcast conversion features (default: true)
+
+## TypeScript API

@@ -19,19 +19,15 @@ import {
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
 import { createS3ServiceFromEnv, S3Service } from './lib/s3Service.js';
+import { createSQSServiceFromEnv, SQSService } from './lib/sqsService.js';
 import { logger } from './lib/logger.js';
 import { DynamoDBService } from './lib/dynamoService.js';
-import { generateVideoS3Key, generateAudioS3Key, generateMetadataS3Key, getVideoBucketName, getAudioBucketName, getMetadataBucketName } from './lib/s3KeyUtils.js';
+import { create_slug } from './lib/utils/utils.js';
 
 import dotenv from 'dotenv';
 
-// Load environment-specific configuration
-if (process.env.LOCALSTACK === 'true') {
-  console.log('🧪 Loading LocalStack environment configuration...');
-  dotenv.config({ path: '.env.localstack' });
-} else {
-  dotenv.config();
-}
+// Load environment configuration
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -40,21 +36,21 @@ const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
 // Initialize S3 service
 const s3Service = createS3ServiceFromEnv();
-const isS3Enabled = s3Service !== null && process.env.S3_UPLOAD_ENABLED !== 'false';
+const isS3Enabled = s3Service !== null && process.env.S3_UPLOAD_ENABLED === 'true';
+
+// Initialize SQS service
+const sqsService = createSQSServiceFromEnv();
+const isSQSEnabled = sqsService !== null;
 
 // Initialize DynamoDB service
 const dynamoService = new DynamoDBService({
   region: process.env.AWS_REGION || 'us-east-1',
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  endpointUrl: process.env.LOCALSTACK === 'true' ? 'http://localhost:4566' : undefined,
-  metadataTableName: process.env.DYNAMODB_METADATA_TABLE || 'video-pipeline-metadata',
-  jobsTableName: process.env.DYNAMODB_JOBS_TABLE || 'video-pipeline-jobs',
-  podcastEpisodesTableName: process.env.DYNAMODB_PODCAST_EPISODES_TABLE || 'PodcastEpisodeStore'
+  podcastEpisodesTableName: process.env.DYNAMODB_PODCAST_EPISODES_TABLE || 'PodcastEpisodeStoreTest'
 });
 
-const isDynamoEnabled = process.env.LOCALSTACK === 'true' || 
-  (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+const isDynamoEnabled = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
 
 const isPodcastConversionEnabled = process.env.PODCAST_CONVERSION_ENABLED !== 'false';
 
@@ -62,6 +58,12 @@ if (isS3Enabled) {
   logger.info('S3 upload service initialized successfully');
 } else {
   logger.warn('S3 upload service disabled or not configured');
+}
+
+if (isSQSEnabled) {
+  logger.info('SQS service initialized successfully');
+} else {
+  logger.warn('SQS service disabled or not configured');
 }
 
 if (isDynamoEnabled) {
@@ -74,7 +76,7 @@ if (isDynamoEnabled) {
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage for download jobs (in production, use a database)
+// In-memory storage for download jobs
 const downloadJobs = new Map<string, DownloadJob>();
 
 // Serve static files from downloads directory
@@ -129,19 +131,6 @@ app.post('/api/download', async (req: Request<{}, {}, DownloadRequest>, res: Res
     };
 
     downloadJobs.set(jobId, job);
-
-    // Persist job to DynamoDB if enabled
-    if (isDynamoEnabled) {
-      try {
-        await dynamoService.saveDownloadJob(job);
-        logger.info('Job persisted to DynamoDB', { jobId: job.id });
-      } catch (dynamoError: any) {
-        logger.warn('Failed to persist job to DynamoDB', { 
-          jobId, 
-          error: dynamoError.message 
-        });
-      }
-    }
 
     // Start downloads asynchronously
     processDownload(jobId, sanitizedUrl);
@@ -283,7 +272,7 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
       throw new Error(`YouTube API error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
-    const searchData = await response.json();
+    const searchData = await response.json() as any;
     
     if (!searchData.items || searchData.items.length === 0) {
       console.log('No search results found');
@@ -307,7 +296,7 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
       throw new Error(`YouTube videos API error: ${detailsResponse.status} ${detailsResponse.statusText}`);
     }
 
-    const detailsData = await detailsResponse.json();
+    const detailsData = await detailsResponse.json() as any; // This is really bad but this is a future implementation
 
     
     const results: Record<string, string> = {};
@@ -319,7 +308,6 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
       const duration = video.contentDetails.duration;
       const durationInSeconds = parseDuration(duration);
       
-      // Filter: duration > 240 seconds (4 minutes)
       if (durationInSeconds > 240) {
         const title = video.snippet.title;
         const videoId = video.id;
@@ -357,39 +345,11 @@ function parseDuration(duration: string): number {
 }
 
 /**
- * Clean up temporary files
- */
-async function cleanupTempFiles(files: string[]): Promise<void> {
-  for (const file of files) {
-    try {
-      if (fs.existsSync(file)) {
-        await fs.promises.unlink(file);
-        console.log(`Cleaned up temp file: ${file}`);
-      }
-    } catch (error) {
-      console.warn(`Failed to cleanup temp file ${file}:`, error);
-    }
-  }
-}
-
-/**
- * Helper function to persist job updates to both in-memory storage and DynamoDB
+ * Helper function to persist job updates to in-memory storage only
  */
 async function persistJobUpdate(jobId: string, job: DownloadJob): Promise<void> {
   // Update in-memory storage
   downloadJobs.set(jobId, { ...job });
-  
-  // Persist to DynamoDB if enabled
-  if (isDynamoEnabled) {
-    try {
-      await dynamoService.saveDownloadJob(job);
-    } catch (dynamoError: any) {
-      logger.warn('Failed to persist job update to DynamoDB', { 
-        jobId, 
-        error: dynamoError.message 
-      });
-    }
-  }
 }
 
 /**
@@ -408,19 +368,6 @@ export async function processDownload(jobId: string, url: string): Promise<void>
       createdAt: new Date()
     };
     downloadJobs.set(jobId, job);
-    
-    // Persist job to DynamoDB if enabled
-    if (isDynamoEnabled) {
-      try {
-        await dynamoService.saveDownloadJob(job);
-        logger.info('Job persisted to DynamoDB', { jobId: job.id });
-      } catch (dynamoError: any) {
-        logger.warn('Failed to persist job to DynamoDB', { 
-          jobId, 
-          error: dynamoError.message 
-        });
-      }
-    }
   }
 
   try {
@@ -483,25 +430,29 @@ export async function processDownload(jobId: string, url: string): Promise<void>
     await persistJobUpdate(jobId, job);
     console.log(`Job ${jobId}: Status changed to 'downloading'. Starting video+audio download and merge.`);
 
-    // Generate output filename using metadata
-    let outputFilename = '%(title)s [%(id)s].mp4';
+    // Generate output filename using metadata with slug-based naming
+    let outputFilename = 'unknown-podcast/untitled-episode.mp4';
     if (metadata) {
-      // Create a safe filename from metadata
-      const safeTitle = metadata.title.replace(/[<>:"/\\|?*]/g, '_').substring(0, 100);
-      outputFilename = `${safeTitle} [${metadata.id}].mp4`;
+      // Create slug-based filename structure
+      const podcastSlug = create_slug(metadata.uploader || 'unknown');
+      const episodeSlug = create_slug(metadata.title || 'untitled');
+      outputFilename = `${podcastSlug}/${episodeSlug}.mp4`;
     }
 
     try {
       // Use the new merged download function
-      const mergedFilePath = await downloadAndMergeVideo(url, {
+      const {mergedFilePath, episodeId} = await downloadAndMergeVideo(url, {
         outputDir: downloadsDir,
         outputFilename: outputFilename,
+        s3Upload: { 
+          enabled: isS3Enabled,
+          deleteLocalAfterUpload: true // Clean up files after S3 upload
+        },
         onProgress: (progressInfo: ProgressInfo) => {
           const currentJobState = downloadJobs.get(jobId);
           if (currentJobState) {
             if (!currentJobState.progress) currentJobState.progress = {};
-            
-            // Determine which stage of the process we're in based on the progress message
+          
             if (progressInfo.raw.startsWith('Video:')) {
               currentJobState.progress.video = {
                 ...progressInfo,
@@ -542,166 +493,6 @@ export async function processDownload(jobId: string, url: string): Promise<void>
           finalJobState.filePaths.audioPath = path.basename(audioOnlyPath);
         }
         
-        // Upload to S3 if enabled
-        if (isS3Enabled && s3Service) {
-              try {
-                logger.info(`Starting S3 uploads for job ${jobId}`, { jobId });
-                finalJobState.status = 'uploading';
-                await persistJobUpdate(jobId, finalJobState);
-
-                const metadataPath = finalJobState.filePaths.metadataPath ? 
-                  path.join(downloadsDir, finalJobState.filePaths.metadataPath) : null;
-
-                // Create custom S3 key using centralized key generation
-                if (!finalJobState.metadata) {
-                  throw new Error('Video metadata is required for S3 upload');
-                }
-                
-                const videoExtension = path.extname(finalMergedPath);
-                const videoKey = generateVideoS3Key(finalJobState.metadata, videoExtension);
-                const videoBucketName = getVideoBucketName();
-
-                // Upload video file to video bucket
-                logger.info(`Uploading video file to S3: ${videoBucketName}/${videoKey}`, { jobId });
-                const videoUpload = await s3Service.uploadFile(finalMergedPath, videoBucketName, videoKey);
-                if (videoUpload.success) {
-                  finalJobState.s3Locations = finalJobState.s3Locations || {};
-                  finalJobState.s3Locations.video = {
-                    bucket: videoUpload.bucket,
-                    key: videoUpload.key,
-                    location: videoUpload.location
-                  };
-                  logger.info(`Video uploaded successfully to S3: ${videoUpload.location}`, { jobId });
-                } else {
-                  logger.error(`Failed to upload video to S3 for Job ID ${jobId}: ${videoUpload.error}`);
-                }
-
-                // Use the downloaded audio file - no extraction needed
-                try {
-                  // Check if audio was already uploaded during download
-                  if (audioS3Info) {
-                    logger.info(`Audio was already uploaded during download: ${audioS3Info.location}`, { jobId });
-                    
-                    // Use the pre-uploaded audio file information
-                    const audioUpload = {
-                      success: true,
-                      bucket: audioS3Info.bucket,
-                      key: audioS3Info.key,
-                      location: audioS3Info.location
-                    };
-                    
-                    finalJobState.s3Locations = finalJobState.s3Locations || {};
-                    finalJobState.s3Locations.audio = {
-                      bucket: audioUpload.bucket,
-                      key: audioUpload.key,
-                      location: audioUpload.location
-                    };
-                    logger.info(`Using previously uploaded audio: ${audioUpload.location}`, { jobId });
-                    
-                    // Clean up the original audio file if it still exists
-                    if (audioOnlyPath && fs.existsSync(audioOnlyPath)) {
-                      try {
-                        await fs.promises.unlink(audioOnlyPath);
-                        logger.info(`Cleaned up original audio file: ${audioOnlyPath}`, { jobId });
-                      } catch (deleteError) {
-                        logger.warn(`Failed to clean up original audio file: ${audioOnlyPath}`, { jobId });
-                      }
-                    }
-                  } else {
-                    // Audio wasn't uploaded yet, do it now
-                    const originalAudioPath = audioOnlyPath;
-                    
-                    if (!originalAudioPath || !fs.existsSync(originalAudioPath)) {
-                      logger.warn(`Original audio file not found or doesn't exist: ${originalAudioPath}`, { jobId });
-                      throw new Error(`Audio file not found at expected location: ${originalAudioPath}`);
-                    }
-                    
-                    // Upload the original audio file directly to S3
-                    const audioKey = generateAudioS3Key(finalJobState.metadata);
-                    const audioBucketName = getAudioBucketName();
-                    logger.info(`Uploading original audio file to S3: ${audioBucketName}/${audioKey} from ${originalAudioPath}`, { jobId });
-                    const audioUpload = await s3Service.uploadFile(originalAudioPath, audioBucketName, audioKey);
-                    
-                    if (audioUpload.success) {
-                      finalJobState.s3Locations = finalJobState.s3Locations || {};
-                      finalJobState.s3Locations.audio = {
-                        bucket: audioUpload.bucket,
-                        key: audioUpload.key,
-                        location: audioUpload.location
-                      };
-                      logger.info(`Audio uploaded successfully to S3: ${audioUpload.location}`, { jobId });
-                      
-                      // Store audio file path in job
-                      if (!finalJobState.filePaths) finalJobState.filePaths = {};
-                      finalJobState.filePaths.audioPath = path.basename(originalAudioPath);
-                      
-                      // Clean up original audio file after successful upload
-                      try {
-                        await fs.promises.unlink(originalAudioPath);
-                        logger.info(`Cleaned up original audio file after S3 upload: ${originalAudioPath}`, { jobId });
-                      } catch (deleteError) {
-                        logger.warn(`Failed to clean up original audio file: ${originalAudioPath}`, { jobId });
-                      }
-                    } else {
-                      logger.error(`Failed to upload audio to S3: ${audioUpload.error}`, undefined, { 
-                        jobId,
-                        error: audioUpload.error 
-                      });
-                    }
-                  }
-                } catch (audioError: any) {
-                  logger.warn(`Failed to extract and upload audio: ${audioError.message}`, { jobId });
-                }
-
-                // Upload metadata file if it exists
-                if (metadataPath && fs.existsSync(metadataPath)) {
-                  const metadataKey = generateMetadataS3Key(finalJobState.metadata);
-                  const metadataBucketName = getMetadataBucketName();
-                  logger.info(`Uploading metadata file to S3: ${metadataBucketName}/${metadataKey}`, { jobId });
-                  const metadataUpload = await s3Service.uploadFile(metadataPath, metadataBucketName, metadataKey, 'application/json');
-                  if (metadataUpload.success) {
-                    finalJobState.s3Locations = finalJobState.s3Locations || {};
-                    finalJobState.s3Locations.metadata = {
-                      bucket: metadataUpload.bucket,
-                      key: metadataUpload.key,
-                      location: metadataUpload.location
-                    };
-                    logger.info(`Metadata uploaded successfully to S3: ${metadataUpload.location}`, { jobId });
-                  } else {
-                    logger.error(`Failed to upload metadata to S3: ${metadataUpload.error}`, undefined, { jobId });
-                  }
-                }
-
-                // Delete local files immediately after successful S3 upload (ephemeral storage)
-                const filesToDelete = [finalMergedPath];
-                if (metadataPath) filesToDelete.push(metadataPath);
-                if (audioOnlyPath && fs.existsSync(audioOnlyPath)) filesToDelete.push(audioOnlyPath);
-                
-                console.log(`Job ${jobId}: Cleaning up ${filesToDelete.length} local files to maintain ephemeral storage...`);
-                
-                for (const filePath of filesToDelete) {
-                  try {
-                    if (fs.existsSync(filePath)) {
-                      await fs.promises.unlink(filePath);
-                      logger.info(`Deleted local file after S3 upload: ${filePath}`, { jobId });
-                      console.log(`Job ${jobId}: ✅ Deleted local file: ${path.basename(filePath)}`);
-                    }
-                  } catch (deleteError) {
-                    logger.error(`Failed to delete local file: ${filePath}`, undefined, { jobId, error: (deleteError as Error).message });
-                    console.error(`Job ${jobId}: ❌ Failed to delete local file: ${path.basename(filePath)}`);
-                  }
-                }
-
-                logger.info(`S3 uploads completed for job ${jobId}`, { jobId });
-              } catch (s3Error: any) {
-                logger.error(`S3 upload failed for job ${jobId}: ${s3Error.message}`, undefined, { 
-                  jobId, 
-                  error: s3Error.message
-                });
-                // Don't fail the entire job if S3 upload fails
-                finalJobState.s3Error = s3Error.message;
-              }
-            }
 
         finalJobState.status = 'completed';
         finalJobState.completedAt = new Date();
@@ -725,68 +516,14 @@ export async function processDownload(jobId: string, url: string): Promise<void>
         console.log(`Job ${jobId}: download and merge completed successfully.`);
         console.log(`Final merged file: ${finalMergedPath}`);
         
-        // Convert to podcast episode if enabled
-        if (isPodcastConversionEnabled && finalJobState.metadata) {
-          try {
-            console.log(`Job ${jobId}: Converting to podcast episode...`);
-            
-            // Determine audio URL (only use S3 location, no local fallback)
-            let audioUrl = '';
-            if (finalJobState.s3Locations?.audio?.location) {
-              audioUrl = finalJobState.s3Locations.audio.location;
-              console.log(`Job ${jobId}: Using S3 audio URL: ${audioUrl}`);
-            } else {
-              console.warn(`Job ${jobId}: No S3 audio location available for podcast conversion, skipping`);
-              return; // Skip podcast conversion if no S3 URL available
-            }
-            
-            // Determine video URL (only use S3 location, no local fallback)
-            let videoUrl = '';
-            if (finalJobState.s3Locations?.video?.location) {
-              videoUrl = finalJobState.s3Locations.video.location;
-              console.log(`Job ${jobId}: Using S3 video URL: ${videoUrl}`);
-            } else {
-              console.warn(`Job ${jobId}: No S3 video location available for podcast conversion`);
-              // Continue with podcast conversion even without video URL as it's optional
-            }
-            
-            // Create analysis configuration from environment variables
-            const analysisConfig: AnalysisConfig = {
-              topic_keywords: process.env.PODCAST_TOPIC_KEYWORDS?.split(',').map(k => k.trim()) || [],
-              person_keywords: process.env.PODCAST_PERSON_KEYWORDS?.split(',').map(k => k.trim()) || [],
-              enable_ai_analysis: process.env.PODCAST_AI_ANALYSIS_ENABLED === 'true'
-            };
-            
-            // Convert and save as podcast episode
-            const episodeId = await dynamoService.convertAndSaveAsPodcastEpisode(
-              finalJobState.metadata,
-              audioUrl,
-              analysisConfig,
-              videoUrl // Pass video URL as fourth parameter
-            );
-            
-            if (episodeId) {
-              console.log(`Job ${jobId}: Successfully converted to podcast episode ${episodeId}`);
-              logger.info(`Podcast episode created`, { 
-                jobId, 
-                episodeId, 
-                videoTitle: finalJobState.metadata.title,
-                audioUrl,
-                videoUrl
-              });
-            } else {
-              console.warn(`Job ${jobId}: Failed to convert to podcast episode`);
-              logger.warn(`Podcast episode conversion failed`, { jobId });
-            }
-          } catch (conversionError: any) {
-            console.error(`Job ${jobId}: Podcast conversion error:`, conversionError);
-            logger.error(`Podcast conversion failed for job ${jobId}: ${conversionError.message}`, undefined, { 
-              jobId, 
-              error: conversionError.message 
-            });
-            // Don't fail the entire job if podcast conversion fails
-          }
+        // Check if metadata processing is complete and queue for video trimming if ready
+        if (episodeId) {
+          logger.info(`Checking video trimming readiness for episode: ${episodeId}`);
+          await checkAndQueueVideoTrimming(episodeId);
+        } else {
+          logger.warn(`No episode ID available for job ${jobId}, skipping video trimming check`);
         }
+        
       }
 
     } catch (downloadError: any) {
@@ -820,6 +557,7 @@ app.get('/health', (req: Request, res: Response) => {
     service: 'podcast-pipeline',
     timestamp: new Date().toISOString(),
     s3Enabled: isS3Enabled,
+    sqsEnabled: isSQSEnabled,
     dynamoEnabled: isDynamoEnabled,
     podcastConversionEnabled: isPodcastConversionEnabled
   });
@@ -901,7 +639,9 @@ app.get('/', (req: Request, res: Response) => {
       'Podcast Conversion': isPodcastConversionEnabled ? 'Enabled' : 'Disabled',
       'Audio Extraction': 'Always Enabled',
       'S3 Upload': isS3Enabled ? 'Enabled' : 'Disabled',
-      'DynamoDB Storage': isDynamoEnabled ? 'Enabled' : 'Disabled'
+      'SQS Queue': isSQSEnabled ? 'Enabled' : 'Disabled',
+      'DynamoDB Storage': isDynamoEnabled ? 'Enabled' : 'Disabled',
+      'Video Trimming Queue': isSQSEnabled ? 'Ready' : 'Disabled'
     }
   });
 });
@@ -913,6 +653,52 @@ app.use((error: Error, req: Request, res: Response, next: any) => {
     message: 'Internal server error'
   });
 });
+
+/**
+ * Check if episode metadata indicates all processing is complete
+ * and queue message to video trimming SQS queue if ready
+ * @param episodeId - Episode ID to check and potentially queue
+ */
+async function checkAndQueueVideoTrimming(episodeId: string): Promise<void> {
+  if (!isDynamoEnabled || !isSQSEnabled) {
+    logger.warn('DynamoDB or SQS not enabled, skipping video trimming queue check');
+    return;
+  }
+
+  const trimQueueUrl = process.env.VIDEO_TRIMMING_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming';
+
+  try {
+    // Get episode data from DynamoDB
+    const episode = await dynamoService.getPodcastEpisode(episodeId);
+    
+    if (!episode) {
+      logger.warn(`Episode ${episodeId} not found in database, cannot check trimming status`);
+      return;
+    }
+
+    // Check if all required statuses are COMPLETED
+    const quotesStatus = episode.quotes_audio_status;
+    const chunkingStatus = episode.chunking_status;
+    
+    logger.info(`Episode ${episodeId} status check - quotes_audio_status: ${quotesStatus}, chunking_status: ${chunkingStatus}`);
+    
+    if (quotesStatus === 'COMPLETED' && chunkingStatus === 'COMPLETED') {
+      // All statuses are complete, queue message to video trimming
+      const messageBody = JSON.stringify({ id: episodeId });
+      
+      logger.info(`All processing completed for episode ${episodeId}, queuing to video trimming`);
+      logger.info(`Using video trimming queue URL: ${trimQueueUrl}`);
+      
+      await sqsService!.sendMessage(messageBody, undefined, trimQueueUrl);
+      
+      logger.info(`Successfully queued episode ${episodeId} to video trimming queue`);
+    } else {
+      logger.info(`Episode ${episodeId} not ready for trimming - quotes_audio_status: ${quotesStatus}, chunking_status: ${chunkingStatus}`);
+    }
+  } catch (error: any) {
+    logger.error(`Failed to check and queue video trimming for episode ${episodeId}: ${error.message}`);
+  }
+}
 
 // Startup function with yt-dlp update check and periodic monitoring
 async function startServer(): Promise<void> {

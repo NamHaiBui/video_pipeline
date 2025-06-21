@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  # bgutil-ytdlp-pot-provider service (dependency)
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider-prod
+    ports:
+      - "4416:4416"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4416/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Main video pipeline application
+  video-pipeline:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-pipeline-prod
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - ENABLE_SQS_POLLING=true
+      - S3_UPLOAD_ENABLED=true
+      - PODCAST_CONVERSION_ENABLED=true
+      
+      # AWS Configuration
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      
+      # S3 Configuration
+      - S3_AUDIO_BUCKET_NAME=${S3_AUDIO_BUCKET_NAME}
+      - S3_VIDEO_BUCKET_NAME=${S3_VIDEO_BUCKET_NAME}
+      
+      # DynamoDB Configuration
+      - DYNAMODB_PODCAST_EPISODES_TABLE=${DYNAMODB_PODCAST_EPISODES_TABLE}
+      
+      # SQS Configuration
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - VIDEO_TRIMMING_QUEUE_URL=${VIDEO_TRIMMING_QUEUE_URL:-https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming}
+      
+      # YouTube API
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
+      
+      # Processing Configuration
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+      - POLLING_INTERVAL_MS=${POLLING_INTERVAL_MS:-30000}
+      - DEFAULT_VIDEO_QUALITY=${DEFAULT_VIDEO_QUALITY:-720p}
+      - PREFERRED_AUDIO_FORMAT=${PREFERRED_AUDIO_FORMAT:-mp3}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      
+      # yt-dlp Configuration
+      - YTDLP_USE_NIGHTLY=${YTDLP_USE_NIGHTLY:-false}
+      
+    volumes:
+      - video-pipeline-downloads:/app/downloads
+      - video-pipeline-temp:/app/temp
+      - video-pipeline-data:/app/data
+    depends_on:
+      bgutil-provider:
+        condition: service_healthy
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  video-pipeline-downloads:
+    driver: local
+  video-pipeline-temp:
+    driver: local
+  video-pipeline-data:
+    driver: local
+
+networks:
+  default:
+    name: video-pipeline-prod-network

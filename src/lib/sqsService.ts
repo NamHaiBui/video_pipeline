@@ -2,6 +2,7 @@ import {
   SQSClient, 
   ReceiveMessageCommand, 
   DeleteMessageCommand, 
+  SendMessageCommand,
   ReceiveMessageCommandOutput, 
   Message 
 } from '@aws-sdk/client-sqs';
@@ -81,6 +82,33 @@ export class SQSService {
   }
 
   /**
+   * Send a message to the SQS queue
+   * @param messageBody Message body to send
+   * @param messageAttributes Optional message attributes
+   * @param queueUrl Optional override for the queue URL
+   */
+  async sendMessage(
+    messageBody: string, 
+    messageAttributes?: Record<string, any>,
+    queueUrl?: string
+  ): Promise<string> {
+    try {
+      const command = new SendMessageCommand({
+        QueueUrl: queueUrl || this.queueUrl,
+        MessageBody: messageBody,
+        MessageAttributes: messageAttributes
+      });
+
+      const response = await this.client.send(command);
+      logger.info(`Message sent to SQS queue: ${response.MessageId}`);
+      return response.MessageId || '';
+    } catch (error: any) {
+      logger.error(`Failed to send SQS message: ${error.message}`, undefined, { error });
+      throw error;
+    }
+  }
+
+  /**
    * Process all messages in the queue until it's empty
    * @param messageHandler Function to process each message
    * @returns Number of messages processed
@@ -148,13 +176,8 @@ export function createSQSServiceFromEnv(): SQSService | null {
       waitTimeSeconds: parseInt(process.env.SQS_WAIT_TIME || '20', 10)
     };
     
-    // Use LocalStack endpoint if configured
-    if (process.env.LOCALSTACK === 'true') {
-      config.endpointUrl = process.env.LOCALSTACK_ENDPOINT || 'http://localhost:4566';
-      config.accessKeyId = 'localstack';
-      config.secretAccessKey = 'localstack';
-      logger.info('Configuring SQS service to use LocalStack');
-    } else if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    // Use production AWS credentials
+    if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
       config.accessKeyId = process.env.AWS_ACCESS_KEY_ID;
       config.secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     }

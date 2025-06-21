@@ -9,21 +9,20 @@ import {
   PutCommand, 
   GetCommand, 
   UpdateCommand, 
-  QueryCommand, 
-  ScanCommand,
-  DeleteCommand,
+  QueryCommand,
   PutCommandInput,
   GetCommandInput,
   UpdateCommandInput,
   QueryCommandInput,
-  ScanCommandInput,
-  DeleteCommandInput
 } from '@aws-sdk/lib-dynamodb';
-import { VideoMetadata, DownloadJob } from '../types.js';
+import { VideoMetadata} from '../types.js';
 
 // Add import for podcast types
 import { PodcastEpisodeData, ContentAnalysisResult, AnalysisConfig } from '../types.js';
 import { v4 as uuidv4 } from 'uuid';
+import logger from './logger.js';
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
+import { extractXMLElements, parseXML, sleep, create_slug } from './utils/utils.js';
 
 /**
  * Configuration interface for DynamoDB service
@@ -35,12 +34,8 @@ export interface DynamoDBConfig {
   accessKeyId?: string;
   /** AWS secret access key (optional, uses default credential chain if not provided) */
   secretAccessKey?: string;
-  /** Custom endpoint URL for LocalStack or other DynamoDB-compatible services */
-  endpointUrl?: string;
   /** Table name for storing video metadata */
-  metadataTableName: string;
-  /** Table name for storing download jobs */
-  jobsTableName: string;
+  metadataTableName?: string;
   /** Table name for storing podcast episodes (optional) */
   podcastEpisodesTableName?: string;
 }
@@ -84,32 +79,6 @@ export interface VideoMetadataRecord {
 }
 
 /**
- * Download job record structure for DynamoDB storage
- */
-export interface DownloadJobRecord {
-  /** Primary key: Job ID (UUID) */
-  jobId: string;
-  /** Video URL being processed */
-  videoUrl: string;
-  /** Current job status */
-  status: 'pending' | 'downloading_metadata' | 'downloading' | 'merging' | 'uploading' | 'completed' | 'error';
-  /** Progress information as JSON string */
-  progressJson: string;
-  /** Video metadata ID (foreign key to metadata table) */
-  videoId?: string;
-  /** File paths as JSON string */
-  filePathsJson?: string;
-  /** Error message if job failed */
-  errorMessage?: string;
-  /** Job creation timestamp */
-  createdAt: string;
-  /** Job completion timestamp */
-  completedAt?: string;
-  /** TTL timestamp for automatic cleanup */
-  ttl: number;
-}
-
-/**
  * DynamoDB service class for video pipeline operations
  */
 export class DynamoDBService {
@@ -125,7 +94,7 @@ export class DynamoDBService {
   constructor(config: DynamoDBConfig) {
     this.config = config;
 
-    // Configure DynamoDB client with optional LocalStack support
+    // Configure DynamoDB client
     const clientConfig: any = {
       region: config.region,
       credentials: config.accessKeyId && config.secretAccessKey ? {
@@ -133,11 +102,6 @@ export class DynamoDBService {
         secretAccessKey: config.secretAccessKey,
       } : undefined, // Uses default credential chain if not provided
     };
-
-    // Add LocalStack endpoint if specified
-    if (config.endpointUrl) {
-      clientConfig.endpoint = config.endpointUrl;
-    }
 
     // Initialize clients
     this.dynamoClient = new DynamoDBClient(clientConfig);
@@ -150,10 +114,7 @@ export class DynamoDBService {
    */
   async ensureTablesExist(): Promise<void> {
     try {
-      await Promise.all([
-        this.ensureMetadataTableExists(),
-        this.ensureJobsTableExists()
-      ]);
+      await this.ensureMetadataTableExists();
       console.log('✅ DynamoDB tables verified/created successfully');
     } catch (error: any) {
       console.error('❌ Failed to ensure DynamoDB tables exist:', error.message);
@@ -174,25 +135,6 @@ export class DynamoDBService {
       if (error instanceof ResourceNotFoundException) {
         console.log(`📋 Creating metadata table: ${this.config.metadataTableName}`);
         await this.createMetadataTable();
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  /**
-   * Ensure jobs table exists, create if it doesn't
-   */
-  private async ensureJobsTableExists(): Promise<void> {
-    try {
-      await this.dynamoClient.send(new DescribeTableCommand({
-        TableName: this.config.jobsTableName
-      }));
-      console.log(`📋 Jobs table ${this.config.jobsTableName} already exists`);
-    } catch (error: any) {
-      if (error instanceof ResourceNotFoundException) {
-        console.log(`📋 Creating jobs table: ${this.config.jobsTableName}`);
-        await this.createJobsTable();
       } else {
         throw error;
       }
@@ -228,63 +170,6 @@ export class DynamoDBService {
 
     await this.dynamoClient.send(command);
     console.log(`✅ Created metadata table: ${this.config.metadataTableName}`);
-  }
-
-  /**
-   * Create the download jobs table with appropriate schema
-   */
-  private async createJobsTable(): Promise<void> {
-    const command = new CreateTableCommand({
-      TableName: this.config.jobsTableName,
-      KeySchema: [
-        {
-          AttributeName: 'jobId',
-          KeyType: 'HASH' // Partition key
-        }
-      ],
-      AttributeDefinitions: [
-        {
-          AttributeName: 'jobId',
-          AttributeType: 'S'
-        },
-        {
-          AttributeName: 'status',
-          AttributeType: 'S'
-        },
-        {
-          AttributeName: 'createdAt',
-          AttributeType: 'S'
-        }
-      ],
-      GlobalSecondaryIndexes: [
-        {
-          IndexName: 'StatusIndex',
-          KeySchema: [
-            {
-              AttributeName: 'status',
-              KeyType: 'HASH'
-            },
-            {
-              AttributeName: 'createdAt',
-              KeyType: 'RANGE'
-            }
-          ],
-          Projection: {
-            ProjectionType: 'ALL'
-          }
-        }
-      ],
-      BillingMode: 'PAY_PER_REQUEST',
-      StreamSpecification: {
-        StreamEnabled: false
-      },
-      SSESpecification: {
-        Enabled: true
-      }
-    });
-
-    await this.dynamoClient.send(command);
-    console.log(`✅ Created jobs table: ${this.config.jobsTableName}`);
   }
 
   /**
@@ -353,421 +238,6 @@ export class DynamoDBService {
       console.error(`❌ Failed to save metadata for video ${metadata.id}:`, error.message);
       return false;
     }
-  }
-
-  /**
-   * Retrieve video metadata from DynamoDB
-   * 
-   * @param videoId - YouTube video ID
-   * @returns Promise<VideoMetadataRecord | null> - Metadata record or null if not found
-   */
-  async getVideoMetadata(videoId: string): Promise<VideoMetadataRecord | null> {
-    try {
-      const getCommand: GetCommandInput = {
-        TableName: this.config.metadataTableName,
-        Key: {
-          videoId: videoId
-        }
-      };
-
-      const result = await this.docClient.send(new GetCommand(getCommand));
-      
-      if (result.Item) {
-        console.log(`✅ Retrieved metadata for video ${videoId} from DynamoDB`);
-        return result.Item as VideoMetadataRecord;
-      } else {
-        console.log(`ℹ️ No metadata found for video ${videoId} in DynamoDB`);
-        return null;
-      }
-    } catch (error: any) {
-      console.error(`❌ Failed to retrieve metadata for video ${videoId}:`, error.message);
-      return null;
-    }
-  }
-
-  /**
-   * Save download job to DynamoDB
-   * 
-   * @param job - Download job object
-   * @returns Promise<boolean> - Success status
-   */
-  async saveDownloadJob(job: DownloadJob): Promise<boolean> {
-    try {
-      const record: DownloadJobRecord = {
-        jobId: job.id,
-        videoUrl: job.url,
-        status: job.status,
-        progressJson: JSON.stringify(job.progress),
-        videoId: job.metadata?.id,
-        filePathsJson: job.filePaths ? JSON.stringify(job.filePaths) : undefined,
-        errorMessage: job.error,
-        createdAt: job.createdAt.toISOString(),
-        completedAt: job.completedAt?.toISOString(),
-        // Set TTL for 30 days from now
-        ttl: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)
-      };
-
-      const putCommand: PutCommandInput = {
-        TableName: this.config.jobsTableName,
-        Item: record
-      };
-
-      await this.docClient.send(new PutCommand(putCommand));
-      console.log(`✅ Saved job ${job.id} to DynamoDB with status: ${job.status}`);
-      return true;
-    } catch (error: any) {
-      console.error(`❌ Failed to save job ${job.id}:`, error.message);
-      return false;
-    }
-  }
-
-  /**
-   * Update download job status in DynamoDB
-   * 
-   * @param jobId - Job ID to update
-   * @param status - New status
-   * @param additionalData - Additional data to update
-   * @returns Promise<boolean> - Success status
-   */
-  async updateJobStatus(
-    jobId: string, 
-    status: DownloadJob['status'],
-    additionalData?: {
-      progress?: DownloadJob['progress'];
-      filePaths?: DownloadJob['filePaths'];
-      error?: string;
-      completedAt?: Date;
-    }
-  ): Promise<boolean> {
-    try {
-      const updateExpressions: string[] = ['#status = :status'];
-      const expressionAttributeNames: Record<string, string> = {
-        '#status': 'status'
-      };
-      const expressionAttributeValues: Record<string, any> = {
-        ':status': status
-      };
-
-      if (additionalData?.progress) {
-        updateExpressions.push('progressJson = :progress');
-        expressionAttributeValues[':progress'] = JSON.stringify(additionalData.progress);
-      }
-
-      if (additionalData?.filePaths) {
-        updateExpressions.push('filePathsJson = :filePaths');
-        expressionAttributeValues[':filePaths'] = JSON.stringify(additionalData.filePaths);
-      }
-
-      if (additionalData?.error) {
-        updateExpressions.push('errorMessage = :error');
-        expressionAttributeValues[':error'] = additionalData.error;
-      }
-
-      if (additionalData?.completedAt) {
-        updateExpressions.push('completedAt = :completedAt');
-        expressionAttributeValues[':completedAt'] = additionalData.completedAt.toISOString();
-      }
-
-      const updateCommand: UpdateCommandInput = {
-        TableName: this.config.jobsTableName,
-        Key: {
-          jobId: jobId
-        },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'UPDATED_NEW'
-      };
-
-      await this.docClient.send(new UpdateCommand(updateCommand));
-      console.log(`✅ Updated job ${jobId} status to: ${status}`);
-      return true;
-    } catch (error: any) {
-      console.error(`❌ Failed to update job ${jobId}:`, error.message);
-      return false;
-    }
-  }
-
-  /**
-   * Get download job from DynamoDB
-   * 
-   * @param jobId - Job ID to retrieve
-   * @returns Promise<DownloadJobRecord | null> - Job record or null if not found
-   */
-  async getDownloadJob(jobId: string): Promise<DownloadJobRecord | null> {
-    try {
-      const getCommand: GetCommandInput = {
-        TableName: this.config.jobsTableName,
-        Key: {
-          jobId: jobId
-        }
-      };
-
-      const result = await this.docClient.send(new GetCommand(getCommand));
-      
-      if (result.Item) {
-        console.log(`✅ Retrieved job ${jobId} from DynamoDB`);
-        return result.Item as DownloadJobRecord;
-      } else {
-        console.log(`ℹ️ No job found with ID ${jobId} in DynamoDB`);
-        return null;
-      }
-    } catch (error: any) {
-      console.error(`❌ Failed to retrieve job ${jobId}:`, error.message);
-      return null;
-    }
-  }
-
-  /**
-   * Query jobs by status
-   * 
-   * @param status - Job status to filter by
-   * @param limit - Maximum number of results to return
-   * @returns Promise<DownloadJobRecord[]> - Array of job records
-   */
-  async getJobsByStatus(status: DownloadJob['status'], limit: number = 50): Promise<DownloadJobRecord[]> {
-    try {
-      const queryCommand: QueryCommandInput = {
-        TableName: this.config.jobsTableName,
-        IndexName: 'StatusIndex',
-        KeyConditionExpression: '#status = :status',
-        ExpressionAttributeNames: {
-          '#status': 'status'
-        },
-        ExpressionAttributeValues: {
-          ':status': status
-        },
-        Limit: limit,
-        ScanIndexForward: false // Sort by createdAt descending
-      };
-
-      const result = await this.docClient.send(new QueryCommand(queryCommand));
-      console.log(`✅ Retrieved ${result.Items?.length || 0} jobs with status: ${status}`);
-      return (result.Items || []) as DownloadJobRecord[];
-    } catch (error: any) {
-      console.error(`❌ Failed to query jobs by status ${status}:`, error.message);
-      return [];
-    }
-  }
-
-  /**
-   * Clean up completed jobs older than specified days
-   * 
-   * @param olderThanDays - Delete jobs older than this many days
-   * @returns Promise<number> - Number of jobs deleted
-   */
-  async cleanupOldJobs(olderThanDays: number = 7): Promise<number> {
-    try {
-      const cutoffDate = new Date(Date.now() - (olderThanDays * 24 * 60 * 60 * 1000));
-      const cutoffIso = cutoffDate.toISOString();
-
-      // Query for completed jobs older than cutoff
-      const scanCommand: ScanCommandInput = {
-        TableName: this.config.jobsTableName,
-        FilterExpression: '#status = :completedStatus AND createdAt < :cutoffDate',
-        ExpressionAttributeNames: {
-          '#status': 'status'
-        },
-        ExpressionAttributeValues: {
-          ':completedStatus': 'completed',
-          ':cutoffDate': cutoffIso
-        }
-      };
-
-      const result = await this.docClient.send(new ScanCommand(scanCommand));
-      const jobsToDelete = result.Items || [];
-
-      let deletedCount = 0;
-      for (const job of jobsToDelete) {
-        try {
-          const deleteCommand: DeleteCommandInput = {
-            TableName: this.config.jobsTableName,
-            Key: {
-              jobId: job.jobId
-            }
-          };
-
-          await this.docClient.send(new DeleteCommand(deleteCommand));
-          deletedCount++;
-        } catch (deleteError: any) {
-          console.warn(`⚠️ Failed to delete job ${job.jobId}:`, deleteError.message);
-        }
-      }
-
-      console.log(`🧹 Cleaned up ${deletedCount} completed jobs older than ${olderThanDays} days`);
-      return deletedCount;
-    } catch (error: any) {
-      console.error(`❌ Failed to cleanup old jobs:`, error.message);
-      return 0;
-    }
-  }
-
-  /**
-   * Convert video metadata to podcast episode data and save to DynamoDB
-   * 
-   * @param metadata - Video metadata from yt-dlp
-   * @param audioUrl - S3 URL or local path to the audio file
-   * @param analysisConfig - Configuration for content analysis
-   * @param videoUrl - S3 URL or local path to the video file (optional)
-   * @returns Promise<string | null> - Episode ID if successful, null if failed
-   */
-  async convertAndSaveAsPodcastEpisode(
-    metadata: VideoMetadata,
-    audioUrl: string,
-    analysisConfig?: AnalysisConfig,
-    videoUrl?: string
-  ): Promise<string | null> {
-    try {
-      if (!this.config.podcastEpisodesTableName) {
-        console.error('❌ Podcast episodes table name not configured');
-        return null;
-      }
-
-      // Ensure podcast episodes table exists
-      await this.ensurePodcastEpisodesTableExists();
-
-      // Convert video metadata to podcast episode data
-      const episodeData = await this.convertVideoToPodcastEpisode(metadata, audioUrl, analysisConfig, videoUrl);
-
-      // Save to DynamoDB
-      const success = await this.savePodcastEpisode(episodeData);
-      
-      if (success) {
-        console.log(`✅ Successfully converted and saved video ${metadata.id} as podcast episode`);
-        return episodeData.id;
-      } else {
-        console.error(`❌ Failed to save podcast episode for video ${metadata.id}`);
-        return null;
-      }
-    } catch (error: any) {
-      console.error(`❌ Failed to convert video ${metadata.id} to podcast episode:`, error.message);
-      return null;
-    }
-  }
-
-  /**
-   * Convert video metadata to podcast episode data structure
-   * 
-   * @param metadata - Video metadata from yt-dlp
-   * @param audioUrl - S3 URL or local path to the audio file
-   * @param analysisConfig - Configuration for content analysis
-   * @param videoUrl - S3 URL or local path to the video file (optional)
-   * @returns Promise<PodcastEpisodeData>
-   */
-  private async convertVideoToPodcastEpisode(
-    metadata: VideoMetadata,
-    audioUrl: string,
-    analysisConfig?: AnalysisConfig,
-    videoUrl?: string
-  ): Promise<PodcastEpisodeData> {
-    // Create slug from title for file naming
-    const episodeTitle = this.createSlug(metadata.title);
-    const podcastTitle = this.createSlug(metadata.uploader);
-    
-    // Format date
-    const publishedDate = this.formatDate(metadata.upload_date);
-    
-    // Create file name
-    const fileName = `${podcastTitle}/${episodeTitle}.mp3`;
-
-    // Initialize episode data with all required attributes
-    const episodeData: PodcastEpisodeData = {
-      // Core identifiers
-      id: uuidv4(),
-      podcast_title: metadata.uploader.toLowerCase().trim(),
-      episode_title: episodeTitle,
-      
-      // Processing status fields (default to "PENDING" when unknown)
-      audio_chunking_status: "PENDING",
-      chunking_status: "PENDING",
-      summarization_status: "PENDING",
-      transcription_status: "PENDING",
-      
-      // Audio and file information
-      audio_url: audioUrl,
-      file_name: fileName,
-      
-      // Content metadata
-      description: (metadata.description || '').substring(0, 2000), // Limit to avoid DynamoDB size issues
-      episode_downloaded: true, // Assuming it's downloaded if we have audio URL
-      episode_title_details: metadata.title,
-      
-      // Content categorization (default to empty arrays/strings when unknown)
-      genres: [],
-      topics: [],
-      personalities: [],
-      
-      // Guest and host information (default to "PENDING" when unknown)
-      guest_count: 0,
-      guest_description: "PENDING",
-      guest_extraction_confidence: "PENDING",
-      guest_names: [],
-      host_description: "PENDING",
-      host_name: "PENDING",
-      
-      // Chunking information (default to 0 when unknown)
-      num_chunks: 0,
-      num_removed_chunks: 0,
-      
-      // Data completeness flag
-      partial_data: false,
-      
-      // Podcast metadata
-      podcast_author: metadata.uploader.toLowerCase().trim(),
-      published_date: publishedDate,
-      rss_url: "PENDING",
-      source: metadata.extractor || 'youtube',
-      
-      // Summary and transcript information (default to "PENDING" when unknown)
-      summary_metadata: "PENDING",
-      transcript_uri: "PENDING",
-      
-      // Optional fields for backward compatibility
-      image: metadata.thumbnail,
-      source_url: metadata.webpage_url,
-      video_url: videoUrl, // S3 URL or local path to the video file
-      episode_url: metadata.webpage_url,
-      episode_time_millis: metadata.duration * 1000,
-      number_of_personalities: 0,
-      topic_match: true,
-      original_video_metadata: JSON.stringify({
-        id: metadata.id,
-        title: metadata.title,
-        uploader: metadata.uploader,
-        duration: metadata.duration,
-        upload_date: metadata.upload_date,
-        view_count: metadata.view_count,
-        like_count: metadata.like_count,
-        webpage_url: metadata.webpage_url,
-        extractor: metadata.extractor,
-        thumbnail: metadata.thumbnail,
-        description: (metadata.description || '').substring(0, 1000) // Limit description length
-      }),
-      view_count: metadata.view_count,
-      like_count: metadata.like_count,
-      ttl: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60) // 1 year TTL
-    };
-
-    // Perform content analysis if enabled
-    if (analysisConfig?.enable_ai_analysis) {
-      try {
-        const analysis = await this.analyzeContent(
-          metadata.description || metadata.title,
-          metadata.title,
-          analysisConfig
-        );
-        
-        episodeData.personalities = analysis.personalities.map(p => p.toLowerCase().trim());
-        episodeData.topics = analysis.matching_topics;
-        episodeData.number_of_personalities = analysis.number_of_personalities;
-        episodeData.topic_match = analysis.topic_match;
-      } catch (error: any) {
-        console.warn(`⚠️ Content analysis failed for ${metadata.id}:`, error.message);
-        episodeData.partial_data = true;
-      }
-    }
-
-    return episodeData;
   }
 
   /**
@@ -878,81 +348,6 @@ export class DynamoDBService {
   }
 
   /**
-   * Get episodes by transcription status
-   * 
-   * @param status - Transcription status to filter by
-   * @param limit - Maximum number of results
-   * @returns Promise<PodcastEpisodeData[]>
-   */
-  async getEpisodesByTranscriptionStatus(
-    status: PodcastEpisodeData['transcription_status'], 
-    limit: number = 50
-  ): Promise<PodcastEpisodeData[]> {
-    try {
-      if (!this.config.podcastEpisodesTableName) {
-        console.error('❌ Podcast episodes table name not configured');
-        return [];
-      }
-
-      const queryCommand: QueryCommandInput = {
-        TableName: this.config.podcastEpisodesTableName,
-        IndexName: 'TranscriptionStatusIndex',
-        KeyConditionExpression: 'transcription_status = :status',
-        ExpressionAttributeValues: {
-          ':status': status
-        },
-        Limit: limit,
-        ScanIndexForward: false // Sort by published_date descending
-      };
-
-      const result = await this.docClient.send(new QueryCommand(queryCommand));
-      console.log(`✅ Retrieved ${result.Items?.length || 0} episodes with status: ${status}`);
-      return (result.Items || []) as PodcastEpisodeData[];
-    } catch (error: any) {
-      console.error(`❌ Failed to query episodes by status ${status}:`, error.message);
-      return [];
-    }
-  }
-
-  /**
-   * Update episode transcription status
-   * 
-   * @param episodeId - Episode ID
-   * @param status - New transcription status
-   * @returns Promise<boolean>
-   */
-  async updateTranscriptionStatus(
-    episodeId: string, 
-    status: PodcastEpisodeData['transcription_status']
-  ): Promise<boolean> {
-    try {
-      if (!this.config.podcastEpisodesTableName) {
-        console.error('❌ Podcast episodes table name not configured');
-        return false;
-      }
-
-      const updateCommand: UpdateCommandInput = {
-        TableName: this.config.podcastEpisodesTableName,
-        Key: {
-          id: episodeId
-        },
-        UpdateExpression: 'SET transcription_status = :status',
-        ExpressionAttributeValues: {
-          ':status': status
-        },
-        ReturnValues: 'UPDATED_NEW'
-      };
-
-      await this.docClient.send(new UpdateCommand(updateCommand));
-      console.log(`✅ Updated episode ${episodeId} transcription status to: ${status}`);
-      return true;
-    } catch (error: any) {
-      console.error(`❌ Failed to update episode ${episodeId} transcription status:`, error.message);
-      return false;
-    }
-  }
-
-  /**
    * Ensure podcast episodes table exists, create if it doesn't
    */
   private async ensurePodcastEpisodesTableExists(): Promise<void> {
@@ -966,198 +361,566 @@ export class DynamoDBService {
       }));
       console.log(`📋 Podcast episodes table ${this.config.podcastEpisodesTableName} already exists`);
     } catch (error: any) {
-      if (error instanceof ResourceNotFoundException) {
-        console.log(`📋 Creating podcast episodes table: ${this.config.podcastEpisodesTableName}`);
-        await this.createPodcastEpisodesTable();
-      } else {
-        throw error;
-      }
+      logger.info(`Checking if podcast episodes table ${this.config.podcastEpisodesTableName} exists failed: ${error.message}`);
     }
   }
 
-  /**
-   * Create the podcast episodes table with appropriate schema
-   */
-  private async createPodcastEpisodesTable(): Promise<void> {
-    if (!this.config.podcastEpisodesTableName) {
-      throw new Error('Podcast episodes table name not configured');
-    }
-
-    const command = new CreateTableCommand({
-      TableName: this.config.podcastEpisodesTableName,
-      KeySchema: [
-        {
-          AttributeName: 'id',
-          KeyType: 'HASH' // Partition key
-        }
-      ],
-      AttributeDefinitions: [
-        {
-          AttributeName: 'id',
-          AttributeType: 'S'
-        },
-        {
-          AttributeName: 'podcast_title',
-          AttributeType: 'S'
-        },
-        {
-          AttributeName: 'published_date',
-          AttributeType: 'S'
-        },
-        {
-          AttributeName: 'transcription_status',
-          AttributeType: 'S'
-        }
-      ],
-      GlobalSecondaryIndexes: [
-        {
-          IndexName: 'PodcastTitleIndex',
-          KeySchema: [
-            {
-              AttributeName: 'podcast_title',
-              KeyType: 'HASH'
-            },
-            {
-              AttributeName: 'published_date',
-              KeyType: 'RANGE'
-            }
-          ],
-          Projection: {
-            ProjectionType: 'ALL'
-          }
-        },
-        {
-          IndexName: 'TranscriptionStatusIndex',
-          KeySchema: [
-            {
-              AttributeName: 'transcription_status',
-              KeyType: 'HASH'
-            },
-            {
-              AttributeName: 'published_date',
-              KeyType: 'RANGE'
-            }
-          ],
-          Projection: {
-            ProjectionType: 'ALL'
-          }
-        }
-      ],
-      BillingMode: 'PAY_PER_REQUEST',
-      StreamSpecification: {
-        StreamEnabled: false
-      },
-      SSESpecification: {
-        Enabled: true
-      }
-    });
-
-    await this.dynamoClient.send(command);
-    console.log(`✅ Created podcast episodes table: ${this.config.podcastEpisodesTableName}`);
-  }
-
-  /**
-   * Create a URL-friendly slug from text
-   * 
-   * @param text - Text to convert to slug
-   * @returns string - URL-friendly slug
-   */
-  private createSlug(text: string): string {
-    return text
-      .toLowerCase()
-      .trim()
-      .replace(/[^\w\s-]/g, '') // Remove special characters
-      .replace(/[\s_-]+/g, '-') // Replace spaces and underscores with hyphens
-      .replace(/^-+|-+$/g, ''); // Remove leading/trailing hyphens
-  }
-
-  /**
-   * Format date string to ISO format
-   * 
-   * @param dateStr - Date string in YYYYMMDD format
-   * @returns string - ISO date string
-   */
-  private formatDate(dateStr: string): string {
-    try {
-      // Parse YYYYMMDD format
-      const year = dateStr.substring(0, 4);
-      const month = dateStr.substring(4, 6);
-      const day = dateStr.substring(6, 8);
-      const date = new Date(`${year}-${month}-${day}`);
-      return date.toISOString().split('T')[0] + ' 00:00:00';
-    } catch (error) {
-      // Fallback to current date
-      return new Date().toISOString().split('T')[0] + ' 00:00:00';
-    }
-  }
-
-  /**
-   * Analyze content for personalities and topics
-   * This is a placeholder - you would integrate with AWS Bedrock or another AI service
-   * 
-   * @param content - Content to analyze
-   * @param title - Content title
-   * @param config - Analysis configuration
-   * @returns Promise<ContentAnalysisResult>
-   */
-  private async analyzeContent(
-    content: string,
-    title: string,
-    config: AnalysisConfig
-  ): Promise<ContentAnalysisResult> {
-    // This is a simplified implementation
-    // In production, you would integrate with AWS Bedrock like in your Python example
+  processEpisodeMetadata(
+    videoMetadata: VideoMetadata,
+    audioS3Link: string,
+  ): PodcastEpisodeData {
+    logger.info("Processing episode metadata");
     
-    const result: ContentAnalysisResult = {
-      number_of_personalities: 0,
+    const podcast_title = create_slug(videoMetadata.uploader || "");
+    const episode_title = create_slug(videoMetadata.title || "");
+    const author = videoMetadata.uploader || "";
+    
+    // Generate file name structure using slugs
+    const file_name = `${podcast_title}/${episode_title}`;
+    
+    const episode_data: PodcastEpisodeData = {
+      id: uuidv4(),
+      episode_id: videoMetadata.id,
+      podcast_id: create_slug(videoMetadata.uploader || ""),
+      episode_title: episode_title,
+      episode_title_details: videoMetadata.title || "",
+      podcast_title: podcast_title,
+      podcast_author: author,
+      description: videoMetadata.description?.trim() || "",
+      published_date: parseDate(videoMetadata.upload_date)||videoMetadata.upload_date || "",
+      episode_time_millis: videoMetadata.duration ? videoMetadata.duration * 1000 : 0,
+      audio_url: audioS3Link,
+      episode_url: videoMetadata.webpage_url || "",
+      image: JSON.stringify(videoMetadata.thumbnail || ""),
+      genres: videoMetadata.tags || [],
+      country: videoMetadata.country || "",
+      episode_guid: videoMetadata.id,
+      file_name: `${file_name}.mp3`,
+      source: "youtube",
+      video_url: "",
+      rss_url: "",
+      
+      // Status fields
+      transcription_status: "new",
+      audio_chunking_status: "PENDING",
+      chunking_status: "PENDING",
+      summarization_status: "PENDING",
+      quotes_audio_status: "PENDING",
+      
+      // Analysis fields with defaults
       personalities: [],
-      topic_match: true,
-      matching_topics: []
+      topics: [],
+      guest_count: 0,
+      guest_description: "PENDING",
+      guest_extraction_confidence: "PENDING",
+      guest_names: [],
+      host_description: "PENDING",
+      host_name: "PENDING",
+      number_of_personalities: 0,
+      topic_match: false,
+      
+      // Processing fields
+      num_chunks: 0,
+      num_removed_chunks: 0,
+      summary_metadata: "PENDING",
+      transcript_uri: "PENDING",
+      
+      // Download status
+      episode_downloaded: true, 
+      partial_data: false
     };
 
-    // Simple keyword-based analysis as fallback
-    if (config.topic_keywords && config.topic_keywords.length > 0) {
-      const contentLower = content.toLowerCase();
-      const titleLower = title.toLowerCase();
-      
-      result.matching_topics = config.topic_keywords.filter(keyword => 
-        contentLower.includes(keyword.toLowerCase()) || 
-        titleLower.includes(keyword.toLowerCase())
-      );
-      
-      result.topic_match = result.matching_topics.length > 0;
-    } else {
-      // Extract basic topics from title/content
-      const commonTopics = ['technology', 'business', 'science', 'entertainment', 'sports', 'politics', 'health'];
-      const contentLower = (content + ' ' + title).toLowerCase();
-      
-      result.matching_topics = commonTopics.filter(topic => 
-        contentLower.includes(topic)
-      );
-    }
+    logger.info(`Processed episode metadata for: ${episode_data.episode_title}`);
+    return episode_data;
+  }
 
-    // Simple personality detection (this would be much more sophisticated in production)
-    const personalityPatterns = [
-      /with\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/g,
-      /featuring\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/g,
-      /interview\s+with\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/g
-    ];
-
-    const personalities = new Set<string>();
-    personalityPatterns.forEach(pattern => {
-      let match;
-      while ((match = pattern.exec(content)) !== null) {
-        personalities.add(match[1]);
+  /**
+   * Update episode with video S3 link
+   * 
+   * @param episodeId - Episode ID to update
+   * @param videoS3Link - S3 link for the video
+   * @returns Promise<boolean> - Success status
+   */
+  async updateEpisodeVideoLink(episodeId: string, videoS3Link: string): Promise<boolean> {
+    try {
+      if (!this.config.podcastEpisodesTableName) {
+        console.error('❌ Podcast episodes table name not configured');
+        return false;
       }
-    });
 
-    result.personalities = Array.from(personalities);
-    result.number_of_personalities = result.personalities.length;
+      const updateCommand: UpdateCommandInput = {
+        TableName: this.config.podcastEpisodesTableName,
+        Key: {
+          id: episodeId
+        },
+        UpdateExpression: 'SET video_url = :videoUrl',
+        ExpressionAttributeValues: {
+          ':videoUrl': videoS3Link
+        },
+        ReturnValues: 'UPDATED_NEW'
+      };
 
-    return result;
+      await this.docClient.send(new UpdateCommand(updateCommand));
+      console.log(`✅ Updated episode ${episodeId} with video S3 link`);
+      return true;
+    } catch (error: any) {
+      console.error(`❌ Failed to update episode ${episodeId} with video link:`, error.message);
+      return false;
+    }
+  }
+
+// Augmented method to process episode metadata with analysis  
+  /**
+   * Process episodes from podcast feed
+   * 
+   * @param episode - Singular Episode
+   * @param podcast_feed - Podcast feed metadata
+   * @param topic_keywords - Array of topic keywords to match
+   * @param person_keywords - Array of person keywords to match
+   */
+  async processEpisodeMetadataWithAnalysis(
+    fetch_itunes: boolean,
+    episode: VideoMetadata,
+    topic_keywords: string[] = []
+  ): Promise<PodcastEpisodeData | undefined> {
+      logger.info("Processing new episodes");
+      const podcast_title = episode.title?.toLowerCase() || "";
+      const author = episode.uploader?.toLowerCase() || "";
+      const title = episode.title?.toLowerCase() || "";
+      const summary = episode.description?.toLowerCase() || ""; 
+      // const rss_link =  await this.getRSSLink(podcast_title);
+      let is_partial = false;
+
+      const episode_data: Partial<PodcastEpisodeData> = {
+        id: uuidv4(),
+        episode_title_details: episode.title?.toLowerCase() || "",
+        podcast_title: podcast_title,
+        description: episode.description?.trim() || "",
+        audio_url: episode.enclosures?.[0]?.href?.trim() || "",
+        transcription_status: "new",
+        published_date: parseDate(episode.published),
+        // rss_url: rss_link || "",
+        podcast_author: author || "",
+        episode_downloaded: false,
+      };
+
+      try {
+        // logger.info("Trying to fetch metadata from iTunes");
+        // if (!fetch_itunes) {
+        //   logger.info("Skipping iTunes metadata fetch as per configuration");
+        //   const episode_metadata = await this.getEpisodeMetadata(title.trim(), "itunes");
+        //   return;
+        // }
+        
+        // if (!episode_metadata) {
+        //   is_partial = true;
+        //   logger.info("Episode information not found");
+        //   await this.insertUnfoundUrl(
+        //     podcast_title, 
+        //     episode_data.episode_title_details!, 
+        //     `No episode found for ${title}`, 
+        //     "episode_details_not_found"
+        //   );
+        // } else {
+          episode_data.episode_id = episode.id;
+          episode_data.podcast_id = episode.uploader?.toLowerCase() || "";
+          episode_data.episode_guid = episode.episode_guid;
+          episode_data.image = JSON.stringify(episode.thumbnail);
+          episode_data.episode_url = episode.webpage_url;
+          episode_data.genres = episode.tags;
+          episode_data.country = episode.country;
+          episode_data.episode_time_millis = episode.duration ? episode.duration * 1000 : 0; 
+        // }
+      } catch (error: any) {
+        logger.error(`Error while inserting data, so going forward and saving partial data.\nException: ${error.message}`);
+        is_partial = true;
+        await this.insertUnfoundUrl(
+          podcast_title,
+          episode_data.episode_title_details!,
+          error.message,
+          "episode_details_not_found"
+        );
+      }
+
+      logger.info("Analyzing topic and personalities");
+      let analysis: ContentAnalysisResult;
+      
+      try {
+        if (topic_keywords.length > 0) {
+          analysis = await this.analyzePodcastSummaryCohere(summary, topic_keywords, title);
+        } else {
+          analysis = await this.analyzePodcastSummaryCohereNonTopics(summary, title);
+        }
+      } catch (error: any) {
+        logger.error(`Error occurred while performing analysis: ${error.message}`);
+        await this.insertUnfoundUrl(
+          podcast_title,
+          episode_data.episode_title_details!,
+          error.message,
+          "episode_analysis_failed"
+        );
+        logger.info(`Skipping to insert ${episode.title?.toLowerCase()}`);
+        return;
+      }
+
+      // Converting the episode title to slugs
+      const episode_title = create_slug(episode.title?.toLowerCase() || "");
+      const personalities = analysis.personalities.map(person => person.toLowerCase().trim());
+      
+      let file_name = podcast_title.replace(/\s+/g, "-");
+      file_name = create_slug(file_name);
+      file_name += `/${episode_title}`;
+      
+      episode_data.file_name = `${file_name}.mp3`;
+      episode_data.personalities = personalities;
+      episode_data.topics = analysis.matching_topics;
+      episode_data.episode_title = episode_title;
+      episode_data.source = "itunes";
+      episode_data.partial_data = is_partial;
+      
+      // Set default values for required fields
+      episode_data.audio_chunking_status = "PENDING";
+      episode_data.chunking_status = "PENDING";
+      episode_data.summarization_status = "PENDING";
+      episode_data.quotes_audio_status = "PENDING";
+      episode_data.guest_count = analysis.number_of_personalities;
+      episode_data.guest_description = "PENDING";
+      episode_data.guest_extraction_confidence = "PENDING";
+      episode_data.guest_names = personalities;
+      episode_data.host_description = "PENDING";
+      episode_data.host_name = "PENDING";
+      episode_data.num_chunks = 0;
+      episode_data.num_removed_chunks = 0;
+      episode_data.summary_metadata = "PENDING";
+      episode_data.transcript_uri = "PENDING";
+      episode_data.number_of_personalities = analysis.number_of_personalities;
+      episode_data.topic_match = analysis.topic_match;
+
+      logger.info(`Episode to add to the database: ${JSON.stringify(episode_data)}`);
+    
+    return episode_data as PodcastEpisodeData;
+    
+  }
+  private async insertUnfoundUrl(podcast_title: string, arg1: string, message: any, arg3: string) {
+    throw new Error('Method not implemented.');
+  }
+
+
+  // /**
+  //  * Get episode metadata from iTunes with retry mechanism
+  //  * 
+  //  * @param episode_title - Episode title to search for
+  //  * @returns Promise<EpisodeMetadata | null>
+  //  */
+  // private async itunesEpisodeMetadata(episode_title: string): Promise<EpisodeMetadata | null> {
+  //   const maxRetries = 3;
+  //   const initialDelay = 5 * 60 * 1000; // 5 minutes
+
+  //   for (let attempt = 0; attempt < maxRetries; attempt++) {
+  //     try {
+  //       const encoded_title = encodeURIComponent(episode_title);
+  //       const search_url = `https://itunes.apple.com/search?term=${encoded_title}&entity=podcastEpisode`;
+        
+  //       logger.info(`Requesting ${search_url}`);
+        
+  //       const response = await this.makeHttpRequest(search_url);
+        
+  //       if (response.status !== 200) {
+  //         logger.error(`Request failed. Status code: ${response.status}, Url: ${search_url}`);
+  //         return null;
+  //       }
+
+  //       try {
+  //         const json_data = typeof response.data === 'object' ? response.data : JSON.parse(response.data);
+          
+  //         if (json_data.results && json_data.results.length > 0) {
+  //           for (const episodeInfo of json_data.results) {
+  //             if (episode_title.toLowerCase() === episodeInfo.trackName?.trim().toLowerCase()) {
+  //               return {
+  //                 episode_id: episodeInfo.trackId,
+  //                 podcast_id: episodeInfo.collectionId,
+  //                 episode_guid: episodeInfo.episodeGuid || "",
+  //                 image: {
+  //                   artworkUrl600: episodeInfo.artworkUrl600 || "",
+  //                   artworkUrl160: episodeInfo.artworkUrl160 || "",
+  //                   artworkUrl60: episodeInfo.artworkUrl60 || "",
+  //                 },
+  //                 genres: (episodeInfo.genres || []).map((genre: any) => genre.name || ""),
+  //                 country: episodeInfo.country || "",
+  //                 trackTimeMillis: episodeInfo.trackTimeMillis || 0,
+  //                 episode_url: episodeInfo.trackViewUrl || ""
+  //               };
+  //             }
+  //           }
+  //           logger.info(`Podcast not found, episode title: ${episode_title}`);
+  //           return null;
+  //         }
+  //       } catch (jsonError) {
+  //         logger.error(`Failed to parse JSON. Response content: ${response.data}`);
+  //         return null;
+  //       }
+  //     } catch (error: any) {
+  //       logger.error(`Error occurred (attempt ${attempt + 1}/${maxRetries}): ${error.message}`);
+        
+  //       if (attempt < maxRetries - 1) {
+  //         const delay = initialDelay * Math.pow(2, attempt);
+  //         logger.info(`Retrying in ${delay / 1000} seconds...`);
+  //         await sleep(delay);
+  //       } else {
+  //         throw error;
+  //       }
+  //     }
+  //   }
+    
+  //   return null;
+  // }
+  // /**
+  //  * Get episode metadata from specified source
+  //  * 
+  //  * @param episode_title - Episode title to search for
+  //  * @param type - Source type (currently only "itunes" supported)
+  //  * @returns Promise<EpisodeMetadata | null>
+  //  */
+  // private async getEpisodeMetadata(episode_title: string, type: string = "itunes"): Promise<EpisodeMetadata | null> {
+  //   try {
+  //     if (type === "itunes") {
+  //       const episode_metadata = await this.itunesEpisodeMetadata(episode_title);
+  //       return episode_metadata;
+  //     }
+  //     return null;
+  //   } catch (error: any) {
+  //     return null;
+  //   }
+  // }
+
+  /**
+   * Analyze podcast summary using Cohere model with topic keywords
+   * 
+   * @param summary - Podcast summary
+   * @param topic_keywords - Array of topic keywords
+   * @param title - Podcast title
+   * @returns Promise<ContentAnalysisResult>
+   */
+  private async analyzePodcastSummaryCohere(
+    summary: string, 
+    topic_keywords: string[], 
+    title: string
+  ): Promise<ContentAnalysisResult> {
+    const maxRetries = 4;
+    
+    for (let retries = 0; retries < maxRetries; retries++) {
+      try {
+        const client = new BedrockRuntimeClient({ region: "us-east-1" });
+        const model_id = "cohere.command-r-plus-v1:0";
+
+        const system = `
+          You are an AI assistant specializing in analyzing podcast content. 
+          Your task is to extract structured information from the provided podcast summary and title. 
+          - "number_of_personalities": The total number of guests or personalities mentioned in the podcast who were interviewed by host.
+          - "personalities": A list of the names of guests or personalities who were interviewed by host (if any).
+          - "topic_match": A boolean indicating whether the any topics discussed match or are similar to any provided topic list. If the topic_keywords is empty then mark it as true.
+          - "matching_topics": A list of topics from the provided list that match or are semantically similar or has same meaning to those discussed.
+        `;
+
+        const initial_prompt = `
+          \n
+          Analyze the below podcast information:
+          - Podcast Title: <title>${title}</title>
+          - Podcast Summary: <summary>${summary}</summary>
+          - Provided Topic List: <topic_keywords>${JSON.stringify(topic_keywords)}</topic_keywords>
+        `;
+
+        const output_format = `
+          \n
+          For each podcast, provide your analysis using XML tags with the following below structure:
+
+          <podcast_analysis>
+              <personalities_info>
+                  <count>[Total number of guests/personalities who were interviewed by host (in integer)]</count>
+                  <names>
+                      <person>[Name of each guest/personality who were interviewed by host. Create such more for each guest/personality who were interviewed by host]</person>
+                  </names>
+              </personalities_info>
+
+              <topic_analysis>
+                  <matches_provided_topics>[true/false]</matches_provided_topics>
+                  <matching_topics>
+                      <topic>[Each topic that matches or is semantically similar to provided topics. ]</topic>
+                  </matching_topics>
+              </topic_analysis>
+          </podcast_analysis>
+
+          \n
+          Your answer must start with tag <podcast_analysis> and end with tag </podcast_analysis>
+          skip preamble;
+        `;
+
+        const prompt = system + initial_prompt + output_format;
+
+        const native_request = {
+          message: prompt,
+          max_tokens: 512,
+          temperature: 0.2,
+          p: 0.01,
+          k: 0
+        };
+
+        const command = new InvokeModelCommand({
+          modelId: model_id,
+          body: JSON.stringify(native_request)
+        });
+
+        const response = await client.send(command);
+        const response_body = JSON.parse(new TextDecoder().decode(response.body));
+        const value = response_body.text;
+
+        // Replace ampersands that are not part of a valid entity
+        const formatted_xml_value = value.replace(/&(?!amp;|lt;|gt;|quot;|apos;)/g, '&amp;');
+        
+        const parsedXML = parseXML(formatted_xml_value);
+        
+        const personalities_count = parseInt(extractXMLElements(parsedXML, 'count')[0] || '0');
+        const personalities = extractXMLElements(parsedXML, 'person');
+
+        const topic_match = extractXMLElements(parsedXML, 'matches_provided_topics')[0]?.toLowerCase() === 'true';
+        const matching_topics = extractXMLElements(parsedXML, 'topic');
+
+        return {
+          number_of_personalities: personalities_count,
+          personalities,
+          topic_match,
+          matching_topics
+        };
+
+      } catch (error: any) {
+        logger.error(`Error occurred (attempt ${retries + 1}/${maxRetries}): ${error.message}`);
+        
+        if (error.name === 'ThrottlingException') {
+          logger.info("Sleeping for 60 seconds before retrying...");
+          await sleep(60000);
+        }
+        
+        if (retries < maxRetries - 1) {
+          continue;
+        } else {
+          throw new Error("Max retries exceeded for Cohere Command R+ model invocation.");
+        }
+      }
+    }
+    
+    throw new Error("Max retries exceeded for Cohere Command R+ model invocation.");
+  }
+
+  /**
+   * Analyze podcast summary using Cohere model without specific topic keywords
+   * 
+   * @param summary - Podcast summary
+   * @param title - Podcast title
+   * @returns Promise<ContentAnalysisResult>
+   */
+  private async analyzePodcastSummaryCohereNonTopics(summary: string, title: string): Promise<ContentAnalysisResult> {
+    const maxRetries = 4;
+    
+    for (let retries = 0; retries < maxRetries; retries++) {
+      try {
+        const client = new BedrockRuntimeClient({ region: "us-east-1" });
+        const model_id = "cohere.command-r-plus-v1:0";
+
+        const system = `
+          You are an AI assistant specializing in analyzing podcast content. 
+          Your task is to extract structured information from the provided podcast summary and title. 
+          - "number_of_personalities": The total number of guests or personalities mentioned in the podcast who were interviewed by host.
+          - "personalities": A list of the names of guests or personalities who were interviewed by host (if any).
+          - "topics": A list of high level 1-2 words topic which will capture the intent of summary and will represent the summary.
+        `;
+
+        const initial_prompt = `
+          \n
+          Analyze the below podcast information:
+          - Podcast Title: <title>${title}</title>
+          - Podcast Summary: <summary>${summary}</summary>
+        `;
+
+        const output_format = `
+          \n
+          For each podcast, provide your analysis using XML tags with the following below structure:
+
+          <podcast_analysis>
+              <personalities_info>
+                  <count>[Total number of guests/personalities who were interviewed by host (in integer)]</count>
+                  <names>
+                      <person>[Name of each guest/personality who were interviewed by host. Create such more for each guest/personality who were interviewed by host]</person>
+                  </names>
+              </personalities_info>
+
+              <topic_analysis>
+                  <matches_provided_topics>[true/false]</matches_provided_topics>
+                  <matching_topics>
+                      <topic>[Each topic that matches or is semantically similar to provided topics. ]</topic>
+                  </matching_topics>
+              </topic_analysis>
+          </podcast_analysis>
+
+          \n
+          Your answer must start with tag <podcast_analysis> and end with tag </podcast_analysis>
+          skip preamble;
+        `;
+
+        const prompt = system + initial_prompt + output_format;
+
+        const native_request = {
+          message: prompt,
+          max_tokens: 400,
+          temperature: 0.2,
+          p: 0.1,
+          k: 0
+        };
+
+        const command = new InvokeModelCommand({
+          modelId: model_id,
+          body: JSON.stringify(native_request)
+        });
+
+        const response = await client.send(command);
+        const response_body = JSON.parse(new TextDecoder().decode(response.body));
+        const value = response_body.text;
+
+        // Replace ampersands that are not part of a valid entity
+        const formatted_xml_value = value.replace(/&(?!amp;|lt;|gt;|quot;|apos;)/g, '&amp;');
+        
+        const parsedXML = parseXML(formatted_xml_value);
+        
+        const personalities_count = parseInt(extractXMLElements(parsedXML, 'count')[0] || '0');
+        const personalities = extractXMLElements(parsedXML, 'person');
+
+        const matching_topics = extractXMLElements(parsedXML, 'topic');
+
+        return {
+          number_of_personalities: personalities_count,
+          personalities,
+          topic_match: true,
+          matching_topics
+        };
+
+      } catch (error: any) {
+        logger.error(`Error occurred (attempt ${retries + 1}/${maxRetries}): ${error.message}`);
+        
+        if (error.name === 'ThrottlingException') {
+          logger.info("Sleeping for 60 seconds before retrying...");
+          await sleep(60000);
+        }
+        
+        if (retries < maxRetries - 1) {
+          continue;
+        } else {
+          throw new Error("Max retries exceeded for Cohere Command R+ model invocation.");
+        }
+      }
+    }
+    
+    throw new Error("Max retries exceeded for Cohere Command R+ model invocation.");
   }
 }
-
 /**
  * Create DynamoDB service instance from environment variables
  * 
@@ -1168,32 +931,67 @@ export function createDynamoDBServiceFromEnv(): DynamoDBService | null {
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
     const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
     const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-    const endpointUrl = process.env.AWS_ENDPOINT_URL; // For LocalStack
     
-    const metadataTableName = process.env.DYNAMODB_METADATA_TABLE || 'video-pipeline-metadata';
-    const jobsTableName = process.env.DYNAMODB_JOBS_TABLE || 'video-pipeline-jobs';
-    const podcastEpisodesTableName = process.env.DYNAMODB_PODCAST_EPISODES_TABLE || 'PodcastEpisodeStore';
+    const podcastEpisodesTableName = process.env.DYNAMODB_PODCAST_EPISODES_TABLE || 'PodcastEpisodeStoreTest';
 
     const config: DynamoDBConfig = {
       region,
       accessKeyId,
       secretAccessKey,
-      endpointUrl,
-      metadataTableName,
-      jobsTableName,
       podcastEpisodesTableName
     };
 
     const service = new DynamoDBService(config);
     console.log(`📊 DynamoDB service initialized for region: ${region}`);
     
-    if (endpointUrl) {
-      console.log(`🔗 Using custom endpoint: ${endpointUrl} (LocalStack mode)`);
-    }
-
     return service;
   } catch (error: any) {
     console.error('❌ Failed to create DynamoDB service from environment:', error.message);
     return null;
   }
 }
+
+/**
+ * Parses various date formats into a standardized ISO string
+ * 
+ * @param published - Date value in various formats (string, Date object, timestamp)
+ * @returns Formatted date string in ISO format or undefined if parsing fails
+ */
+function parseDate(published: any): string | undefined {
+  if (!published) {
+    return undefined;
+  }
+  
+  try {
+    let date: Date;
+    
+    if (published instanceof Date) {
+      date = published;
+    } else if (typeof published === 'number') {
+      // Handle timestamp
+      date = new Date(published);
+    } else if (typeof published === 'string') {
+      // Check if it's a valid date string
+      if (published.trim() === '') {
+        return undefined;
+      }
+      
+      // Try parsing the string
+      date = new Date(published);
+    } else {
+      return undefined;
+    }
+    
+    // Check if date is valid
+    if (isNaN(date.getTime())) {
+      return undefined;
+    }
+    
+    // Return ISO string format
+    return date.toISOString();
+  } catch (error) {
+    logger.error(`Failed to parse date: ${published}`, error as Error);
+    return undefined;
+  }
+}
+

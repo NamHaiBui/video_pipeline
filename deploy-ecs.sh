@@ -1,275 +1,188 @@
 #!/bin/bash
 
-# Video Pipeline ECS Deployment Script
-# This script builds, pushes, and deploys the video pipeline to AWS ECS
+# AWS ECS Deployment Script for Video Pipeline
+# This script deploys the containerized video pipeline to AWS ECS
 
 set -e
 
 # Configuration
-PROJECT_NAME="video-pipeline"
-ENVIRONMENT="${ENVIRONMENT:-production}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
-ECR_REPOSITORY_NAME="${PROJECT_NAME}"
+AWS_REGION=${AWS_REGION:-us-east-1}
+ECR_REPOSITORY_NAME=${ECR_REPOSITORY_NAME:-video-pipeline}
+ECS_CLUSTER_NAME=${ECS_CLUSTER_NAME:-video-pipeline-cluster}
+ECS_SERVICE_NAME=${ECS_SERVICE_NAME:-video-pipeline-service}
+ECS_TASK_DEFINITION_NAME=${ECS_TASK_DEFINITION_NAME:-video-pipeline-task}
+IMAGE_TAG=${IMAGE_TAG:-latest}
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Functions
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+# Helper functions
+log() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
+error() {
     echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
 }
 
-# Check required tools
-check_dependencies() {
-    log_info "Checking dependencies..."
+# Check prerequisites
+check_prerequisites() {
+    log "Checking prerequisites..."
     
     if ! command -v aws &> /dev/null; then
-        log_error "AWS CLI is not installed. Please install it first."
-        exit 1
+        error "AWS CLI is not installed. Please install it first."
     fi
     
     if ! command -v docker &> /dev/null; then
-        log_error "Docker is not installed. Please install it first."
-        exit 1
+        error "Docker is not installed. Please install it first."
     fi
     
-    log_success "All dependencies are available"
+    # Check AWS credentials
+    if ! aws sts get-caller-identity &> /dev/null; then
+        error "AWS credentials not configured. Run 'aws configure' first."
+    fi
+    
+    log "Prerequisites check passed ✓"
 }
 
 # Get AWS account ID
 get_account_id() {
-    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    if [ -z "$AWS_ACCOUNT_ID" ]; then
-        log_error "Failed to get AWS account ID"
-        exit 1
-    fi
-    log_info "AWS Account ID: $AWS_ACCOUNT_ID"
+    aws sts get-caller-identity --query Account --output text
 }
 
 # Create ECR repository if it doesn't exist
 create_ecr_repository() {
-    log_info "Creating ECR repository if it doesn't exist..."
+    log "Checking ECR repository..."
     
-    aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME --region $AWS_REGION > /dev/null 2>&1 || {
-        log_info "Creating ECR repository: $ECR_REPOSITORY_NAME"
+    if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY_NAME" --region "$AWS_REGION" &> /dev/null; then
+        log "Creating ECR repository: $ECR_REPOSITORY_NAME"
         aws ecr create-repository \
-            --repository-name $ECR_REPOSITORY_NAME \
-            --region $AWS_REGION \
+            --repository-name "$ECR_REPOSITORY_NAME" \
+            --region "$AWS_REGION" \
             --image-scanning-configuration scanOnPush=true
-    }
-    
-    log_success "ECR repository ready"
+    else
+        log "ECR repository $ECR_REPOSITORY_NAME already exists ✓"
+    fi
 }
 
 # Build and push Docker image
 build_and_push_image() {
-    log_info "Building Docker image..."
+    local account_id=$(get_account_id)
+    local ecr_uri="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}:${IMAGE_TAG}"
     
-    # Get ECR login token
-    aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+    log "Building Docker image..."
+    docker build -f Dockerfile.production -t "$ECR_REPOSITORY_NAME:$IMAGE_TAG" .
     
-    # Build image
-    docker build -t $PROJECT_NAME:latest .
+    log "Tagging image for ECR..."
+    docker tag "$ECR_REPOSITORY_NAME:$IMAGE_TAG" "$ecr_uri"
     
-    # Tag image for ECR
-    ECR_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME"
-    docker tag $PROJECT_NAME:latest $ECR_URI:latest
-    docker tag $PROJECT_NAME:latest $ECR_URI:$(date +%Y%m%d-%H%M%S)
+    log "Logging into ECR..."
+    aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
     
-    # Push image
-    log_info "Pushing image to ECR..."
-    docker push $ECR_URI:latest
-    docker push $ECR_URI:$(date +%Y%m%d-%H%M%S)
+    log "Pushing image to ECR..."
+    docker push "$ecr_uri"
     
-    log_success "Image pushed to ECR: $ECR_URI:latest"
-}
-
-# Deploy infrastructure using CloudFormation
-deploy_infrastructure() {
-    log_info "Deploying infrastructure..."
-    
-    # Get VPC and subnet information (you may need to modify this)
-    VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text --region $AWS_REGION)
-    SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text --region $AWS_REGION | tr '\t' ',')
-    
-    if [ "$VPC_ID" == "None" ] || [ -z "$SUBNET_IDS" ]; then
-        log_error "Could not find default VPC or subnets. Please specify VPC_ID and SUBNET_IDS manually."
-        exit 1
-    fi
-    
-    log_info "Using VPC: $VPC_ID"
-    log_info "Using Subnets: $SUBNET_IDS"
-    
-    ECR_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME"
-    
-    aws cloudformation deploy \
-        --template-file cloudformation-infrastructure.yml \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --parameter-overrides \
-            ProjectName=$PROJECT_NAME \
-            Environment=$ENVIRONMENT \
-            ECRRepositoryURI=$ECR_URI \
-            VpcId=$VPC_ID \
-            SubnetIds=$SUBNET_IDS \
-        --capabilities CAPABILITY_NAMED_IAM \
-        --region $AWS_REGION
-    
-    log_success "Infrastructure deployed"
+    log "Image pushed successfully: $ecr_uri ✓"
+    echo "$ecr_uri"
 }
 
 # Update ECS task definition
 update_task_definition() {
-    log_info "Updating ECS task definition..."
+    local image_uri=$1
+    local account_id=$(get_account_id)
     
-    ECR_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:latest"
+    log "Updating ECS task definition..."
     
-    # Get the role ARNs from CloudFormation stack
-    EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSTaskExecutionRoleArn`].OutputValue' \
-        --output text --region $AWS_REGION)
+    # Read the task definition template and replace placeholders
+    local task_def=$(cat ecs-task-definition.json | \
+        sed "s|{{IMAGE_URI}}|$image_uri|g" | \
+        sed "s|{{AWS_REGION}}|$AWS_REGION|g" | \
+        sed "s|{{ACCOUNT_ID}}|$account_id|g")
     
-    TASK_ROLE_ARN=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSTaskRoleArn`].OutputValue' \
-        --output text --region $AWS_REGION)
+    # Register new task definition
+    local new_task_def_arn=$(echo "$task_def" | aws ecs register-task-definition \
+        --cli-input-json file:///dev/stdin \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
     
-    # Update the task definition template
-    sed -e "s|YOUR_ACCOUNT_ID|$AWS_ACCOUNT_ID|g" \
-        -e "s|YOUR_ECR_REPOSITORY_URI|$ECR_URI|g" \
-        -e "s|arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole|$EXECUTION_ROLE_ARN|g" \
-        -e "s|arn:aws:iam::YOUR_ACCOUNT_ID:role/video-pipeline-task-role|$TASK_ROLE_ARN|g" \
-        ecs-task-definition.json > ecs-task-definition-updated.json
-    
-    # Register the task definition
-    aws ecs register-task-definition \
-        --cli-input-json file://ecs-task-definition-updated.json \
-        --region $AWS_REGION
-    
-    log_success "ECS task definition updated"
+    log "New task definition registered: $new_task_def_arn ✓"
+    echo "$new_task_def_arn"
 }
 
-# Create or update ECS service
-deploy_service() {
-    log_info "Deploying ECS service..."
+# Update ECS service
+update_service() {
+    local task_def_arn=$1
     
-    CLUSTER_NAME=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSClusterName`].OutputValue' \
-        --output text --region $AWS_REGION)
+    log "Updating ECS service..."
     
-    TARGET_GROUP_ARN=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`TargetGroupArn`].OutputValue' \
-        --output text --region $AWS_REGION)
+    aws ecs update-service \
+        --cluster "$ECS_CLUSTER_NAME" \
+        --service "$ECS_SERVICE_NAME" \
+        --task-definition "$task_def_arn" \
+        --force-new-deployment \
+        --region "$AWS_REGION" > /dev/null
     
-    SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSSecurityGroupId`].OutputValue' \
-        --output text --region $AWS_REGION)
-    
-    SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text --region $AWS_REGION | tr '\t' ',')
-    
-    SERVICE_NAME="$PROJECT_NAME-service-$ENVIRONMENT"
-    
-    # Check if service exists
-    if aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION > /dev/null 2>&1; then
-        log_info "Updating existing ECS service..."
-        aws ecs update-service \
-            --cluster $CLUSTER_NAME \
-            --service $SERVICE_NAME \
-            --task-definition "$PROJECT_NAME-task:LATEST" \
-            --region $AWS_REGION
-    else
-        log_info "Creating new ECS service..."
-        aws ecs create-service \
-            --cluster $CLUSTER_NAME \
-            --service-name $SERVICE_NAME \
-            --task-definition "$PROJECT_NAME-task" \
-            --desired-count 1 \
-            --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
-            --load-balancers "targetGroupArn=$TARGET_GROUP_ARN,containerName=video-pipeline,containerPort=3000" \
-            --region $AWS_REGION
-    fi
-    
-    log_success "ECS service deployed"
+    log "ECS service update initiated ✓"
 }
 
-# Main deployment process
+# Wait for service to stabilize
+wait_for_deployment() {
+    log "Waiting for service to stabilize..."
+    
+    aws ecs wait services-stable \
+        --cluster "$ECS_CLUSTER_NAME" \
+        --services "$ECS_SERVICE_NAME" \
+        --region "$AWS_REGION"
+    
+    log "Service deployment completed successfully ✓"
+}
+
+# Main deployment function
 main() {
-    log_info "Starting Video Pipeline ECS deployment..."
-    log_info "Project: $PROJECT_NAME"
-    log_info "Environment: $ENVIRONMENT"
-    log_info "Region: $AWS_REGION"
+    log "Starting deployment to AWS ECS..."
+    log "Region: $AWS_REGION"
+    log "Cluster: $ECS_CLUSTER_NAME"
+    log "Service: $ECS_SERVICE_NAME"
+    log "Image Tag: $IMAGE_TAG"
     
-    check_dependencies
-    get_account_id
+    check_prerequisites
     create_ecr_repository
-    build_and_push_image
-    deploy_infrastructure
-    update_task_definition
-    deploy_service
     
-    # Get the load balancer URL
-    ALB_URL=$(aws cloudformation describe-stacks \
-        --stack-name "$PROJECT_NAME-infrastructure-$ENVIRONMENT" \
-        --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
-        --output text --region $AWS_REGION)
+    local image_uri=$(build_and_push_image)
+    local task_def_arn=$(update_task_definition "$image_uri")
     
-    log_success "Deployment completed!"
-    log_info "Application URL: http://$ALB_URL"
-    log_info "Health check: http://$ALB_URL/health"
-    log_info "API docs: http://$ALB_URL/"
+    update_service "$task_def_arn"
+    wait_for_deployment
     
-    # Clean up temporary files
-    rm -f ecs-task-definition-updated.json
+    log "🎉 Deployment completed successfully!"
+    log "Service URL: Check your ECS service for the load balancer endpoint"
 }
 
-# Script options
+# Handle script arguments
 case "${1:-deploy}" in
     "deploy")
         main
         ;;
     "build-only")
-        check_dependencies
-        get_account_id
+        check_prerequisites
         create_ecr_repository
         build_and_push_image
         ;;
-    "infrastructure-only")
-        check_dependencies
-        get_account_id
-        deploy_infrastructure
-        ;;
-    "service-only")
-        check_dependencies
-        get_account_id
-        update_task_definition
-        deploy_service
+    "help")
+        echo "Usage: $0 [deploy|build-only|help]"
+        echo "  deploy     - Full deployment (default)"
+        echo "  build-only - Only build and push image"
+        echo "  help       - Show this help"
         ;;
     *)
-        echo "Usage: $0 [deploy|build-only|infrastructure-only|service-only]"
-        echo "  deploy: Full deployment (default)"
-        echo "  build-only: Build and push Docker image only"
-        echo "  infrastructure-only: Deploy CloudFormation infrastructure only"
-        echo "  service-only: Update task definition and service only"
-        exit 1
+        error "Unknown command: $1. Use 'help' for usage information."
         ;;
 esac

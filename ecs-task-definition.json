@@ -1,0 +1,174 @@
+{
+  "family": "video-pipeline-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::{{ACCOUNT_ID}}:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::{{ACCOUNT_ID}}:role/video-pipeline-task-role",
+  "containerDefinitions": [
+    {
+      "name": "bgutil-provider",
+      "image": "brainicism/bgutil-ytdlp-pot-provider:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 4416,
+          "protocol": "tcp"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:4416/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/video-pipeline",
+          "awslogs-region": "{{AWS_REGION}}",
+          "awslogs-stream-prefix": "bgutil-provider"
+        }
+      },
+      "memoryReservation": 256
+    },
+    {
+      "name": "video-pipeline",
+      "image": "{{IMAGE_URI}}",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "PORT",
+          "value": "3000"
+        },
+        {
+          "name": "ENABLE_SQS_POLLING",
+          "value": "true"
+        },
+        {
+          "name": "S3_UPLOAD_ENABLED",
+          "value": "true"
+        },
+        {
+          "name": "PODCAST_CONVERSION_ENABLED",
+          "value": "true"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "{{AWS_REGION}}"
+        },
+        {
+          "name": "MAX_CONCURRENT_JOBS",
+          "value": "2"
+        },
+        {
+          "name": "POLLING_INTERVAL_MS",
+          "value": "30000"
+        },
+        {
+          "name": "DEFAULT_VIDEO_QUALITY",
+          "value": "720p"
+        },
+        {
+          "name": "PREFERRED_AUDIO_FORMAT",
+          "value": "mp3"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "info"
+        },
+        {
+          "name": "BGUTIL_PROVIDER_URL",
+          "value": "http://localhost:4416"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "AWS_ACCESS_KEY_ID",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/aws-access-key-id"
+        },
+        {
+          "name": "AWS_SECRET_ACCESS_KEY",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/aws-secret-access-key"
+        },
+        {
+          "name": "S3_AUDIO_BUCKET_NAME",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/s3-audio-bucket"
+        },
+        {
+          "name": "S3_VIDEO_BUCKET_NAME",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/s3-video-bucket"
+        },
+        {
+          "name": "DYNAMODB_PODCAST_EPISODES_TABLE",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/dynamodb-episodes-table"
+        },
+        {
+          "name": "SQS_QUEUE_URL",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/sqs-queue-url"
+        },
+        {
+          "name": "VIDEO_TRIMMING_QUEUE_URL",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/video-trimming-queue-url"
+        },
+        {
+          "name": "YOUTUBE_API_KEY",
+          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/youtube-api-key"
+        }
+      ],
+      "dependsOn": [
+        {
+          "containerName": "bgutil-provider",
+          "condition": "HEALTHY"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 40
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/video-pipeline",
+          "awslogs-region": "{{AWS_REGION}}",
+          "awslogs-stream-prefix": "video-pipeline"
+        }
+      },
+      "memoryReservation": 1536,
+      "mountPoints": [
+        {
+          "sourceVolume": "video-pipeline-data",
+          "containerPath": "/app/data"
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "video-pipeline-data",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "{{EFS_FILE_SYSTEM_ID}}",
+        "rootDirectory": "/video-pipeline",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "{{EFS_ACCESS_POINT_ID}}"
+        }
+      }
+    }
+  ]
+}

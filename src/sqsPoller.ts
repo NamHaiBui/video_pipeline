@@ -93,7 +93,12 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     // Parse message
     const messageId = message.MessageId || 'unknown';
     const jobData = JSON.parse(message.Body) as SQSJobMessage;
-    
+    //Ensuring that jobId is always defined
+    if (jobData.jobId === undefined || jobData.jobId === null || jobData.jobId.trim() === '') {
+      logger.warn(`Message ${messageId} has no jobId, create jobId`);
+      jobData.jobId = messageId; 
+    }
+    jobData.jobId = jobData.jobId.trim();;
     // Validate job data
     if (!jobData.url || !jobData.jobId) {
       logger.warn(`Invalid job data in message ${messageId}: missing url or jobId`);
@@ -115,7 +120,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     processDownload(jobData.jobId, jobData.url)
       .then(() => {
         logger.info(`Job ${jobData.jobId} completed successfully`);
-        jobTracker.completeJob(jobData.jobId);
+        jobTracker.completeJob(jobData.jobId!);
         
         // Poll for new messages if we have capacity
         if (jobTracker.canAcceptMoreJobs()) {
@@ -124,7 +129,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       })
       .catch(error => {
         logger.error(`Error processing job ${jobData.jobId}: ${error.message}`, undefined, { error });
-        jobTracker.completeJob(jobData.jobId);
+        jobTracker.completeJob(jobData.jobId!);
         
         // Poll for new messages if we have capacity
         if (jobTracker.canAcceptMoreJobs()) {

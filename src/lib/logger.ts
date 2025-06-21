@@ -6,7 +6,6 @@
  * 
  * Features:
  * - Direct AWS SDK CloudWatch Logs integration
- * - LocalStack support for development
  * - Structured JSON logging
  * - Job correlation via jobId
  * - Metrics logging support
@@ -112,8 +111,7 @@ class CloudWatchLogger {
         logStreamName: process.env[ENV_VARS.CLOUDWATCH_LOG_STREAM] || LOGGING.DEFAULT_LOG_STREAM,
         awsRegion: process.env[ENV_VARS.AWS_REGION] || LOGGING.DEFAULT_AWS_REGION,
         enabled: process.env[ENV_VARS.NODE_ENV] === 'production' || 
-                process.env[ENV_VARS.NODE_ENV] === 'development' ||
-                process.env.LOCALSTACK === 'true',
+                process.env[ENV_VARS.NODE_ENV] === 'development',
         batchSize: 25, // CloudWatch Logs max batch size
         flushInterval: 5000 // Flush every 5 seconds
       }
@@ -145,14 +143,12 @@ class CloudWatchLogger {
         region: this.config.cloudWatch.awsRegion,
       };
 
-      // Add LocalStack configuration if endpoint is provided
-      if (process.env[ENV_VARS.AWS_ENDPOINT_URL]) {
-        clientConfig.endpoint = process.env[ENV_VARS.AWS_ENDPOINT_URL];
+      // Add AWS credentials if provided
+      if (process.env[ENV_VARS.AWS_ACCESS_KEY_ID] && process.env[ENV_VARS.AWS_SECRET_ACCESS_KEY]) {
         clientConfig.credentials = {
-          accessKeyId: process.env[ENV_VARS.AWS_ACCESS_KEY_ID] || 'test',
-          secretAccessKey: process.env[ENV_VARS.AWS_SECRET_ACCESS_KEY] || 'test'
+          accessKeyId: process.env[ENV_VARS.AWS_ACCESS_KEY_ID],
+          secretAccessKey: process.env[ENV_VARS.AWS_SECRET_ACCESS_KEY]
         };
-        console.log(`📝 CloudWatch logging configured for LocalStack: ${process.env[ENV_VARS.AWS_ENDPOINT_URL]}`);
       }
 
       this.cloudWatchClient = new CloudWatchLogsClient(clientConfig);

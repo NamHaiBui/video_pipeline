@@ -57,7 +57,6 @@ export interface DownloadOptions {
   poToken?: string;
   userAgent?: string;
   additionalHeaders?: string[];
-  // AWS S3 upload options
   s3Upload?: {
     enabled: boolean;
     audioKeyPrefix?: string;
@@ -128,7 +127,7 @@ export interface JobStatusResponse {
 }
 
 export interface SQSJobMessage {
-  jobId: string;
+  jobId?: string;
   url: string;
   options?: {
     format?: string;
@@ -158,8 +157,10 @@ export interface PodcastEpisodeData {
   episode_title: string;
   /** Audio chunking processing status */
   audio_chunking_status: string;
-  /** Audio file URL or path */
+  /** Audio file URL */
   audio_url: string;
+  /** Video file URL */
+  video_url: string;
   /** Content chunking processing status */
   chunking_status: string;
   /** Episode description (from video description) */
@@ -210,38 +211,26 @@ export interface PodcastEpisodeData {
   transcript_uri: string;
   /** Transcription status */
   transcription_status: string;
-  
-  // Optional fields for backward compatibility and additional metadata
-  /** Episode image/thumbnail URL */
-  image?: string;
-  /** Source URL (original video URL) */
-  source_url?: string;
-  /** Video URL (processed video file, e.g., from S3) */
-  video_url?: string;
-  /** Episode ID from original source */
-  episode_id?: string;
-  /** Podcast ID from original source */
-  podcast_id?: string;
-  /** Episode GUID */
-  episode_guid?: string;
-  /** Episode URL */
-  episode_url?: string;
+  /** Quotes audio processing status */
+  quotes_audio_status: string;
   /** Country/region */
-  country?: string;
+  country: string;
+  /** Episode ID from original source */
+  episode_id: string;
+  /** Podcast ID from original source */
+  podcast_id: string;
+  /** Episode GUID */
+  episode_guid: string;
+  /** Episode image/thumbnail URL */
+  image: string;
+  /** Episode URL */
+  episode_url: string;
   /** Episode duration in milliseconds */
-  episode_time_millis?: number;
+  episode_time_millis: number;
   /** Number of personalities detected */
   number_of_personalities?: number;
   /** Topic matching information */
   topic_match?: boolean;
-  /** Original video metadata as JSON string */
-  original_video_metadata?: string;
-  /** View count from original video */
-  view_count?: number;
-  /** Like count from original video */
-  like_count?: number;
-  /** TTL timestamp for cleanup */
-  ttl?: number;
 }
 
 /**

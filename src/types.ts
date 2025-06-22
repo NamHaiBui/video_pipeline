@@ -146,7 +146,54 @@ export interface SQSResponseMessage {
 }
 
 /**
+ * Guest description structure for DynamoDB
+ */
+export interface GuestDescription {
+  M: {
+    name: { S: string };
+    description: { S: string };
+    matched_from_cache: { S: string };
+    confidence: { S: string };
+  };
+}
+
+/**
+ * Guest name structure for DynamoDB
+ */
+export interface GuestName {
+  M: {
+    S: { S: string };
+  };
+}
+
+/**
+ * Image structure for DynamoDB
+ */
+export interface ImageData {
+  artworkUrl600: { S: string };
+  artworkUrl60: { S: string };
+  artworkUrl160: { S: string };
+}
+
+/**
+ * Summary metadata structure for DynamoDB
+ */
+export interface SummaryMetadata {
+  topic_metadata: {
+    M: {
+      start: { L: Array<{ S: string }> };
+      end: { L: Array<{ S: string }> };
+      topics: { L: Array<{ S: string }> };
+      chunk_nos: { L: Array<{ S: string }> };
+    };
+  };
+  summary_transcript_file_name: { S: string };
+  summary_duration: { S: string };
+}
+
+/**
  * Podcast episode data structure for storing video content as podcast episodes
+ * Matches DynamoDB format with type descriptors
  */
 export interface PodcastEpisodeData {
   /** Unique identifier for the episode */
@@ -159,78 +206,78 @@ export interface PodcastEpisodeData {
   audio_chunking_status: string;
   /** Audio file URL */
   audio_url: string;
-  /** Video file URL */
-  video_url: string;
   /** Content chunking processing status */
   chunking_status: string;
+  /** Country/region */
+  country: string;
   /** Episode description (from video description) */
   description: string;
   /** Whether episode has been downloaded */
   episode_downloaded: boolean;
+  /** Episode GUID */
+  episode_guid: string;
+  /** Episode ID from original source */
+  episode_id: string;
+  /** Episode duration in milliseconds */
+  episode_time_millis: number;
   /** Original episode title with full details */
   episode_title_details: string;
+  /** Episode URL */
+  episode_url: string;
   /** File name for storage */
   file_name: string;
-  /** Content genres/categories */
-  genres: string[];
+  /** Content genres/categories - DynamoDB format */
+  genres: Array<{ S: string }>;
   /** Number of guests detected */
   guest_count: number;
-  /** Description of detected guests */
-  guest_description: string;
+  /** Description of detected guests - DynamoDB format */
+  guest_description: GuestDescription[];
   /** Confidence level of guest extraction */
   guest_extraction_confidence: string;
-  /** List of guest names */
-  guest_names: string[];
-  /** Description of detected hosts */
-  host_description: string;
-  /** Name of the host */
-  host_name: string;
+  /** List of guest names - DynamoDB format */
+  guest_names: GuestName[];
+  /** Episode image/thumbnail data - DynamoDB format */
+  image: ImageData;
   /** Number of chunks created */
   num_chunks: number;
+  /** Number of quotes extracted */
+  num_quotes: number;
   /** Number of chunks removed during processing */
   num_removed_chunks: number;
   /** Whether this is partial data */
   partial_data: boolean;
-  /** List of personalities/guests mentioned */
-  personalities: string[];
+  /** List of personalities/guests mentioned - DynamoDB format */
+  personalities: Array<{ S: string }>;
   /** Podcast author/channel name */
   podcast_author: string;
+  /** Podcast ID from original source */
+  podcast_id: string;
   /** Published/upload date */
   published_date: string;
+  /** Quote extraction status */
+  quote_status: string;
+  /** Quotes audio processing status */
+  quotes_audio_status: string;
+  /** Quotes video processing status */
+  quotes_video_status: string;
   /** RSS feed URL for the podcast */
   rss_url: string;
   /** Content source (e.g., 'youtube', 'vimeo') */
   source: string;
   /** Summarization processing status */
   summarization_status: string;
-  /** Summary metadata information */
-  summary_metadata: string;
-  /** Topics extracted from content */
-  topics: string[];
+  /** Summary metadata information - DynamoDB format */
+  summary_metadata: SummaryMetadata;
+  /** Topics extracted from content - DynamoDB format */
+  topics: Array<{ S: string }>;
   /** URI for transcript file */
   transcript_uri: string;
   /** Transcription status */
   transcription_status: string;
-  /** Quotes audio processing status */
-  quotes_audio_status: string;
-  /** Country/region */
-  country: string;
-  /** Episode ID from original source */
-  episode_id: string;
-  /** Podcast ID from original source */
-  podcast_id: string;
-  /** Episode GUID */
-  episode_guid: string;
-  /** Episode image/thumbnail URL */
-  image: string;
-  /** Episode URL */
-  episode_url: string;
-  /** Episode duration in milliseconds */
-  episode_time_millis: number;
-  /** Number of personalities detected */
-  number_of_personalities?: number;
-  /** Topic matching information */
-  topic_match?: boolean;
+  /** Video chunking processing status */
+  video_chunking_status: string;
+  /** Video file name */
+  video_file_name: string;
 }
 
 /**

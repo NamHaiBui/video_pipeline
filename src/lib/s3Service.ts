@@ -2,6 +2,7 @@ import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } fro
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'fs';
 import path from 'path';
+import { logger } from './logger.js';
 
 export interface S3Config {
   region: string;
@@ -99,8 +100,8 @@ export class S3Service {
       const result = await this.s3Client.send(command);
       const location = `https://${bucket}.s3.${this.config.region}.amazonaws.com/${key}`;
 
-      console.log(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
-      console.log(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      logger.info(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
+      logger.info(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
       
       return {
         success: true,
@@ -110,7 +111,7 @@ export class S3Service {
       };
 
     } catch (error: any) {
-      console.error(`❌ Failed to upload ${filePath} to S3:`, error.message);
+      logger.error(`❌ Failed to upload ${filePath} to S3:`, error.message);
       return {
         success: false,
         key,
@@ -128,7 +129,7 @@ export class S3Service {
     const filename = path.basename(filePath);
     const key = keyPrefix ? `${keyPrefix}/${filename}` : filename;
     
-    console.log(`🔊 Uploading audio file to S3: ${filename}`);
+    logger.info(`🔊 Uploading audio file to S3: ${filename}`);
     return this.uploadFile(filePath, this.config.audioBucket, key);
   }
 
@@ -139,7 +140,7 @@ export class S3Service {
     const filename = path.basename(filePath);
     const key = keyPrefix ? `${keyPrefix}/${filename}` : filename;
     
-    console.log(`📹 Uploading video file to S3: ${filename}`);
+    logger.info(`📹 Uploading video file to S3: ${filename}`);
     return this.uploadFile(filePath, this.config.videoBucket, key);
   }
 
@@ -151,7 +152,7 @@ export class S3Service {
     const key = keyPrefix ? `${keyPrefix}/${filename}` : filename;
     const bucket = this.config.metadataBucket || this.config.videoBucket;
     
-    console.log(`📄 Uploading metadata file to S3: ${filename}`);
+    logger.info(`📄 Uploading metadata file to S3: ${filename}`);
     return this.uploadFile(filePath, bucket, key, 'application/json');
   }
 
@@ -168,7 +169,7 @@ export class S3Service {
       const url = await getSignedUrl(this.s3Client, command, { expiresIn });
       return url;
     } catch (error: any) {
-      console.error(`Failed to generate presigned URL for s3://${bucket}/${key}:`, error.message);
+      logger.error(`Failed to generate presigned URL for s3://${bucket}/${key}:`, error.message);
       throw error;
     }
   }
@@ -198,7 +199,7 @@ export class S3Service {
       await this.s3Client.send(command);
       const location = `https://${bucket}.s3.${this.config.region}.amazonaws.com/${key}`;
 
-      console.log(`✅ Successfully uploaded content to s3://${bucket}/${key}`);
+      logger.info(`✅ Successfully uploaded content to s3://${bucket}/${key}`);
       
       return {
         success: true,
@@ -208,7 +209,7 @@ export class S3Service {
       };
 
     } catch (error: any) {
-      console.error(`❌ Failed to upload content to S3:`, error.message);
+      logger.error(`❌ Failed to upload content to S3:`, error.message);
       return {
         success: false,
         key,
@@ -250,10 +251,10 @@ export class S3Service {
       });
 
       await this.s3Client.send(command);
-      console.log(`🗑️ Deleted s3://${bucket}/${key}`);
+      logger.info(`🗑️ Deleted s3://${bucket}/${key}`);
       return true;
     } catch (error: any) {
-      console.error(`❌ Failed to delete s3://${bucket}/${key}:`, error.message);
+      logger.error(`❌ Failed to delete s3://${bucket}/${key}:`, error.message);
       return false;
     }
   }
@@ -269,7 +270,7 @@ export class S3Service {
       
       return result.Buckets?.map(bucket => bucket.Name || '') || [];
     } catch (error: any) {
-      console.error(`❌ Failed to list buckets:`, error.message);
+      logger.error(`❌ Failed to list buckets:`, error.message);
       return [];
     }
   }
@@ -282,7 +283,7 @@ export class S3Service {
       if (fs.existsSync(filePath)) {
         const fileDir = path.dirname(filePath);
         fs.unlinkSync(filePath);
-        console.log(`🗑️ Deleted local file: ${filePath}`);
+        logger.info(`🗑️ Deleted local file: ${filePath}`);
         
         // Try to clean up empty parent directories
         await this.cleanupEmptyDirectories(fileDir);
@@ -291,7 +292,7 @@ export class S3Service {
       }
       return false;
     } catch (error: any) {
-      console.error(`Failed to delete local file ${filePath}:`, error.message);
+      logger.error(`Failed to delete local file ${filePath}:`, error.message);
       return false;
     }
   }
@@ -309,7 +310,7 @@ export class S3Service {
       
       if (files.length === 0) {
         fs.rmdirSync(dirPath);
-        console.log(`🗑️ Removed empty directory: ${path.basename(dirPath)}`);
+        logger.info(`🗑️ Removed empty directory: ${path.basename(dirPath)}`);
         
         // Recursively clean up parent directory if it's now empty
         const parentDir = path.dirname(dirPath);
@@ -319,7 +320,7 @@ export class S3Service {
       }
     } catch (error: any) {
       // Silently ignore directory cleanup errors to avoid disrupting main flow
-      console.debug(`Note: Could not clean up directory ${dirPath}: ${error.message}`);
+      logger.debug(`Note: Could not clean up directory ${dirPath}: ${error.message}`);
     }
   }
 }
@@ -334,7 +335,7 @@ export function createS3ServiceFromEnv(): S3Service | null {
   const metadataBucket = process.env.S3_METADATA_BUCKET;
 
   if (!audioBucket || !videoBucket) {
-    console.warn('⚠️ S3 buckets not configured. Set S3_AUDIO_BUCKET and S3_VIDEO_BUCKET environment variables to enable S3 uploads.');
+    logger.warn('⚠️ S3 buckets not configured. Set S3_AUDIO_BUCKET and S3_VIDEO_BUCKET environment variables to enable S3 uploads.');
     return null;
   }
 
@@ -347,12 +348,12 @@ export function createS3ServiceFromEnv(): S3Service | null {
     metadataBucket
   };
 
-  console.log(`🏗️ Initializing S3 service for AWS region: ${region}`);
+  logger.info(`🏗️ Initializing S3 service for AWS region: ${region}`);
   
-  console.log(`🔊 Audio bucket: ${audioBucket}`);
-  console.log(`📹 Video bucket: ${videoBucket}`);
+  logger.info(`🔊 Audio bucket: ${audioBucket}`);
+  logger.info(`📹 Video bucket: ${videoBucket}`);
   if (metadataBucket) {
-    console.log(`📄 Metadata bucket: ${metadataBucket}`);
+    logger.info(`📄 Metadata bucket: ${metadataBucket}`);
   }
 
   return new S3Service(config);

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import axios, { AxiosResponse } from 'axios';
 import ProgressBar from 'progress';
+import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,14 +62,14 @@ async function downloadFileWithProgress(url: string, outputPath: string, fileNam
 }
 
 async function setupBinaries(): Promise<void> {
-  console.log('--- Setting up Binaries ---');
+  logger.info('Setting up binaries');
 
   if (!fs.existsSync(YTDLP_FINAL_PATH)) {
     await downloadFileWithProgress(YTDLP_URL, YTDLP_FINAL_PATH, 'yt-dlp');
     fs.chmodSync(YTDLP_FINAL_PATH, '755');
-    console.log('yt-dlp downloaded and made executable.');
+    logger.info('yt-dlp downloaded and made executable');
   } else {
-    console.log('yt-dlp already exists at:', YTDLP_FINAL_PATH);
+    logger.info('yt-dlp already exists', { path: YTDLP_FINAL_PATH });
   }
 
   if (!fs.existsSync(FFMPEG_FINAL_PATH)) {

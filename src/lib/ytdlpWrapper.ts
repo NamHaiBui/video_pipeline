@@ -27,6 +27,7 @@ import { createDynamoDBServiceFromEnv } from './dynamoService.js';
 import { isValidYouTubeUrl } from './urlUtils.js';
 import { generateAudioS3Key, generateVideoS3Key, getAudioBucketName, getVideoBucketName } from './s3KeyUtils.js';
 import { sanitizeFilename, sanitizeOutputTemplate, create_slug } from './utils/utils.js';
+import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,7 +148,7 @@ function buildYtdlpArgs(
   if (options.cookiesFile && fs.existsSync(options.cookiesFile)) {
     baseArgs.push('--cookies', options.cookiesFile);
   } else if (options.cookiesFile) {
-    console.warn(`Cookies file not found at ${options.cookiesFile}, proceeding without it.`);
+    logger.warn('Cookies file not found, proceeding without it', { cookiesFile: options.cookiesFile });
   }
   // browserHeaders.forEach(header => {
   //   baseArgs.push('--add-header', header);
@@ -186,7 +187,7 @@ function handleProgressData(line: string, options: DownloadOptions): void {
         raw: progressData
       });
     } else {
-      console.log('Progress:', progressData);
+      logger.debug('Progress received', { progressData });
     }
   }
 }
@@ -213,7 +214,7 @@ function executeDownloadProcess(
   options: DownloadOptions
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    console.log(`Executing: ${YTDLP_PATH} ${args.join(' ')}`);
+    logger.debug('Executing yt-dlp command', { command: `${YTDLP_PATH} ${args.join(' ')}` });
     const ytdlpProcess = spawn(YTDLP_PATH, args);
     let downloadedFilePath = '';
     let stderrOutput = '';
@@ -227,18 +228,38 @@ function executeDownloadProcess(
         downloadedFilePath = detectedPath;
       }
       if (line && !line.startsWith('download-status:')) {
-        console.log(`yt-dlp stdout: ${line}`);
+        logger.debug('yt-dlp stdout', { line });
       }
     });
 
     ytdlpProcess.stderr?.on('data', (data: Buffer) => {
       const line = data.toString().trim();
       stderrOutput += line + '\n';
-      console.warn(`yt-dlp stderr: ${line}`);
+      
+      // Only log actual errors and warnings, filter out informational messages
+      const lowerLine = line.toLowerCase();
+      const isInformational = lowerLine.includes('downloading webpage') ||
+                             lowerLine.includes('extracting data') ||
+                             lowerLine.includes('has already been downloaded') ||
+                             lowerLine.includes('[youtube]') ||
+                             lowerLine.includes('selected format') ||
+                             lowerLine.includes('resuming download');
+                             
+      const isActualWarning = lowerLine.includes('error') || 
+                             lowerLine.includes('warning') || 
+                             lowerLine.includes('failed') || 
+                             lowerLine.includes('timeout') ||
+                             lowerLine.includes('unavailable');
+      
+      if (isActualWarning && !isInformational) {
+        logger.warn('yt-dlp stderr', { line });
+      } else {
+        logger.debug('yt-dlp info', { line });
+      }
     });
 
     ytdlpProcess.on('error', (error: Error) => {
-      console.error(`Failed to start yt-dlp process: ${error.message}`);
+      logger.error('Failed to start yt-dlp process', error);
       reject(error);
     });
 
@@ -253,12 +274,11 @@ function executeDownloadProcess(
           });
         }
         const finalPath = downloadedFilePath || 'unknown_path';
-        console.log(`Download finished successfully (exit code ${code}). Output: ${finalPath}`);
+        logger.info('Download finished successfully', { finalPath, exitCode: code });
         resolve(finalPath);
       } else {
         const errorMessage = `yt-dlp process exited with code ${code}.`;
-        console.error(errorMessage);
-        console.error(`yt-dlp stderr output:\n${stderrOutput}`);
+        logger.error('Download failed', new Error(errorMessage), { stderrOutput });
         reject(new Error(`${errorMessage}\nStderr: ${stderrOutput}`));
       }
     });
@@ -282,7 +302,7 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
   if (options.cookiesFile && fs.existsSync(options.cookiesFile)) {
     args.push('--cookies', options.cookiesFile);
   } else if (options.cookiesFile) {
-    console.warn(`Cookies file not found at ${options.cookiesFile}, proceeding without it.`);
+    logger.warn('Cookies file not found, proceeding without it', { cookiesFile: options.cookiesFile });
   }
 
   // Add additional headers if specified
@@ -294,17 +314,15 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
 
   args.push(videoUrl);
 
-  console.log(`Fetching metadata for: ${videoUrl}`);
-  console.log(`Executing: ${YTDLP_PATH} ${args.join(' ')}`); 
+  logger.info('Fetching video metadata', { url: videoUrl });
+  logger.debug('Executing yt-dlp metadata command', { command: `${YTDLP_PATH} ${args.join(' ')}` });
   
   try {
     const { stdout, stderr } = await new Promise<CommandResult>((resolve, reject) => {
       execFile(YTDLP_PATH, args, (error, stdout, stderr) => {
         if (error) {
-          console.error(`yt-dlp execution error (execFile): ${error.message}`);
-          if (stderr) {
-            console.error(`yt-dlp stderr (execFile): ${stderr}`);
-          }
+          logger.error('yt-dlp execution error', error, { stderr });
+          // Don't double-log stderr if it's already been logged above
           (error as any).stderrContent = stderr;
           return reject(error);
         }
@@ -312,39 +330,45 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
       });
     });
 
-    if (stderr && !stderr.toLowerCase().includes('downloading webpage') && !stderr.toLowerCase().includes('extracting data')) {
-        console.warn('yt-dlp messages during metadata fetch (stderr):', stderr.trim());
+    // Only log stderr if it contains actual warnings/errors, not just info messages
+    if (stderr) {
+      const lowerStderr = stderr.toLowerCase();
+      const isInformational = lowerStderr.includes('downloading webpage') ||
+                             lowerStderr.includes('extracting data') ||
+                             lowerStderr.includes('has already been downloaded') ||
+                             lowerStderr.includes('[youtube]') ||
+                             lowerStderr.includes('selected format') ||
+                             lowerStderr.includes('resuming download');
+                             
+      const isActualWarning = lowerStderr.includes('error') || 
+                             lowerStderr.includes('warning') || 
+                             lowerStderr.includes('failed') || 
+                             lowerStderr.includes('timeout') ||
+                             lowerStderr.includes('unavailable');
+      
+      if (isActualWarning && !isInformational) {
+        logger.warn('yt-dlp warnings during metadata fetch', { stderr: stderr.trim() });
+      } else if (!isInformational) {
+        logger.debug('yt-dlp info during metadata fetch', { stderr: stderr.trim() });
+      }
     }
     
     try {
       const metadata = JSON.parse(stdout) as VideoMetadata;
-      try {
-        const dynamoService = createDynamoDBServiceFromEnv();
-        if (dynamoService) {
-          console.log('💾 Saving video metadata to DynamoDB...');
-          const saveSuccess = await dynamoService.saveVideoMetadata(metadata);
-          if (saveSuccess) {
-            console.log(`✅ Metadata for video ${metadata.id} saved to DynamoDB successfully`);
-          } else {
-            console.warn(`⚠️ Failed to save metadata for video ${metadata.id} to DynamoDB`);
-          }
-        } else {
-          console.log('DynamoDB service not available, skipping metadata save');
-        }
-      } catch (dynamoError: any) {
-        console.warn('⚠️ DynamoDB save error (continuing with metadata return):', dynamoError.message);
-      }
+      
+      // Note: Video metadata is no longer uploaded to DynamoDB
+      // Only podcast episode metadata will be uploaded during audio processing
+      logger.info('Video metadata extracted successfully');
       
       return metadata;
     } catch (parseError: any) {
-      console.error(`Failed to parse JSON metadata for ${videoUrl}: ${parseError.message}`);
-      console.error('Raw stdout from yt-dlp (metadata):', stdout);
+      logger.error('Failed to parse JSON metadata', parseError, { url: videoUrl, stdout: stdout.substring(0, 200) });
       throw new Error(`Failed to parse JSON metadata for ${videoUrl}. Raw output: ${stdout.substring(0, 200)}...`);
     }
   } catch (error: any) {
-    console.error(`Failed to fetch or parse metadata for ${videoUrl}: ${error.message}`);
+    logger.error('Failed to fetch or parse metadata', error, { url: videoUrl });
     if (error.stderrContent) {
-        console.error('Detailed error from yt-dlp (metadata):', error.stderrContent);
+        logger.error('Detailed yt-dlp error output', undefined, { stderr: error.stderrContent });
     }
     throw error;
   }
@@ -363,7 +387,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
       try {
         videoMetadata = await getVideoMetadata(videoUrl, options);
       } catch (metaError) {
-        console.warn('Could not fetch metadata for filename optimization, using template as-is');
+        logger.warn('Could not fetch metadata for filename optimization, using template as-is', { error: metaError });
       }
     }
     
@@ -383,8 +407,8 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
     
     const baseArgs = buildYtdlpArgs(videoUrl, outputPathAndFilename, format, options, ['-x']);
 
-    console.log(`Starting podcast audio download for: ${videoUrl}`);
-    console.log(`Using format: ${format}`);
+    logger.info('Starting podcast audio download', { url: videoUrl, format });
+    logger.debug('Using audio format', { format });
 
     try {
       const finalPath = await executeDownloadProcess(baseArgs, {
@@ -404,7 +428,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
         try {
           const s3Service = createS3ServiceFromEnv();
           if (s3Service) {
-            console.log('🚀 Uploading podcast audio to S3...');
+            logger.info('Uploading podcast audio to S3');
             
             let audioKey: string;
             if (videoMetadata) {
@@ -419,28 +443,28 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
             const uploadResult = await s3Service.uploadFile(finalPath, bucketName, audioKey);
             
             if (uploadResult.success) {
-              console.log(`✅ Podcast audio uploaded to S3: ${uploadResult.location}`);
+              logger.info('Podcast audio uploaded to S3 successfully', { location: uploadResult.location });
               
               // Only delete local file if deleteLocalAfterUpload is not explicitly set to false
               const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
               if (shouldDeleteLocal) {
                 try {
                   await s3Service.deleteLocalFile(finalPath);
-                  console.log(`🗑️ Deleted local audio file after S3 upload: ${path.basename(finalPath)}`);
+                  logger.info('Deleted local audio file after S3 upload', { filename: path.basename(finalPath) });
                 } catch (deleteError) {
-                  console.warn(`⚠️ Failed to delete local audio file: ${deleteError}`);
+                  logger.warn('Failed to delete local audio file', { error: deleteError, filename: path.basename(finalPath) });
                 }
               } else {
-                console.log(`📁 Keeping local audio file for further processing: ${path.basename(finalPath)}`);
+                logger.info('Keeping local audio file for further processing', { filename: path.basename(finalPath) });
               }
             } else {
-              console.error(`❌ Failed to upload podcast audio to S3: ${uploadResult.error}`);
+              logger.error('Failed to upload podcast audio to S3', undefined, { error: uploadResult.error });
             }
           } else {
-            console.warn('⚠️ S3 service not available, skipping upload');
+            logger.warn('S3 service not available, skipping upload');
           }
         } catch (error: any) {
-          console.error('❌ Error during S3 upload:', error.message);
+          logger.error('Error during S3 upload', error);
         }
       }
       
@@ -472,7 +496,7 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
 
     const baseArgs = buildYtdlpArgs(videoUrl, outputPathAndFilename, format, options);
 
-    console.log(`Starting video-only download for: ${videoUrl}`);
+    logger.info(`Starting video-only download for: ${videoUrl}`);
     return executeDownloadProcess(baseArgs, options);
 }
 
@@ -481,11 +505,11 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
  */
 async function uploadAudioToS3(localPath: string, videoUrl: string, s3Service: S3Service, metadata?: VideoMetadata): Promise<S3UploadResult | null> {
   if (!s3Service || !isValidYouTubeUrl(videoUrl)) {
-    if (!s3Service) console.warn('S3 service not available, skipping upload.');
+    if (!s3Service) logger.warn('S3 service not available, skipping upload.');
     return null;
   }
 
-  console.log('🚀 Uploading audio to S3...');
+  logger.info('🚀 Uploading audio to S3...');
   
   // Use provided metadata or fallback to fetching it
   let videoMetadata = metadata;
@@ -493,7 +517,7 @@ async function uploadAudioToS3(localPath: string, videoUrl: string, s3Service: S
     try {
       videoMetadata = await getVideoMetadata(videoUrl);
     } catch (metaError) {
-      console.warn('Could not fetch metadata for S3 naming, using fallback', metaError);
+      logger.warn('Could not fetch metadata for S3 naming, using fallback', { error: metaError });
     }
   }
 
@@ -502,10 +526,10 @@ async function uploadAudioToS3(localPath: string, videoUrl: string, s3Service: S
   const uploadResult = await s3Service.uploadFile(localPath, bucketName, s3AudioKey);
 
   if (uploadResult.success) {
-    console.log(`✅ Audio uploaded to S3: ${uploadResult.location}`);
+    logger.info(`✅ Audio uploaded to S3: ${uploadResult.location}`);
     return uploadResult;
   } else {
-    console.error(`❌ Failed to upload audio to S3: ${uploadResult.error}`);
+    logger.error(`❌ Failed to upload audio to S3: ${uploadResult.error}`);
     return null;
   }
 }
@@ -525,7 +549,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       try {
         videoMetadata = await getVideoMetadata(videoUrl, options);
       } catch (metaError) {
-        console.warn('Could not fetch metadata for filename sanitization, using template as-is');
+        logger.warn('Could not fetch metadata for filename sanitization, using template as-is');
       }
     }
     
@@ -554,8 +578,8 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
     let finalMergedPath = '';
 
     try {
-      console.log(`Starting video+audio download and merge for: ${videoUrl}`);
-      console.log('Starting parallel download of video and audio streams...');
+      logger.info(`Starting video+audio download and merge for: ${videoUrl}`);
+      logger.info('Starting parallel download of video and audio streams...');
       
       // Create slug-based temporary filenames
       const podcastSlug = videoMetadata ? create_slug(videoMetadata.uploader || 'unknown') : 'unknown-podcast';
@@ -602,12 +626,12 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       
       const audioPromise = audioDownloadPromise.then(async (audioPath: string) => {
         tempAudioPath = audioPath;
-        console.log(`Audio download completed successfully: ${audioPath}`);
+        logger.info(`Audio download completed successfully: ${audioPath}`);
                 
         try {
           const s3Service = createS3ServiceFromEnv();
           if (s3Service) {
-            uploadedAudioInfo = await uploadAudioToS3(audioPath, videoUrl, s3Service, videoMetadata || undefined); //TODO: Add ACL Public Object
+            uploadedAudioInfo = await uploadAudioToS3(audioPath, videoUrl, s3Service, videoMetadata || undefined);
             if (uploadedAudioInfo && options.onProgress) {
               options.onProgress({
                 percent: '100%',
@@ -618,29 +642,30 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
             }
           }
         } catch (error: any) {
-          console.error(`❌ Error uploading audio to S3: ${error.message}`);
+          logger.error(`❌ Error uploading audio to S3: ${error.message}`);
         }
         
-        // Process metadata and save to DynamoDB when audio is finished
+        // Process metadata and save podcast episode data to DynamoDB when audio is finished
+        // Note: Only podcast episode metadata is uploaded, not raw video metadata
         try {
           const dynamoService = createDynamoDBServiceFromEnv();
           if (dynamoService && videoMetadata && uploadedAudioInfo?.location) {
-            console.log('💾 Processing and saving episode metadata...');
-            const podcastEpisode = dynamoService.processEpisodeMetadata(videoMetadata, uploadedAudioInfo.location);
+            logger.info('💾 Processing and saving podcast episode metadata...');
+            const podcastEpisode = dynamoService.processEpisodeMetadata(videoMetadata, uploadedAudioInfo.key || uploadedAudioInfo.location);
             episodeId = podcastEpisode.id;
             
-            // Save the episode to DynamoDB
+            // Save the podcast episode to DynamoDB
             const saveSuccess = await dynamoService.savePodcastEpisode(podcastEpisode);
             if (saveSuccess) {
-              console.log(`✅ Episode metadata saved successfully: ${episodeId}`);
+              logger.info(`✅ Podcast episode metadata saved successfully: ${episodeId}`);
             } else {
-              console.warn(`⚠️ Failed to save episode metadata: ${episodeId}`);
+              logger.warn(`⚠️ Failed to save podcast episode metadata: ${episodeId}`);
             }
           } else {
-            console.warn('⚠️ DynamoDB service not available, metadata missing, or audio upload failed - skipping metadata processing');
+            logger.warn('⚠️ DynamoDB service not available, metadata missing, or audio upload failed - skipping podcast episode metadata processing');
           }
         } catch (error: any) {
-          console.error(`❌ Error processing episode metadata: ${error.message}`);
+          logger.error(`❌ Error processing podcast episode metadata: ${error.message}`);
         }
         
         return episodeId;
@@ -650,9 +675,9 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       tempVideoPath = await videoDownloadPromise;
       episodeId = await audioPromise;
       
-      console.log('Both downloads processed successfully!');
-      console.log(`Video: ${tempVideoPath}`);
-      console.log(`Audio: ${tempAudioPath}`);
+      logger.info('Both downloads processed successfully!');
+      logger.info(`Video: ${tempVideoPath}`);
+      logger.info(`Audio: ${tempAudioPath}`);
       
       // Store the audio path and upload info for later use
 
@@ -676,7 +701,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         finalMergedPath = path.join(outputDir, `merged_video_${timestamp}.mp4`);
       }
 
-      console.log('Starting merge of video and audio streams...');
+      logger.info('Starting merge of video and audio streams...');
       if (options.onProgress) {
         options.onProgress({
           percent: '95%',
@@ -689,15 +714,15 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       // Merge video and audio with validation
       await mergeVideoAudioWithValidation(tempVideoPath, tempAudioPath, finalMergedPath, options);
 
-      console.log('Cleaning up temporary files...');
+      logger.info('Cleaning up temporary files...');
       try {
         if (fs.existsSync(tempVideoPath)) {
           await fsPromises.unlink(tempVideoPath);
-          console.log('✅ Cleaned up temporary video file');
+          logger.info('✅ Cleaned up temporary video file');
         }
         if (fs.existsSync(tempAudioPath)) {
           await fsPromises.unlink(tempAudioPath);
-          console.log('✅ Cleaned up temporary audio file');
+          logger.info('✅ Cleaned up temporary audio file');
         }
         
         // Clean up empty directories starting from where the files were
@@ -716,7 +741,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
         // Clean up the main temp directory if it's empty
         await cleanupEmptyDirectories(tempDir);
       } catch (cleanupError) {
-        console.warn('Warning: Failed to clean up temporary files:', cleanupError);
+        logger.warn('Warning: Failed to clean up temporary files', { error: cleanupError });
       }
 
       if (options.onProgress) {
@@ -734,13 +759,13 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
       };
       
       
-      console.log(`Video download and merge completed successfully: ${resultObj.mergedFilePath}`);
+      logger.info(`Video download and merge completed successfully: ${resultObj.mergedFilePath}`);
       
       if (options.s3Upload?.enabled) {
         try {
           const s3Service = createS3ServiceFromEnv();
           if (s3Service) {
-            console.log('🚀 Uploading merged video file to S3...');
+            logger.info('🚀 Uploading merged video file to S3...');
             
             // Use already retrieved metadata instead of making another network call
             let videoKey: string;
@@ -757,21 +782,21 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
             const uploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
             
             if (uploadResult.success) {
-              console.log(`✅ Video uploaded to S3: ${uploadResult.location}`);
-              // Update DynamoDB with video S3 location
+              logger.info(`✅ Video uploaded to S3: ${uploadResult.location}`);
+              // Update DynamoDB with video S3 key
               try {
                 const dynamoService = createDynamoDBServiceFromEnv();
-                if (dynamoService && episodeId && uploadResult.location) {
-                  console.log('💾 Updating episode with video S3 link...');
-                  const updateSuccess = await dynamoService.updateEpisodeVideoLink(episodeId, uploadResult.location);
+                if (dynamoService && episodeId && videoKey) {
+                  logger.info('💾 Updating episode with video S3 key...');
+                  const updateSuccess = await dynamoService.updateEpisodeVideoLink(episodeId, videoKey);
                   if (updateSuccess) {
-                    console.log(`✅ Episode ${episodeId} updated with video S3 link`);
+                    logger.info(`✅ Episode ${episodeId} updated with video S3 key`);
                   } else {
-                    console.warn(`⚠️ Failed to update episode ${episodeId} with video S3 link`);
+                    logger.warn(`⚠️ Failed to update episode ${episodeId} with video S3 key`);
                   }
                 }
               } catch (updateError: any) {
-                console.warn('⚠️ DynamoDB video link update error:', updateError.message);
+                logger.warn('⚠️ DynamoDB video key update error:', updateError.message);
               }
               
               const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== true;
@@ -779,28 +804,28 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
                 try {
                 // await s3Service.deleteLocalFile(audio);
                   await s3Service.deleteLocalFile(finalMergedPath);
-                  console.log(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
+                  logger.info(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
                 } catch (deleteError) {
-                  console.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
+                  logger.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
                 }
               } else {
-                console.log(`📁 Keeping local video file: ${path.basename(finalMergedPath)}`);
+                logger.info(`📁 Keeping local video file: ${path.basename(finalMergedPath)}`);
               }
             } else {
-              console.error(`❌ Failed to upload video to S3: ${uploadResult.error}`);
+              logger.error(`❌ Failed to upload video to S3: ${uploadResult.error}`);
             }
           } else {
-            console.warn('⚠️ S3 service not available, skipping upload');
+            logger.warn('⚠️ S3 service not available, skipping upload');
           }
         } catch (error: any) {
-          console.error('❌ Error during S3 video upload:', error.message);
+          logger.error('❌ Error during S3 video upload:', error.message);
         }
       }
       
       resolve(resultObj);
 
     } catch (error: any) {
-      console.error(`Error during download and merge process: ${error.message}`);
+      logger.error(`Error during download and merge process: ${error.message}`);
       
       // Clean up temp files on error
       try {
@@ -824,7 +849,7 @@ export function downloadAndMergeVideo(videoUrl: string, options: DownloadOptions
           }
         }
       } catch (cleanupError) {
-        console.warn('Warning: Failed to clean up temporary files after error:', cleanupError);
+        logger.warn('Warning: Failed to clean up temporary files after error', { error: cleanupError });
       }
       
       reject(error);
@@ -840,26 +865,26 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
   return new Promise((resolve, reject) => {
     // Pre-merge validation
     if (!fs.existsSync(videoPath)) {
-      console.error(`❌ Video file missing: ${videoPath}`);
+      logger.error(`❌ Video file missing: ${videoPath}`);
       // List files in the directory to help with debugging
       const videoDir = path.dirname(videoPath);
       if (fs.existsSync(videoDir)) {
         const files = fs.readdirSync(videoDir);
-        console.error(`📁 Files in directory ${videoDir}:`, files);
+        logger.debug('Files in video directory', { directory: videoDir, files });
       } else {
-        console.error(`📁 Directory ${videoDir} does not exist`);
+        logger.error(`📁 Directory ${videoDir} does not exist`);
       }
       return reject(new Error(`Video file does not exist: ${videoPath}`));
     }
     if (!fs.existsSync(audioPath)) {
-      console.error(`❌ Audio file missing: ${audioPath}`);
+      logger.error(`❌ Audio file missing: ${audioPath}`);
       // List files in the directory to help with debugging
       const audioDir = path.dirname(audioPath);
       if (fs.existsSync(audioDir)) {
         const files = fs.readdirSync(audioDir);
-        console.error(`📁 Files in directory ${audioDir}:`, files);
+        logger.debug('Files in audio directory', { directory: audioDir, files });
       } else {
-        console.error(`📁 Directory ${audioDir} does not exist`);
+        logger.error(`📁 Directory ${audioDir} does not exist`);
       }
       return reject(new Error(`Audio file does not exist: ${audioPath}`));
     }
@@ -874,8 +899,8 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       return reject(new Error(`Audio file is empty: ${audioPath}`));
     }
 
-    console.log(`📹 Video file: ${(videoStats.size / 1024 / 1024).toFixed(2)} MB`);
-    console.log(`🔊 Audio file: ${(audioStats.size / 1024 / 1024).toFixed(2)} MB`);
+    logger.info(`📹 Video file: ${(videoStats.size / 1024 / 1024).toFixed(2)} MB`);
+    logger.info(`🔊 Audio file: ${(audioStats.size / 1024 / 1024).toFixed(2)} MB`);
 
     const args = [
       '-i', videoPath,
@@ -887,7 +912,7 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       outputPath
     ];
 
-    console.log(`Merging video and audio: ${FFMPEG_PATH} ${args.join(' ')}`);
+    logger.info(`Merging video and audio: ${FFMPEG_PATH} ${args.join(' ')}`);
 
     const ffmpegProcess = spawn(FFMPEG_PATH, args);
     let ffmpegOutput = '';
@@ -896,17 +921,17 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
     ffmpegProcess.stderr?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegError += output + '\n';
-      console.log(`ffmpeg: ${output}`);
+      logger.info(`ffmpeg: ${output}`);
     });
 
     ffmpegProcess.stdout?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegOutput += output + '\n';
-      console.log(`ffmpeg stdout: ${output}`);
+      logger.info(`ffmpeg stdout: ${output}`);
     });
 
     ffmpegProcess.on('error', (error: Error) => {
-      console.error(`Failed to start ffmpeg process: ${error.message}`);
+      logger.error(`Failed to start ffmpeg process: ${error.message}`);
       reject(error);
     });
 
@@ -922,13 +947,13 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
           return reject(new Error(`Merged file is empty: ${outputPath}`));
         }
 
-        console.log(`✅ Merge completed successfully. Output: ${outputPath}`);
-        console.log(`📁 Merged file size: ${(mergedStats.size / 1024 / 1024).toFixed(2)} MB`);
+        logger.info(`✅ Merge completed successfully. Output: ${outputPath}`);
+        logger.info(`📁 Merged file size: ${(mergedStats.size / 1024 / 1024).toFixed(2)} MB`);
         
         resolve(outputPath);
       } else {
-        console.error(`❌ ffmpeg process exited with error code ${code}`);
-        console.error(`ffmpeg error output: ${ffmpegError}`);
+        logger.error(`❌ ffmpeg process exited with error code ${code}`);
+        logger.error(`ffmpeg error output: ${ffmpegError}`);
         reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
       }
     });
@@ -948,7 +973,7 @@ async function cleanupEmptyDirectories(dirPath: string, stopAtRoot: string = DEF
     
     if (files.length === 0) {
       await fsPromises.rmdir(dirPath);
-      console.log(`🗑️ Removed empty directory: ${path.basename(dirPath)}`);
+      logger.info(`🗑️ Removed empty directory: ${path.basename(dirPath)}`);
       
       // Recursively clean up parent directory if it's now empty
       const parentDir = path.dirname(dirPath);
@@ -957,6 +982,6 @@ async function cleanupEmptyDirectories(dirPath: string, stopAtRoot: string = DEF
       }
     }
   } catch (error: any) {
-    console.warn(`Warning: Failed to clean up directory ${dirPath}:`, error.message);
+    logger.warn(`Warning: Failed to clean up directory ${dirPath}:`, error.message);
   }
 }

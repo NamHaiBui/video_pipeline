@@ -53,8 +53,6 @@ async function testGitHubApiConnectivity(): Promise<void> {
     
     const rateLimit = response.data.rate;
     console.log(`✅ GitHub API is accessible`);
-    console.log(`📊 Rate limit: ${rateLimit.remaining}/${rateLimit.limit} remaining`);
-    console.log(`🔄 Rate limit resets at: ${new Date(rateLimit.reset * 1000).toISOString()}`);
     
     if (rateLimit.remaining === 0) {
       console.warn('⚠️ GitHub API rate limit exceeded!');
@@ -105,7 +103,7 @@ async function getLatestYtdlpVersion(useNightly = false): Promise<string | null>
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`🔍 Fetching latest ${versionType} version (attempt ${attempt}/${maxRetries})...`);
+      console.log(`🔍 Fetching latest ${versionType} version...`);
       
       const response = await axios.get(`https://api.github.com/repos/${repo}/releases/latest`, {
         timeout: 10000, // 10 second timeout
@@ -116,7 +114,7 @@ async function getLatestYtdlpVersion(useNightly = false): Promise<string | null>
       });
       
       if (response.data && response.data.tag_name) {
-        console.log(`✅ Successfully fetched latest ${versionType} version: ${response.data.tag_name}`);
+        console.log(`✅ Latest ${versionType} version: ${response.data.tag_name}`);
         return response.data.tag_name;
       } else {
         throw new Error('Invalid response structure: missing tag_name');

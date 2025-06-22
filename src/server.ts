@@ -141,7 +141,7 @@ app.post('/api/download', async (req: Request<{}, {}, DownloadRequest>, res: Res
       message: 'Download job started successfully'
     });
   } catch (error) {
-    console.error('Error starting download:', error);
+    logger.error('Error starting download', error as Error);
     res.status(500).json({
       success: false,
       jobId: '', // Adding jobId to match the DownloadResponse type
@@ -238,7 +238,7 @@ app.get('/api/search/:query', async (req: Request<{ query: string }>, res: Respo
     });
 
   } catch (error) {
-    console.error('Error searching YouTube:', error);
+    logger.error('Error searching YouTube', error as Error);
     res.status(500).json({
       success: false,
       message: error instanceof Error ? error.message : 'Search failed'
@@ -261,21 +261,21 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
     searchUrl.searchParams.append('type', 'video');
     searchUrl.searchParams.append('key', YOUTUBE_API_KEY!);
     
-    console.log(`Fetching YouTube search results from: ${searchUrl.toString()}`);
+    logger.debug('Fetching YouTube search results', { searchUrl: searchUrl.toString() });
 
     const response = await fetch(searchUrl.toString());
-    console.log(`YouTube API response status: ${response.status}`);
+    logger.debug('YouTube API response received', { status: response.status });
     
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`YouTube API error response: ${errorText}`);
+      logger.error('YouTube API error response', undefined, { errorText });
       throw new Error(`YouTube API error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
     const searchData = await response.json() as any;
     
     if (!searchData.items || searchData.items.length === 0) {
-      console.log('No search results found');
+      logger.info('No search results found');
       return {};
     }
 
@@ -292,7 +292,7 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
     
     if (!detailsResponse.ok) {
       const errorText = await detailsResponse.text();
-      console.error(`YouTube videos API error: ${errorText}`);
+      logger.error('YouTube videos API error', undefined, { errorText });
       throw new Error(`YouTube videos API error: ${detailsResponse.status} ${detailsResponse.statusText}`);
     }
 
@@ -315,17 +315,23 @@ async function searchYouTubeVideos(query: string, maxResults: number = 10): Prom
         results[title] = url;
         count++;
         
-        console.log(`Added video: ${title} (${Math.floor(durationInSeconds / 60)}:${(durationInSeconds % 60).toString().padStart(2, '0')})`);
+        logger.debug('Added video to search results', { 
+          title, 
+          duration: `${Math.floor(durationInSeconds / 60)}:${(durationInSeconds % 60).toString().padStart(2, '0')}` 
+        });
       } else {
-        console.log(`Skipped video (too short): ${video.snippet.title} (${Math.floor(durationInSeconds / 60)}:${(durationInSeconds % 60).toString().padStart(2, '0')})`);
+        logger.debug('Skipped video (too short)', { 
+          title: video.snippet.title, 
+          duration: `${Math.floor(durationInSeconds / 60)}:${(durationInSeconds % 60).toString().padStart(2, '0')}` 
+        });
       }
     }
 
-    console.log(`Found ${Object.keys(results).length} search results longer than 4 minutes`);
+    logger.info('YouTube search completed', { resultsCount: Object.keys(results).length });
     return results;
 
   } catch (error) {
-    console.error('Error in searchYouTubeVideos:', error);
+    logger.error('Error in searchYouTubeVideos', error as Error);
     throw error;
   }
 }
@@ -665,7 +671,7 @@ async function checkAndQueueVideoTrimming(episodeId: string): Promise<void> {
     return;
   }
 
-  const trimQueueUrl = process.env.VIDEO_TRIMMING_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming';
+  const trimQueueUrl = process.env.VIDEO_TRIMMING_QUEUE_URL;
 
   try {
     // Get episode data from DynamoDB

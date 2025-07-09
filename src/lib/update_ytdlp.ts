@@ -46,7 +46,7 @@ async function testGitHubApiConnectivity(): Promise<void> {
     const response = await axios.get('https://api.github.com/rate_limit', {
       timeout: 5000,
       headers: {
-        'User-Agent': 'video-pipeline/1.0.0',
+        'User-Agent': 'video-episode-downloader/1.0.0',
         'Accept': 'application/vnd.github.v3+json'
       }
     });
@@ -108,7 +108,7 @@ async function getLatestYtdlpVersion(useNightly = false): Promise<string | null>
       const response = await axios.get(`https://api.github.com/repos/${repo}/releases/latest`, {
         timeout: 10000, // 10 second timeout
         headers: {
-          'User-Agent': 'video-pipeline/1.0.0',
+          'User-Agent': 'video-episode-downloader/1.0.0',
           'Accept': 'application/vnd.github.v3+json'
         }
       });
@@ -229,7 +229,7 @@ async function downloadFileWithProgress(url: string, outputPath: string, fileNam
         responseType: 'stream',
         timeout: 30000, // 30 second timeout
         headers: {
-          'User-Agent': 'video-pipeline/1.0.0',
+          'User-Agent': 'video-episode-downloader/1.0.0',
           'Accept': 'application/octet-stream',
           'Accept-Encoding': 'gzip, deflate, br'
         }

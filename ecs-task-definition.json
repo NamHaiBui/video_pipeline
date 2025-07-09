@@ -1,53 +1,66 @@
 {
-  "family": "video-pipeline-task",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "1024",
-  "memory": "2048",
-  "executionRoleArn": "arn:aws:iam::{{ACCOUNT_ID}}:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::{{ACCOUNT_ID}}:role/video-pipeline-task-role",
+  "family": "video-episode-downloader",
   "containerDefinitions": [
     {
       "name": "bgutil-provider",
       "image": "brainicism/bgutil-ytdlp-pot-provider:latest",
-      "essential": true,
+      "cpu": 256,
+      "memory": 512,
       "portMappings": [
         {
           "containerPort": 4416,
+          "hostPort": 4416,
           "protocol": "tcp"
         }
       ],
+      "essential": true,
+      "environment": [],
+      "mountPoints": [],
+      "volumesFrom": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/video_episode_downloader",
+          "mode": "non-blocking",
+          "awslogs-create-group": "true",
+          "max-buffer-size": "25m",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "bgutil-provider"
+        }
+      },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:4416/health || exit 1"],
+        "command": [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://localhost:4416/ping', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""
+        ],
         "interval": 30,
         "timeout": 10,
         "retries": 3,
         "startPeriod": 10
       },
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/video-pipeline",
-          "awslogs-region": "{{AWS_REGION}}",
-          "awslogs-stream-prefix": "bgutil-provider"
-        }
-      },
-      "memoryReservation": 256
+      "systemControls": []
     },
     {
-      "name": "video-pipeline",
-      "image": "{{IMAGE_URI}}",
-      "essential": true,
+      "name": "video-episode-downloader",
+      "image": "221082194281.dkr.ecr.us-east-1.amazonaws.com/video_episode_downloader",
+      "cpu": 768,
+      "memory": 2560,
       "portMappings": [
         {
           "containerPort": 3000,
+          "hostPort": 3000,
           "protocol": "tcp"
         }
       ],
+      "essential": true,
       "environment": [
         {
-          "name": "NODE_ENV",
-          "value": "production"
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "SQS_QUEUE_URL",
+          "value": "https://sqs.us-east-1.amazonaws.com/221082194281/test-download-queue"
         },
         {
           "name": "PORT",
@@ -58,117 +71,115 @@
           "value": "true"
         },
         {
-          "name": "S3_UPLOAD_ENABLED",
-          "value": "true"
-        },
-        {
           "name": "PODCAST_CONVERSION_ENABLED",
           "value": "true"
-        },
-        {
-          "name": "AWS_REGION",
-          "value": "{{AWS_REGION}}"
         },
         {
           "name": "MAX_CONCURRENT_JOBS",
           "value": "2"
         },
         {
-          "name": "POLLING_INTERVAL_MS",
-          "value": "30000"
+          "name": "S3_VIDEO_BUCKET",
+          "value": "pd-video-storage-test"
         },
         {
-          "name": "DEFAULT_VIDEO_QUALITY",
-          "value": "720p"
+          "name": "S3_AUDIO_BUCKET",
+          "value": "pd-audio-storage-test"
         },
         {
-          "name": "PREFERRED_AUDIO_FORMAT",
-          "value": "mp3"
+          "name": "VIDEO_TRIMMING_QUEUE_URL",
+          "value": "https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming"
+        },
+        {
+          "name": "S3_UPLOAD_ENABLED",
+          "value": "true"
+        },
+        {
+          "name": "NODE_ENV",
+          "value": "production"
         },
         {
           "name": "LOG_LEVEL",
           "value": "info"
         },
         {
+          "name": "YTDLP_VERBOSE_WARNINGS",
+          "value": "false"
+        },
+        {
+          "name": "COOKIES_FILE_PATH",
+          "value": "/app/.config/yt-dlp/yt-dlp-cookies.txt"
+        },
+        {
           "name": "BGUTIL_PROVIDER_URL",
-          "value": "http://localhost:4416"
-        }
-      ],
-      "secrets": [
-        {
-          "name": "AWS_ACCESS_KEY_ID",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/aws-access-key-id"
-        },
-        {
-          "name": "AWS_SECRET_ACCESS_KEY",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/aws-secret-access-key"
-        },
-        {
-          "name": "S3_AUDIO_BUCKET_NAME",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/s3-audio-bucket"
-        },
-        {
-          "name": "S3_VIDEO_BUCKET_NAME",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/s3-video-bucket"
+          "value": "http://bgutil-provider:4416"
         },
         {
           "name": "DYNAMODB_PODCAST_EPISODES_TABLE",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/dynamodb-episodes-table"
-        },
-        {
-          "name": "SQS_QUEUE_URL",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/sqs-queue-url"
-        },
-        {
-          "name": "VIDEO_TRIMMING_QUEUE_URL",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/video-trimming-queue-url"
-        },
-        {
-          "name": "YOUTUBE_API_KEY",
-          "valueFrom": "arn:aws:ssm:{{AWS_REGION}}:{{ACCOUNT_ID}}:parameter/video-pipeline/youtube-api-key"
+          "value": "PodcastEpisodeStore"
         }
       ],
+      "mountPoints": [
+        {
+          "sourceVolume": "video-pipeline-config",
+          "containerPath": "/app/.config"
+        }
+      ],
+      "volumesFrom": [],
       "dependsOn": [
         {
           "containerName": "bgutil-provider",
           "condition": "HEALTHY"
         }
       ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/video_episode_downloader",
+          "mode": "non-blocking",
+          "awslogs-create-group": "true",
+          "max-buffer-size": "25m",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "video-episode-downloader"
+        }
+      },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:3000/health || exit 1"
+        ],
         "interval": 30,
         "timeout": 10,
         "retries": 3,
         "startPeriod": 40
       },
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/video-pipeline",
-          "awslogs-region": "{{AWS_REGION}}",
-          "awslogs-stream-prefix": "video-pipeline"
-        }
-      },
-      "memoryReservation": 1536,
-      "mountPoints": [
-        {
-          "sourceVolume": "video-pipeline-data",
-          "containerPath": "/app/data"
-        }
-      ]
+      "systemControls": []
     }
   ],
+  "taskRoleArn": "arn:aws:iam::221082194281:role/ecsTaskExecutionRole",
+  "executionRoleArn": "arn:aws:iam::221082194281:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
   "volumes": [
     {
-      "name": "video-pipeline-data",
+      "name": "video-pipeline-config",
       "efsVolumeConfiguration": {
         "fileSystemId": "{{EFS_FILE_SYSTEM_ID}}",
-        "rootDirectory": "/video-pipeline",
+        "rootDirectory": "/video-pipeline-config",
         "transitEncryption": "ENABLED",
         "authorizationConfig": {
-          "accessPointId": "{{EFS_ACCESS_POINT_ID}}"
+          "accessPointId": "{{EFS_CONFIG_ACCESS_POINT_ID}}"
         }
       }
     }
-  ]
+  ],
+  "placementConstraints": [],
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "3072",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  }
 }

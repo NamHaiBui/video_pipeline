@@ -29,7 +29,7 @@ RUN npm ci
 COPY src/ ./src/
 EXPOSE 3000
 USER root
-CMD ["npm", "run", "server:build"]
+CMD ["npm", "run", "dev"]
 
 # Build stage
 FROM base AS build
@@ -72,7 +72,7 @@ USER nodejs
 EXPOSE 3000
 
 # Add labels for better container management
-LABEL maintainer="video-pipeline" \
+LABEL maintainer="video_episode_downloader" \
       description="Podcast Processing Pipeline - Convert YouTube videos to podcast episodes" \
       version="1.0.0"
 

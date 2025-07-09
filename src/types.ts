@@ -129,6 +129,29 @@ export interface JobStatusResponse {
 export interface SQSJobMessage {
   jobId?: string;
   url: string;
+  channelId?: string; // Channel ID for podcast episode processing
+  id?: string; // For existing episode video downloads - when present, indicates existing episode job
+  
+  // New SQS message structure - all fields at top level
+  videoId?: string;
+  episodeTitle?: string;
+  channelName?: string;
+  originalUri?: string;
+  publishedDate?: string;
+  contentType?: 'Video';
+  hostName?: string;
+  hostDescription?: string;
+  genre?: string;
+  country?: string;
+  websiteLink?: string;
+  additionalData?: {
+    youtubeVideoId?: string;
+    youtubeChannelId?: string;
+    youtubeUrl?: string;
+    notificationReceived?: string;
+    [key: string]: any;
+  };
+  
   options?: {
     format?: string;
     quality?: string;
@@ -136,6 +159,26 @@ export interface SQSJobMessage {
     priority?: 'high' | 'normal' | 'low';
   };
   metadata?: Record<string, any>;
+  
+  // Legacy channelInfo - for backward compatibility (deprecated)
+  channelInfo?: {
+    channelId: string;
+    channelName: string;
+    hostName?: string;
+    hostDescription?: string;
+    country?: string;
+    genre?: string; // genreId will be passed as 'genre' in SQS message
+    rssUrl?: string;
+    guests?: string[];
+    guestDescriptions?: string[];
+    guestImageUrl?: string;
+    episodeImages?: string[];
+    topics?: string[];
+    channelDescription?: string;
+    channelThumbnail?: string;
+    subscriberCount?: number;
+    verified?: boolean;
+  };
 }
 
 export interface SQSResponseMessage {
@@ -146,150 +189,15 @@ export interface SQSResponseMessage {
 }
 
 /**
- * Guest description structure for DynamoDB
- */
-export interface GuestDescription {
-  M: {
-    name: { S: string };
-    description: { S: string };
-    matched_from_cache: { S: string };
-    confidence: { S: string };
-  };
-}
-
-/**
- * Guest name structure for DynamoDB
- */
-export interface GuestName {
-  M: {
-    S: { S: string };
-  };
-}
-
-/**
- * Image structure for DynamoDB
- */
-export interface ImageData {
-  artworkUrl600: { S: string };
-  artworkUrl60: { S: string };
-  artworkUrl160: { S: string };
-}
-
-/**
- * Summary metadata structure for DynamoDB
- */
-export interface SummaryMetadata {
-  topic_metadata: {
-    M: {
-      start: { L: Array<{ S: string }> };
-      end: { L: Array<{ S: string }> };
-      topics: { L: Array<{ S: string }> };
-      chunk_nos: { L: Array<{ S: string }> };
-    };
-  };
-  summary_transcript_file_name: { S: string };
-  summary_duration: { S: string };
-}
-
-/**
- * Podcast episode data structure for storing video content as podcast episodes
- * Matches DynamoDB format with type descriptors
- */
-export interface PodcastEpisodeData {
-  /** Unique identifier for the episode */
-  id: string;
-  /** Podcast/channel title (derived from uploader) */
-  podcast_title: string;
-  /** Episode title (derived from video title) */
-  episode_title: string;
-  /** Audio chunking processing status */
-  audio_chunking_status: string;
-  /** Audio file URL */
-  audio_url: string;
-  /** Content chunking processing status */
-  chunking_status: string;
-  /** Country/region */
-  country: string;
-  /** Episode description (from video description) */
-  description: string;
-  /** Whether episode has been downloaded */
-  episode_downloaded: boolean;
-  /** Episode GUID */
-  episode_guid: string;
-  /** Episode ID from original source */
-  episode_id: string;
-  /** Episode duration in milliseconds */
-  episode_time_millis: number;
-  /** Original episode title with full details */
-  episode_title_details: string;
-  /** Episode URL */
-  episode_url: string;
-  /** File name for storage */
-  file_name: string;
-  /** Content genres/categories - DynamoDB format */
-  genres: Array<{ S: string }>;
-  /** Number of guests detected */
-  guest_count: number;
-  /** Description of detected guests - DynamoDB format */
-  guest_description: GuestDescription[];
-  /** Confidence level of guest extraction */
-  guest_extraction_confidence: string;
-  /** List of guest names - DynamoDB format */
-  guest_names: GuestName[];
-  /** Episode image/thumbnail data - DynamoDB format */
-  image: ImageData;
-  /** Number of chunks created */
-  num_chunks: number;
-  /** Number of quotes extracted */
-  num_quotes: number;
-  /** Number of chunks removed during processing */
-  num_removed_chunks: number;
-  /** Whether this is partial data */
-  partial_data: boolean;
-  /** List of personalities/guests mentioned - DynamoDB format */
-  personalities: Array<{ S: string }>;
-  /** Podcast author/channel name */
-  podcast_author: string;
-  /** Podcast ID from original source */
-  podcast_id: string;
-  /** Published/upload date */
-  published_date: string;
-  /** Quote extraction status */
-  quote_status: string;
-  /** Quotes audio processing status */
-  quotes_audio_status: string;
-  /** Quotes video processing status */
-  quotes_video_status: string;
-  /** RSS feed URL for the podcast */
-  rss_url: string;
-  /** Content source (e.g., 'youtube', 'vimeo') */
-  source: string;
-  /** Summarization processing status */
-  summarization_status: string;
-  /** Summary metadata information - DynamoDB format */
-  summary_metadata: SummaryMetadata;
-  /** Topics extracted from content - DynamoDB format */
-  topics: Array<{ S: string }>;
-  /** URI for transcript file */
-  transcript_uri: string;
-  /** Transcription status */
-  transcription_status: string;
-  /** Video chunking processing status */
-  video_chunking_status: string;
-  /** Video file name */
-  video_file_name: string;
-}
-
-/**
  * Analysis result from AI content analysis
  */
 export interface ContentAnalysisResult {
-  /** Number of personalities detected */
-  number_of_personalities: number;
+  /** Number of personalities found */
+  number_of_personalities?: number;
   /** List of personality names */
   personalities: string[];
-  /** Whether content matches provided topics */
-  topic_match: boolean;
+  /** Whether topics match */
+  topic_match?: boolean;
   /** List of matching topics */
   matching_topics: string[];
 }
@@ -304,4 +212,87 @@ export interface AnalysisConfig {
   person_keywords?: string[];
   /** Enable AI analysis */
   enable_ai_analysis?: boolean;
+}
+
+/**
+ * Processing information for episodes matching the new RDS schema
+ */
+export interface EpisodeProcessingInfo {
+  episodeTranscribingDone: boolean;
+  summaryTranscribingDone: boolean;
+  summarizingDone: boolean;
+  numChunks: number;
+  numRemovedChunks: number;
+  chunkingDone: boolean;
+  quotingDone: boolean;
+}
+
+/**
+ * Episode data structure matching the exact RDS table schema
+ */
+export interface RDSEpisodeData {
+  /** Unique episode identifier */
+  episodeId: string;
+  /** Title of the episode */
+  episodeTitle: string;
+  /** Description/summary of the episode */
+  episodeDescription: string;
+  /** Name of the host */
+  hostName?: string;
+  /** Description of the host */
+  hostDescription?: string;
+  /** Name of the channel/podcast */
+  channelName: string;
+  /** Array of guest names */
+  guests?: string[];
+  /** Array of guest descriptions */
+  guestDescriptions?: string[];
+  /** S3 URL for guest image */
+  guestImageUrl?: string;
+  /** When the episode was published */
+  publishedDate: Date;
+  /** S3 URL for the episode (audio/video file) */
+  episodeUrl?: string;
+  /** Original URL from the source site */
+  originalUrl: string;
+  /** Channel identifier */
+  channelId: string;
+  /** Country of origin */
+  country?: string;
+  /** Genre/category of the episode */
+  genre?: string;
+  /** Array of S3 URLs for episode images */
+  episodeImages?: string[];
+  /** Duration in milliseconds */
+  durationMillis: number;
+  /** RSS feed URL */
+  rssUrl?: string;
+  /** S3 URL for transcript */
+  transcriptUri?: string;
+  /** S3 URL for processed transcript */
+  processedTranscriptUri?: string;
+  /** S3 URL for summary audio */
+  summaryAudioUri?: string;
+  /** Duration of summary in milliseconds */
+  summaryDurationMillis?: number;
+  /** S3 URL for summary transcript */
+  summaryTranscriptUri?: string;
+  /** Array of topics/tags */
+  topics?: string[];
+  /** Last updated timestamp */
+  updatedAt: Date;
+  /** Soft delete timestamp (null when not deleted) */
+  deletedAt?: Date;
+  /** Creation timestamp */
+  createdAt: Date;
+  /** Processing status information */
+  processingInfo: EpisodeProcessingInfo;
+  /** Content type: Audio or Video */
+  contentType: 'Audio' | 'Video';
+  /** Additional data as JSON for future use */
+  additionalData: Record<string, any>;
+  /** Overall processing completion status */
+  processingDone: boolean;
+  /** Sync status with external systems */
+  isSynced: boolean;
 }

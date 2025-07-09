@@ -126,6 +126,7 @@ async function setupBinaries(): Promise<void> {
     }
   }
   console.log('--- Binary setup complete ---');
+  process.exit(0);
 }
 
 setupBinaries().catch((error: Error) => {

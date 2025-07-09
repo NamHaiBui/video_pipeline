@@ -88,14 +88,14 @@ export function parseS3Key(s3Key: string): { podcastSlug: string; episodeSlug: s
  * Get the audio bucket name based on environment
  */
 export function getAudioBucketName(): string {
-  return process.env.S3_AUDIO_BUCKET || 'pd-audio-storage-test';
+  return process.env.S3_AUDIO_BUCKET || 'spice-episode-artifacts';
 }
 
 /**
  * Get the video bucket name based on environment
  */
 export function getVideoBucketName(): string {
-  return process.env.S3_VIDEO_BUCKET || 'pd-video-storage-test';
+  return process.env.S3_VIDEO_BUCKET || 'spice-episode-artifacts';
 }
 
 /**

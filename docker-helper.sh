@@ -33,12 +33,12 @@ info() {
 # Build functions
 build_dev() {
     log "Building development image..."
-    docker build -f Dockerfile -t video-pipeline:dev --target development .
+    docker build -f Dockerfile -t video-episode-downloader:dev --target development .
 }
 
 build_prod() {
     log "Building production image..."
-    docker build -f Dockerfile.production -t video-pipeline:prod --target production .
+    docker build -f Dockerfile.production -t video-episode-downloader:prod --target production .
 }
 
 # Run functions
@@ -68,11 +68,11 @@ cleanup() {
 
 # Logs functions
 logs_app() {
-    docker-compose -f docker-compose.yml logs -f "${2:-video-pipeline}"
+    docker-compose -f docker-compose.yml logs -f "${2:-video-episode-downloader}"
 }
 
 logs_prod() {
-    docker-compose -f docker-compose.prod.yml logs -f "${2:-video-pipeline}"
+    docker-compose -f docker-compose.prod.yml logs -f "${2:-video-episode-downloader}"
 }
 
 # Health check
@@ -91,7 +91,7 @@ health_check() {
 # Show status
 status() {
     log "Container Status:"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=video-pipeline*" --filter "name=bgutil*"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=video-episode-downloader*" --filter "name=bgutil*"
     
     echo ""
     log "Images:"

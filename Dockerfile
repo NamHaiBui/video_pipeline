@@ -29,7 +29,7 @@ RUN mkdir -p /app/bin \
     /app/downloads/audio \
     /app/temp \
     /app/.config/yt-dlp/plugins \
-    && chmod -R 755 /app/downloads /app/temp
+    && chmod -R 755 /app/downloads /app/temp /app/.config
 
 # Create symlinks to system binaries so the app can find them
 RUN ln -sf /usr/bin/ffmpeg /app/bin/ffmpeg && \
@@ -49,7 +49,7 @@ COPY src/ ./src/
 EXPOSE 3000
 
 # Development command
-CMD ["npm", "run", "server:build"]
+CMD ["npm", "run", "dev"]
 
 # Production stage
 FROM base AS production
@@ -61,7 +61,7 @@ RUN mkdir -p /app/bin \
     /app/downloads/audio \
     /app/temp \
     /app/.config/yt-dlp/plugins \
-    && chmod -R 755 /app/downloads /app/temp
+    && chmod -R 755 /app/downloads /app/temp /app/.config
 
 # Create symlinks to system binaries so the app can find them
 RUN ln -sf /usr/bin/ffmpeg /app/bin/ffmpeg && \
@@ -73,6 +73,9 @@ COPY tsconfig*.json ./
 
 # Copy source code (needed for setup_binaries.ts during postinstall)
 COPY src/ ./src/
+
+# Copy .config directory for yt-dlp plugins and configuration
+COPY .config/ ./.config/
 
 # Install all dependencies (including dev dependencies needed for postinstall)
 RUN npm ci
@@ -97,7 +100,7 @@ USER nodejs
 EXPOSE 3000
 
 # Add labels for better container management
-LABEL maintainer="video-pipeline" \
+LABEL maintainer="video_episode_downloader" \
       description="Podcast Processing Pipeline - Convert YouTube videos to podcast episodes" \
       version="1.0.0"
 

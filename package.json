@@ -1,7 +1,7 @@
 {
-  "name": "podcast-processing-pipeline",
+  "name": "video-episode-downloader",
   "version": "1.0.0",
-  "description": "A podcast processing pipeline to convert YouTube videos to podcast episodes with audio extraction and metadata processing",
+  "description": "A video episode downloader to convert YouTube videos to podcast episodes with audio extraction and metadata processing",
   "main": "dist/server.js",
   "type": "module",
   "scripts": {
@@ -23,7 +23,9 @@
     "test:slug-integration": "tsx src/scripts/test-slug-integration.ts",
     "test:complete-slug": "tsx src/scripts/test-complete-slug.ts",
     "test:video-slug": "tsx src/scripts/test-video-slug.ts",
-    "test:trimming-queue": "tsx scripts/test-video-trimming-queue.ts"
+    "test:trimming-queue": "tsx scripts/test-video-trimming-queue.ts",
+    "diagnose:ytdlp-warnings": "tsx src/scripts/diagnose-ytdlp-warnings.ts",
+    "migrate:rds": "tsx src/scripts/migrate-to-rds.ts"
   },
   "keywords": [
     "podcast",
@@ -48,6 +50,7 @@
     "@aws-sdk/client-sqs": "^3.828.0",
     "@aws-sdk/lib-dynamodb": "^3.828.0",
     "@aws-sdk/s3-request-presigner": "^3.828.0",
+    "@google-cloud/vertexai": "^1.10.0",
     "@xmldom/xmldom": "^0.9.8",
     "axios": "^1.9.0",
     "cors": "^2.8.5",
@@ -55,7 +58,10 @@
     "dateutil": "^0.1.0",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "mysql2": "^3.14.1",
     "node-fetch": "^3.3.2",
+    "openai": "^5.8.3",
+    "pg": "^8.16.3",
     "progress": "^2.0.3",
     "uuid": "^11.1.0"
   },
@@ -64,6 +70,7 @@
     "@types/dotenv": "^6.1.1",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.29",
+    "@types/pg": "^8.15.4",
     "@types/progress": "^2.0.7",
     "@types/uuid": "^10.0.0",
     "tsx": "^4.19.4",

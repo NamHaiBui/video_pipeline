@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # bgutil-ytdlp-pot-provider service (dependency)
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     container_name: bgutil-provider
@@ -9,7 +8,7 @@ services:
       - "4416:4416"
     restart: unless-stopped
     networks:
-      - video-pipeline-network
+      - video-episode-downloader-network
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:4416', (res) => process.exit(0)).on('error', () => process.exit(1))"]
       interval: 30s
@@ -17,13 +16,13 @@ services:
       retries: 3
       start_period: 10s
 
-  # Main video pipeline application
-  video-pipeline:
+  # Main video episode downloader application
+  video-episode-downloader:
     build: 
       context: .
       dockerfile: Dockerfile
       target: production
-    container_name: video-pipeline
+    container_name: video_episode_downloader
     ports:
       - "3000:3000"
     environment:
@@ -32,6 +31,9 @@ services:
       - ENABLE_SQS_POLLING=true
       - S3_UPLOAD_ENABLED=true
       - PODCAST_CONVERSION_ENABLED=true
+      
+      # bgutil-provider Configuration
+      - BGUTIL_PROVIDER_URL=http://bgutil-provider:4416
       
       # AWS Configuration
       - AWS_REGION=${AWS_REGION:-us-east-1}
@@ -60,18 +62,17 @@ services:
       
       # Logging
       - LOG_LEVEL=info
+      - YTDLP_VERBOSE_WARNINGS=false
       
-      # bgutil provider
-      - BGUTIL_PROVIDER_URL=http://bgutil-provider:4416
       
     volumes:
-      - video-pipeline-data:/app/data
+      - video-episode-downloader-data:/app/data
     depends_on:
       bgutil-provider:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - video-pipeline-network
+      - video-episode-downloader-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
@@ -80,9 +81,8 @@ services:
       start_period: 40s
 
 volumes:
-  video-pipeline-data:
-
+  video-episode-downloader-data:
 networks:
-  video-pipeline-network:
+  video-episode-downloader-network:
     driver: bridge
-    name: video-pipeline-network
+    name: video-episode-downloader-network

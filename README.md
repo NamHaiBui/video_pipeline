@@ -1,6 +1,6 @@
-# Podcast Processing Pipeline - TypeScript
+# Video Episode Downloader - TypeScript
 
-A comprehensive podcast processing pipeline built with TypeScript and Node.js that converts YouTube videos into podcast episodes with automatic audio extraction, metadata processing, and cloud storage integration.
+A comprehensive video episode downloader built with TypeScript and Node.js that converts YouTube videos into podcast episodes with automatic audio extraction, metadata processing, and cloud storage integration.
 
 ## Features
 

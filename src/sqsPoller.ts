@@ -95,36 +95,51 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     const messageId = message.MessageId || 'unknown';
     const jobData = JSON.parse(message.Body) as SQSJobMessage;
     
-    // Validate that url is always present
-    if (!jobData.url) {
-      logger.warn(`Invalid job data in message ${messageId}: missing url`);
-      return true; // Delete invalid messages
+    // Determine message type based on structure
+    const isVideoEnrichment = !!(jobData.id && jobData.url && !jobData.videoId);
+    const isNewEntry = !!(jobData.videoId && jobData.episodeTitle && jobData.originalUri);
+    
+    // Validate message structure
+    if (isVideoEnrichment) {
+      // Video Enrichment: {"id": str, "url": str}
+      if (!jobData.id || !jobData.url) {
+        logger.warn(`Invalid video enrichment message ${messageId}: missing id or url`);
+        return true; // Delete invalid messages
+      }
+    } else if (isNewEntry) {
+      // New Entry: comprehensive video metadata
+      if (!jobData.videoId || !jobData.episodeTitle || !jobData.originalUri) {
+        logger.warn(`Invalid new entry message ${messageId}: missing required fields (videoId, episodeTitle, originalUri)`);
+        return true; // Delete invalid messages
+      }
+    } else {
+      // Legacy format validation
+      if (!jobData.url) {
+        logger.warn(`Invalid job data in message ${messageId}: missing url or unknown message format`);
+        return true; // Delete invalid messages
+      }
     }
     
-    // Determine message type based on presence of 'id' field
-    // If 'id' is present, it's an existing episode job; otherwise it's a new download job
-    const isExistingEpisodeJob = !!(jobData.id);
-    
-    // Handle existing episode video download
-    if (isExistingEpisodeJob) {
-      logger.info(`Processing existing episode video download: ${jobData.id} - ${jobData.url}`);
+    // Handle video enrichment (existing episode video download)
+    if (isVideoEnrichment) {
+      logger.info(`Processing video enrichment: ${jobData.id} - ${jobData.url}`);
       
       // Check if we can accept more jobs
       if (!jobTracker.canAcceptMoreJobs()) {
-        logger.debug(`Cannot accept existing episode job ${jobData.id}, max concurrent jobs reached`);
+        logger.debug(`Cannot accept video enrichment job ${jobData.id}, max concurrent jobs reached`);
         return false; // Keep in queue
       }
       
       // Start job tracking
-      const trackingJobId = `existing-${jobData.id}`;
+      const trackingJobId = `enrichment-${jobData.id}`;
       if (!jobTracker.startJob(trackingJobId)) {
         return false; // Failed to start job, try again later
       }
       
-      // Process existing episode job async
+      // Process video enrichment job async
       downloadVideoForExistingEpisode(jobData.id!, jobData.url!)
         .then(() => {
-          logger.info(`Existing episode video download ${jobData.id} completed successfully`);
+          logger.info(`Video enrichment ${jobData.id} completed successfully`);
           jobTracker.completeJob(trackingJobId);
           
           // Poll for new messages if we have capacity
@@ -133,7 +148,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
           }
         })
         .catch(error => {
-          logger.error(`Error processing existing episode job ${jobData.id}: ${error.message}`, undefined, { error });
+          logger.error(`Error processing video enrichment job ${jobData.id}: ${error.message}`, undefined, { error });
           jobTracker.completeJob(trackingJobId);
           
           // Poll for new messages if we have capacity
@@ -150,12 +165,64 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       return true;
     }
     
-    // Handle new download job
-    // Ensure that jobId is always defined for new downloads
+    // Handle new entry creation
+    if (isNewEntry) {
+      // Generate jobId for tracking
+      const generatedJobId = jobData.videoId || messageId || uuidv4();
+      logger.info(`Processing new entry creation: ${generatedJobId} - ${jobData.episodeTitle}`);
+      
+      // Check if we can accept more jobs
+      if (!jobTracker.canAcceptMoreJobs()) {
+        logger.debug(`Cannot accept new entry job ${generatedJobId}, max concurrent jobs reached`);
+        return false; // Keep in queue
+      }
+      
+      // Start job tracking
+      const trackingJobId = `newentry-${generatedJobId}`;
+      if (!jobTracker.startJob(trackingJobId)) {
+        return false; // Failed to start job, try again later
+      }
+      
+      // Process new entry job async - pass the full jobData with new entry structure
+      processDownload(generatedJobId, jobData.originalUri!, jobData)
+        .then(() => {
+          logger.info(`New entry creation ${generatedJobId} completed successfully`);
+          jobTracker.completeJob(trackingJobId);
+          
+          // Poll for new messages if we have capacity
+          if (jobTracker.canAcceptMoreJobs()) {
+            pollSQSMessages();
+          }
+        })
+        .catch(error => {
+          logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
+          jobTracker.completeJob(trackingJobId);
+          
+          // Poll for new messages if we have capacity
+          if (jobTracker.canAcceptMoreJobs()) {
+            pollSQSMessages();
+          }
+        });
+      
+      // Delete message from queue since we've accepted the job
+      if (sqsService) {
+        await sqsService.deleteMessage(message.ReceiptHandle);
+      }
+      
+      return true;
+    }
+    // Handle legacy message format (for backward compatibility)
+    // Validate that url is present for legacy messages
+    if (!jobData.url) {
+      logger.warn(`Invalid legacy job data in message ${messageId}: missing url`);
+      return true; // Delete invalid messages
+    }
+    
+    // Ensure that jobId is always defined for legacy downloads
     if (!jobData.jobId || jobData.jobId.trim() === '') {
       // Try to use messageId first, fallback to generating a new UUID
       const generatedJobId = messageId && messageId !== 'unknown' ? messageId : uuidv4();
-      logger.info(`Message ${messageId} has no jobId, generating: ${generatedJobId}`);
+      logger.info(`Legacy message ${messageId} has no jobId, generating: ${generatedJobId}`);
       jobData.jobId = generatedJobId;
     } else {
       jobData.jobId = jobData.jobId.trim();
@@ -163,11 +230,11 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     
     // At this point jobId should always be defined and non-empty
     const channelInfo = jobData.channelId ? ` [Channel: ${jobData.channelId}]` : '';
-    logger.debug(`Processing new download job: ${jobData.jobId} - ${jobData.url}${channelInfo}`);
+    logger.debug(`Processing legacy download job: ${jobData.jobId} - ${jobData.url}${channelInfo}`);
     
     // Check if we can accept more jobs
     if (!jobTracker.canAcceptMoreJobs()) {
-      logger.debug(`Cannot accept job ${jobData.jobId}, max concurrent jobs reached`);
+      logger.debug(`Cannot accept legacy job ${jobData.jobId}, max concurrent jobs reached`);
       return false; // Keep in queue
     }
     
@@ -176,10 +243,10 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       return false; // Failed to start job, try again later
     }
     
-    // Process job async - pass the full jobData instead of just channelId
+    // Process legacy job async - pass the full jobData instead of just channelId
     processDownload(jobData.jobId, jobData.url, jobData)
       .then(() => {
-        logger.info(`Job ${jobData.jobId} completed successfully`);
+        logger.info(`Legacy job ${jobData.jobId} completed successfully`);
         jobTracker.completeJob(jobData.jobId!);
         
         // Poll for new messages if we have capacity
@@ -188,7 +255,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         }
       })
       .catch(error => {
-        logger.error(`Error processing job ${jobData.jobId}: ${error.message}`, undefined, { error });
+        logger.error(`Error processing legacy job ${jobData.jobId}: ${error.message}`, undefined, { error });
         jobTracker.completeJob(jobData.jobId!);
         
         // Poll for new messages if we have capacity
@@ -262,9 +329,10 @@ export function startSQSPolling(): void {
   
   logger.info(`Starting SQS polling with max ${MAX_CONCURRENT_JOBS} concurrent jobs`);
   logger.info('📬 SQS Message Types Supported:');
-  logger.info('  - New Downloads: { "jobId": "uuid" (optional), "url": "https://youtube.com/...", "channelId": "channel-id" (optional) }');
-  logger.info('  - Existing Episode Videos: { "id": "episodeId", "url": "https://youtube.com/..." }');
-  logger.info('  - Note: jobId will be auto-generated if not provided for new downloads');
+  logger.info('  - Video Enrichment: { "id": "episodeId", "url": "https://youtube.com/..." }');
+  logger.info('  - New Entry: { "videoId": "...", "episodeTitle": "...", "originalUri": "https://youtube.com/...", "channelName": "...", "channelId": "...", ... }');
+  logger.info('  - Legacy Downloads: { "jobId": "uuid" (optional), "url": "https://youtube.com/...", "channelId": "channel-id" (optional) }');
+  logger.info('  - Note: jobId will be auto-generated if not provided for legacy downloads');
   logger.info('  - Note: channelId will be derived from uploader if not provided');
   
   // Initial poll

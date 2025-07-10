@@ -127,20 +127,21 @@ export interface JobStatusResponse {
 }
 
 export interface SQSJobMessage {
-  jobId?: string;
-  url: string;
-  channelId?: string; // Channel ID for podcast episode processing
-  id?: string; // For existing episode video downloads - when present, indicates existing episode job
+  // Video Enrichment format: {"id": str, "url": str}
+  id?: string; // Episode ID for video enrichment jobs
+  url?: string; // Video URL for video enrichment jobs or legacy format
   
-  // New SQS message structure - all fields at top level
+  // New Entry format: comprehensive video metadata
   videoId?: string;
   episodeTitle?: string;
   channelName?: string;
-  originalUri?: string;
+  channelId?: string;
+  originalUri?: string; // The video URL for new entries
   publishedDate?: string;
   contentType?: 'Video';
   hostName?: string;
   hostDescription?: string;
+  languageCode?: string;
   genre?: string;
   country?: string;
   websiteLink?: string;
@@ -148,9 +149,13 @@ export interface SQSJobMessage {
     youtubeVideoId?: string;
     youtubeChannelId?: string;
     youtubeUrl?: string;
+    triggeredManually?: string;
     notificationReceived?: string;
     [key: string]: any;
   };
+  
+  // Legacy format fields (for backward compatibility)
+  jobId?: string; // Job ID for legacy downloads (auto-generated if not provided)
   
   options?: {
     format?: string;
@@ -178,6 +183,8 @@ export interface SQSJobMessage {
     channelThumbnail?: string;
     subscriberCount?: number;
     verified?: boolean;
+    notificationReceived?: string;
+    [key: string]: any;
   };
 }
 

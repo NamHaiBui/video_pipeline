@@ -126,37 +126,7 @@ export function formatDate(dateStr: string): string {
       return new Date().toISOString().split('T')[0] + ' 00:00:00';
     }
   }
-  /**
-   * Parse XML string and extract elements
-   * Built-in XML parser without external dependencies
-   */
-  export function parseXML(xmlString: string): { [key: string]: string[] } {
-    const result: { [key: string]: string[] } = {};
-    
-    // Simple regex-based XML parsing for our specific use case
-    const tagRegex = /<([^>]+)>([^<]*)<\/\1>/g;
-    let match;
-    
-    while ((match = tagRegex.exec(xmlString)) !== null) {
-      const tagName = match[1];
-      const content = match[2].trim();
-      
-      if (!result[tagName]) {
-        result[tagName] = [];
-      }
-      result[tagName].push(content);
-    }
-    
-    return result;
-  }
-
-  /**
-   * Extract specific elements from parsed XML data
-   */
-  export function extractXMLElements(parsedXML: { [key: string]: string[] }, tagName: string): string[] {
-    return parsedXML[tagName] || [];
-  }
-
+  
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

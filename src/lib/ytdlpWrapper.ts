@@ -801,7 +801,7 @@ export function downloadAndMergeVideo(
                 channelId: channelId,
                 country: 'USA',
                 durationMillis: videoMetadata.duration ? videoMetadata.duration * 1000 : 0,
-                contentType: 'Audio' as const,
+                contentType: 'Video' as const,
                 processingInfo: {
                   episodeTranscribingDone: false,
                   summaryTranscribingDone: false,

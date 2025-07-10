@@ -1,0 +1,22 @@
+{
+  "videoId": "jNQXAC9IVRw",
+  "episodeTitle": "Me at the zoo - First YouTube Video",
+  "channelName": "jawed",
+  "channelId": "UC4QobU6STFB0P71PMvOGN5A",
+  "originalUri": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+  "publishedDate": "2005-04-23T23:31:52Z",
+  "contentType": "Video",
+  "hostName": "Jawed Karim",
+  "hostDescription": "Co-founder of YouTube",
+  "languageCode": "en",
+  "genre": "Technology",
+  "country": "USA",
+  "websiteLink": "https://www.youtube.com/channel/UC4QobU6STFB0P71PMvOGN5A",
+  "additionalData": {
+    "youtubeVideoId": "jNQXAC9IVRw",
+    "youtubeChannelId": "UC4QobU6STFB0P71PMvOGN5A",
+    "youtubeUrl": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+    "triggeredManually": "2025-07-10T00:44:00Z",
+    "testMessage": true
+  }
+}

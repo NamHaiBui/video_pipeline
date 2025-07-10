@@ -51,9 +51,6 @@ downloads/
 temp/
 bin/
 
-# But keep .config directory for yt-dlp configuration
-!.config/
-
 # Scripts (keep deployment scripts but exclude test scripts)
 scripts/test-*.sh
 test-*.sh

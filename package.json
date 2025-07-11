@@ -24,6 +24,7 @@
     "test:complete-slug": "tsx src/scripts/test-complete-slug.ts",
     "test:video-slug": "tsx src/scripts/test-video-slug.ts",
     "test:trimming-queue": "tsx scripts/test-video-trimming-queue.ts",
+    "test:guest-extraction": "tsx scripts/test-guest-extraction.ts",
     "diagnose:ytdlp-warnings": "tsx src/scripts/diagnose-ytdlp-warnings.ts",
     "migrate:rds": "tsx src/scripts/migrate-to-rds.ts"
   },

@@ -98,7 +98,7 @@ export class S3Service {
       });
 
       const result = await this.s3Client.send(command);
-      const location = `https://${bucket}.s3.${this.config.region}.amazonaws.com/${key}`;
+      const location = `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`;
 
       logger.info(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
       logger.info(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
@@ -329,10 +329,9 @@ export class S3Service {
  * Create S3 service instance from environment variables
  */
 export function createS3ServiceFromEnv(): S3Service | null {
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
-  const audioBucket = process.env.S3_AUDIO_BUCKET;
-  const videoBucket = process.env.S3_VIDEO_BUCKET;
-  const metadataBucket = process.env.S3_METADATA_BUCKET;
+  const region ='us-east-1';
+  const audioBucket = process.env.S3_ARTIFACT_BUCKET;
+  const videoBucket = process.env.S3_ARTIFACT_BUCKET;
 
   if (!audioBucket || !videoBucket) {
     logger.warn('⚠️ S3 buckets not configured. Set S3_AUDIO_BUCKET and S3_VIDEO_BUCKET environment variables to enable S3 uploads.');
@@ -345,16 +344,13 @@ export function createS3ServiceFromEnv(): S3Service | null {
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     audioBucket,
     videoBucket,
-    metadataBucket
   };
 
   logger.info(`🏗️ Initializing S3 service for AWS region: ${region}`);
   
   logger.info(`🔊 Audio bucket: ${audioBucket}`);
   logger.info(`📹 Video bucket: ${videoBucket}`);
-  if (metadataBucket) {
-    logger.info(`📄 Metadata bucket: ${metadataBucket}`);
-  }
+
 
   return new S3Service(config);
 }

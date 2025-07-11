@@ -1,3 +1,5 @@
+import { GuestExtractionResult } from './lib/guestExtractionService.js';
+
 export interface VideoMetadata {
   title: string;
   uploader: string;
@@ -74,13 +76,15 @@ export interface CommandResult {
 export interface DownloadJob {
   id: string;
   url: string;
-  status: 'pending' | 'downloading_metadata'| 'downloading' | 'merging' | 'uploading' | 'completed' | 'error';
+  status: 'pending' | 'downloading_metadata' | 'extracting_guests' | 'downloading' | 'merging' | 'uploading' | 'completed' | 'error';
   progress: {
     video?: ProgressInfo;
     audio?: ProgressInfo;
     merged?: ProgressInfo;
   };
   metadata?: VideoMetadata;
+  guestExtraction?: GuestExtractionResult;
+  guestExtractionError?: string;
   filePaths?: {
     videoPath?: string;
     audioPath?: string;
@@ -238,42 +242,64 @@ export interface EpisodeProcessingInfo {
  * Episode data structure matching the exact RDS table schema
  */
 export interface RDSEpisodeData {
-  /** Unique episode identifier */
+  /** Unique episode identifier (Primary Key) */
   episodeId: string;
   /** Title of the episode */
   episodeTitle: string;
   /** Description/summary of the episode */
   episodeDescription: string;
-  /** Name of the host */
-  hostName?: string;
-  /** Description of the host */
-  hostDescription?: string;
-  /** Name of the channel/podcast */
-  channelName: string;
-  /** Array of guest names */
-  guests?: string[];
-  /** Array of guest descriptions */
-  guestDescriptions?: string[];
-  /** S3 URL for guest image */
-  guestImageUrl?: string;
-  /** When the episode was published */
-  publishedDate: Date;
+  /** S3 URL for the episode thumbnail image */
+  episodeThumbnailImageUrl?: string;
   /** S3 URL for the episode (audio/video file) */
   episodeUrl?: string;
   /** Original URL from the source site */
   originalUrl: string;
+  /** Duration in milliseconds */
+  durationMillis: number;
+  /** When the episode was published */
+  publishedDate: Date;
+  /** Creation timestamp */
+  createdAt: Date;
+  /** Last updated timestamp */
+  updatedAt: Date;
+  /** Soft delete timestamp (null when not deleted) */
+  deletedAt?: Date;
+  
   /** Channel identifier */
   channelId: string;
+  /** Name of the channel/podcast */
+  channelName: string;
+  /** RSS feed URL */
+  rssUrl?: string;
+  /** Channel thumbnail URL */
+  channelThumbnailUrl?: string;
+  
+  /** Name of the host */
+  hostName?: string;
+  /** Description of the host */
+  hostDescription?: string;
+  /** S3 URL for host image */
+  hostImageUrl?: string;
+  
+  /** Array of guest names (as JSON) */
+  guests?: string[];
+  /** Array of guest descriptions (as JSON) */
+  guestDescriptions?: string[];
+  /** S3 URL for guest images (as JSON) */
+  guestImages?: string[];
+  
+  /** Array of topics/tags (as JSON) */
+  topics?: string[];
+  /** Summary metadata as JSON */
+  summaryMetadata?: Record<string, any>;
+  
   /** Country of origin */
   country?: string;
   /** Genre/category of the episode */
   genre?: string;
-  /** Array of S3 URLs for episode images */
-  episodeImages?: string[];
-  /** Duration in milliseconds */
-  durationMillis: number;
-  /** RSS feed URL */
-  rssUrl?: string;
+  /** Language code */
+  languageCode?: string;
+  
   /** S3 URL for transcript */
   transcriptUri?: string;
   /** S3 URL for processed transcript */
@@ -284,18 +310,11 @@ export interface RDSEpisodeData {
   summaryDurationMillis?: number;
   /** S3 URL for summary transcript */
   summaryTranscriptUri?: string;
-  /** Array of topics/tags */
-  topics?: string[];
-  /** Last updated timestamp */
-  updatedAt: Date;
-  /** Soft delete timestamp (null when not deleted) */
-  deletedAt?: Date;
-  /** Creation timestamp */
-  createdAt: Date;
-  /** Processing status information */
-  processingInfo: EpisodeProcessingInfo;
+  
   /** Content type: Audio or Video */
   contentType: 'Audio' | 'Video';
+  /** Processing status information (as JSON) */
+  processingInfo: EpisodeProcessingInfo;
   /** Additional data as JSON for future use */
   additionalData: Record<string, any>;
   /** Overall processing completion status */

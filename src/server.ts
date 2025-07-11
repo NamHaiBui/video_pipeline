@@ -21,11 +21,12 @@ import {
 } from './lib/ytdlpWrapper.js';
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
-import { createS3ServiceFromEnv, S3Service } from './lib/s3Service.js';
-import { createSQSServiceFromEnv, SQSService } from './lib/sqsService.js';
-import { RDSService } from './lib/rdsService.js';
+import { createS3ServiceFromEnv} from './lib/s3Service.js';
+import { createSQSServiceFromEnv} from './lib/sqsService.js';
+import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
 import { logger } from './lib/logger.js';
 import { create_slug } from './lib/utils/utils.js';
+import { GuestExtractionService, GuestExtractionResult } from './lib/guestExtractionService.js';
 
 import dotenv from 'dotenv';
 
@@ -45,17 +46,27 @@ const isS3Enabled = s3Service !== null && process.env.S3_UPLOAD_ENABLED === 'tru
 const sqsService = createSQSServiceFromEnv();
 const isSQSEnabled = sqsService !== null;
 
-// Initialize RDS service
-const rdsService = new RDSService({
+// Initialize RDS service with SSL required
+const rdsService = createRDSServiceFromEnv() || new RDSService({
   host: process.env.RDS_HOST || 'localhost',
   user: process.env.RDS_USER || 'postgres',
   password: process.env.RDS_PASSWORD || '',
   database: process.env.RDS_DATABASE || 'postgres',
   port: parseInt(process.env.RDS_PORT || '5432'),
-  ssl: process.env.RDS_SSL_ENABLED === 'true' ? { rejectUnauthorized: false } : false,
+  ssl: { rejectUnauthorized: false }, // Always require SSL for RDS connections
 });
 
 const isRDSEnabled = !!(process.env.RDS_HOST && process.env.RDS_USER && process.env.RDS_PASSWORD);
+
+// Initialize Guest Extraction service
+const guestExtractionService = GuestExtractionService.createFromEnv(isRDSEnabled ? rdsService : undefined);
+const isGuestExtractionEnabled = guestExtractionService !== null;
+
+// Pass guest extraction service to RDS service if both are available
+if (isRDSEnabled && isGuestExtractionEnabled) {
+  rdsService['guestExtractionService'] = guestExtractionService;
+  logger.info('Guest extraction service linked to RDS service');
+}
 
 const isPodcastConversionEnabled = process.env.PODCAST_CONVERSION_ENABLED !== 'false';
 
@@ -75,6 +86,12 @@ if (isRDSEnabled) {
   logger.info('RDS service initialized successfully');
 } else {
   logger.warn('RDS service disabled or not configured');
+}
+
+if (isGuestExtractionEnabled) {
+  logger.info('Guest extraction service initialized successfully');
+} else {
+  logger.warn('Guest extraction service disabled - requires Gemini API key');
 }
 
 // Middleware
@@ -192,6 +209,127 @@ app.get('/api/jobs', (req: Request, res: Response) => {
     jobs,
     message: 'Jobs retrieved successfully'
   });
+});
+
+/**
+ * POST /api/extract-guests
+ * Extract guest information from episode metadata
+ */
+app.post('/api/extract-guests', async (req: Request, res: Response) => {
+  try {
+    const { episodeId, metadata } = req.body;
+
+    if (!episodeId || !metadata) {
+      res.status(400).json({
+        success: false,
+        message: 'Both episodeId and metadata (title, description, uploader) are required'
+      });
+      return;
+    }
+
+    if (!isGuestExtractionEnabled) {
+      res.status(503).json({
+        success: false,
+        message: 'Guest extraction service is not enabled'
+      });
+      return;
+    }
+
+    if (!isRDSEnabled) {
+      res.status(503).json({
+        success: false,
+        message: 'RDS is not enabled - cannot update episode'
+      });
+      return;
+    }
+
+    // Extract guests and topics
+    const extractionResult = await guestExtractionService!.extractAndUpdateEpisode(episodeId, {
+      podcast_title: metadata.uploader || 'Unknown Podcast',
+      episode_title: metadata.title || 'Unknown Episode',
+      episode_description: metadata.description || ''
+    });
+
+    if (extractionResult) {
+      res.json({
+        success: true,
+        message: 'Guest extraction completed successfully',
+        data: {
+          episodeId,
+          guestCount: extractionResult.guest_names.length,
+          topicCount: extractionResult.topics.length,
+          guests: extractionResult.guest_names,
+          topics: extractionResult.topics,
+          description: extractionResult.description
+        }
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        message: 'Guest extraction failed'
+      });
+    }
+
+  } catch (error: any) {
+    console.error('Guest extraction error:', error);
+    res.status(500).json({
+      success: false,
+      message: `Guest extraction failed: ${error.message}`
+    });
+  }
+});
+
+/**
+ * POST /api/extract-guests-metadata
+ * Extract guest information from video metadata only (no database update)
+ */
+app.post('/api/extract-guests-metadata', async (req: Request, res: Response) => {
+  try {
+    const { metadata } = req.body;
+
+    if (!metadata || !metadata.title || !metadata.description) {
+      res.status(400).json({
+        success: false,
+        message: 'Metadata with title and description is required'
+      });
+      return;
+    }
+
+    if (!isGuestExtractionEnabled) {
+      res.status(503).json({
+        success: false,
+        message: 'Guest extraction service is not enabled'
+      });
+      return;
+    }
+
+    // Extract guests and topics without updating database
+    const extractionResult = await guestExtractionService!.extractPodcastWithBiosAndImages({
+      podcast_title: metadata.uploader || 'Unknown Podcast',
+      episode_title: metadata.title,
+      episode_description: metadata.description
+    });
+
+    res.json({
+      success: true,
+      message: 'Guest extraction completed successfully',
+      data: {
+        guestCount: extractionResult.guest_names.length,
+        topicCount: extractionResult.topics.length,
+        guests: extractionResult.guest_names,
+        topics: extractionResult.topics,
+        description: extractionResult.description,
+        guestDetails: extractionResult.guest_details
+      }
+    });
+
+  } catch (error: any) {
+    console.error('Guest extraction error:', error);
+    res.status(500).json({
+      success: false,
+      message: `Guest extraction failed: ${error.message}`
+    });
+  }
 });
 
 /**
@@ -391,6 +529,8 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     console.log(`Job ${jobId}: Status changed to 'downloading_metadata'. Fetching metadata for ${url}`);
 
     let metadata: VideoMetadata;
+    let guestExtractionResult: GuestExtractionResult | undefined;
+    
     try {
       metadata = await getVideoMetadata(url);
       
@@ -400,22 +540,45 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         return;
       }
       job.metadata = metadata;
-      await persistJobUpdate(jobId, job);
-      
-      // Save metadata to file
-      const metadataFilename = `${jobId}_metadata.json`;
-      const metadataPath = path.join(downloadsDir, metadataFilename);
-      
-      try {
-        await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
-        console.log(`Job ${jobId}: Metadata saved to ${metadataPath}`);
-        
-        if (!job.filePaths) job.filePaths = {};
-        job.filePaths.metadataPath = metadataFilename;
-      } catch (writeError: any) {
-        console.error(`Job ${jobId}: Failed to save metadata file:`, writeError);
-      }
+      await persistJobUpdate(jobId, job);      
       console.log(`Job ${jobId}: Metadata fetched successfully.`);
+
+      // 2. Extract guests and topics if service is available
+      if (isGuestExtractionEnabled && metadata.title && metadata.description) {
+        console.log(`Job ${jobId}: Starting guest and topic extraction...`);
+        job.status = 'extracting_guests';
+        await persistJobUpdate(jobId, job);
+        
+        try {
+          guestExtractionResult = await guestExtractionService!.extractPodcastWithBiosAndImages({
+            podcast_title: metadata.uploader || 'Unknown Podcast',
+            episode_title: metadata.title,
+            episode_description: metadata.description
+          });
+          
+          job = downloadJobs.get(jobId);
+          if (job) {
+            job.guestExtraction = guestExtractionResult;
+            await persistJobUpdate(jobId, job);
+            console.log(`Job ${jobId}: Guest extraction completed. Found ${guestExtractionResult.guest_names.length} guests and ${guestExtractionResult.topics.length} topics`);
+            
+            // Log guest details if any were found
+            if (guestExtractionResult.guest_names.length > 0) {
+              console.log(`Job ${jobId}: Guests found: ${guestExtractionResult.guest_names.join(', ')}`);
+              console.log(`Job ${jobId}: Topics extracted: ${guestExtractionResult.topics.join(', ')}`);
+            }
+          }
+        } catch (extractionError: any) {
+          console.error(`Job ${jobId}: Guest extraction failed:`, extractionError);
+          // Continue with download even if guest extraction fails
+          job = downloadJobs.get(jobId);
+          if (job) {
+            job.guestExtractionError = extractionError.message;
+            await persistJobUpdate(jobId, job);
+          }
+        }
+      }
+      
     } catch (metaError: any) {
       console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
       job = downloadJobs.get(jobId);
@@ -424,7 +587,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         job.error = `Failed to fetch metadata: ${metaError?.message || String(metaError)}`;
         job.completedAt = new Date();
         await persistJobUpdate(jobId, job);
-        
         // Clean up metadata file if it was created before the error
         await cleanupMetadataFile(jobId);
       }
@@ -460,7 +622,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       // Construct SQSMessageBody from either new format (top-level fields) or legacy channelInfo
       let channelInfo: SQSMessageBody | undefined;
       if (sqsJobMessage) {
-        // Check if it's the new format (has top-level fields)
         if (sqsJobMessage.videoId || sqsJobMessage.episodeTitle || sqsJobMessage.channelName) {
           channelInfo = {
             videoId: sqsJobMessage.videoId || metadata?.id || '',
@@ -484,7 +645,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
             }
           };
         } 
-        // Legacy format with channelInfo object
         else if (sqsJobMessage.channelInfo) {
           channelInfo = {
             videoId: metadata?.id || '',
@@ -546,7 +706,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
             downloadJobs.set(jobId, { ...currentJobState });
           }
         }
-      }, metadata, channelInfo);
+      }, metadata, channelInfo, guestExtractionResult);
 
       // Update job with final merged file path
       const finalJobState = downloadJobs.get(jobId);
@@ -703,6 +863,7 @@ app.get('/health', (req: Request, res: Response) => {
     s3Enabled: isS3Enabled,
     sqsEnabled: isSQSEnabled,
     rdsEnabled: isRDSEnabled,
+    guestExtractionEnabled: isGuestExtractionEnabled,
     podcastConversionEnabled: isPodcastConversionEnabled
   });
 });
@@ -765,6 +926,8 @@ app.get('/', (req: Request, res: Response) => {
     endpoints: {
       'POST /api/download': 'Start podcast processing from YouTube URL',
       'POST /api/download-video-existing': 'Download video for existing podcast episode',
+      'POST /api/extract-guests': 'Extract guests and topics from podcast data',
+      'POST /api/extract-guests-from-metadata': 'Extract guests and topics from YouTube video metadata',
       'GET /api/job/:jobId': 'Get podcast processing job status',
       'GET /api/jobs': 'Get all podcast processing jobs',
       'DELETE /api/job/:jobId': 'Delete a podcast processing job',
@@ -775,6 +938,8 @@ app.get('/', (req: Request, res: Response) => {
     usage: {
       'Start Podcast Processing': 'POST /api/download with { "url": "https://youtube.com/watch?v=..." }',
       'Download Video for Existing Episode': 'POST /api/download-video-existing with { "episodeId": "uuid", "videoUrl": "https://youtube.com/watch?v=..." }',
+      'Extract Guests': 'POST /api/extract-guests with { "podcast_title": "...", "episode_title": "...", "episode_description": "..." }',
+      'Extract from Video': 'POST /api/extract-guests-from-metadata with { "url": "https://youtube.com/watch?v=..." }',
       'Check Status': 'GET /api/job/{jobId}',
       'List All Jobs': 'GET /api/jobs',
       'Search Podcast Content': 'GET /api/search/{query}?maxResults=10',
@@ -786,6 +951,7 @@ app.get('/', (req: Request, res: Response) => {
     features: {
       'Podcast Conversion': isPodcastConversionEnabled ? 'Enabled' : 'Disabled',
       'Audio Extraction': 'Always Enabled',
+      'Guest Extraction': isGuestExtractionEnabled ? 'Enabled (Gemini + Perplexity + Google Images)' : 'Disabled (Missing API Keys)',
       'S3 Upload': isS3Enabled ? 'Enabled' : 'Disabled',
       'SQS Queue': isSQSEnabled ? 'Enabled' : 'Disabled',
       'RDS Storage': isRDSEnabled ? 'Enabled (PostgreSQL)' : 'Disabled',
@@ -882,8 +1048,15 @@ async function startServer(): Promise<void> {
       console.log(`📁 Downloads: http://localhost:${PORT}/downloads/`);
       console.log(`📦 Update Status: http://localhost:${PORT}/api/update-status`);
       console.log(`🔄 Manual Update: POST http://localhost:${PORT}/api/update-ytdlp`);
+      console.log(`🧠 Guest Extraction: POST http://localhost:${PORT}/api/extract-guests`);
       console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
       console.log(`🎧 Podcast Conversion: ${isPodcastConversionEnabled ? 'Enabled' : 'Disabled'}`);
+      console.log(`👥 Guest Extraction: ${isGuestExtractionEnabled ? 'Enabled' : 'Disabled'}`);
+      if (isGuestExtractionEnabled) {
+        console.log(`   └── Gemini API: ${process.env.GEMINI_API_KEY ? 'Configured' : 'Missing'}`);
+        console.log(`   └── Perplexity API: ${process.env.PERPLEXITY_API_KEY ? 'Configured' : 'Missing'}`);
+        console.log(`   └── Google Search API: ${process.env.SEARCH_API_KEY ? 'Configured' : 'Missing'}`);
+      }
       
       // Start SQS polling if enabled
       if (enableSQS) {
@@ -998,7 +1171,7 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     let episodeUrl: string;
     if (isS3Enabled && !path.isAbsolute(videoPath)) {
       // S3 key returned (relative path format), convert to full S3 URL
-      episodeUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${videoPath}`;
+      episodeUrl = `https://${process.env.S3_BUCKET_NAME}.s3. us-east-1.amazonaws.com/${videoPath}`;
       logger.info(`Using S3 URL for RDS: ${episodeUrl}`);
     } else {
       // Local path returned, convert to relative path

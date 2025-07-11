@@ -1,8 +1,3 @@
-/**
- * Centralized S3 key generation utilities for consistent naming across the application
- * Implements the unified naming format: s3://pd-audio-storage/podcast-title-slug/episode-title-slug.extension
- */
-
 import { create_slug } from './utils/utils.js';
 import { VideoMetadata } from '../types.js';
 
@@ -62,7 +57,7 @@ export function parseS3Key(s3Key: string): { podcastSlug: string; episodeSlug: s
     return {
       podcastSlug: mediaMatch[1],
       episodeSlug: mediaMatch[2],
-      type: mediaMatch[3], // 'audio' or 'video'
+      type: mediaMatch[3], 
       filename: mediaMatch[4]
     };
   }
@@ -82,18 +77,12 @@ export function parseS3Key(s3Key: string): { podcastSlug: string; episodeSlug: s
   return null;
 }
 
-/**
- * Get the audio bucket name based on environment
- */
-export function getAudioBucketName(): string {
-  return process.env.S3_AUDIO_BUCKET || 'spice-episode-artifacts';
-}
-
-/**
- * Get the video bucket name based on environment
- */
-export function getVideoBucketName(): string {
-  return process.env.S3_VIDEO_BUCKET || 'spice-episode-artifacts';
+export function getS3ArtifactBucket(): string {
+  const bucket = process.env.S3_ARTIFACT_BUCKET || 'spice-episode-artifacts';
+  if (!bucket) {
+    throw new Error('S3_ARTIFACT_BUCKET environment variable is not set');
+  }
+  return bucket;
 }
 
 /**

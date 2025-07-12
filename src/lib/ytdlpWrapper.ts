@@ -7,18 +7,14 @@ import { VideoMetadata, ProgressInfo, DownloadOptions, CommandResult, SQSJobMess
 import { S3Service, S3UploadResult, createS3ServiceFromEnv } from './s3Service.js';
 import { RDSService, SQSMessageBody, EpisodeRecord } from './rdsService.js';
 import { GuestExtractionResult } from './guestExtractionService.js';
-import { isValidYouTubeUrl } from './urlUtils.js';
-import { generateAudioS3Key, generateVideoS3Key, getS3ArtifactBucket } from './s3KeyUtils.js';
-import { sanitizeFilename, sanitizeOutputTemplate, create_slug } from './utils/utils.js';
-import { logger } from './logger.js';
+import { isValidYouTubeUrl } from './utils/urlUtils.js';
+import { generateAudioS3Key, generateLowerDefVideoS3Key, generateM3U8S3Key, generateThumbnailS3Key, generateVideoS3Key, getPublicUrl, getS3ArtifactBucket } from './s3KeyUtils.js';
+import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getManifestUrl, getThumbnailUrl } from './utils/utils.js';
+import { logger } from './utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-function generateEpisodeId(): string {
-  return uuidv4();
-}
 
 function parseVideoDate(dateString: string): Date | null {
   if (!dateString) return null;
@@ -103,7 +99,7 @@ function resolveCookiesFilePath(cookiesFile: string): string {
  * @param options - The original DownloadOptions
  * @returns DownloadOptions with cookies file guaranteed to be set
  */
-function ensureCookiesInOptions(options: DownloadOptions = {}): DownloadOptions {
+function ensureCookiesInOptions(options: DownloadOptions): DownloadOptions {
   const optionsWithCookies = { ...options };
   
   // Always set cookies file if not provided
@@ -189,7 +185,7 @@ function buildYtdlpArgs(
   videoUrl: string,
   outputPathAndFilename: string,
   format: string,
-  options: DownloadOptions = {},
+  options: DownloadOptions,
   additionalArgs: string[] = []
 ): string[] {
   // Ensure cookies are always included
@@ -350,8 +346,6 @@ function executeDownloadProcess(
 
 export async function getVideoMetadata(videoUrl: string, options: DownloadOptions = {}): Promise<VideoMetadata> {
   checkBinaries();
-  
-  // Ensure cookies are always included
   const optionsWithCookies = ensureCookiesInOptions(options);
   
   let args = [
@@ -419,9 +413,6 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
     
     try {
       const metadata = JSON.parse(stdout) as VideoMetadata;
-      
-      // Note: Video metadata is no longer uploaded to RDS, only episode data
-      // Only podcast episode metadata will be uploaded during audio processing
       logger.info('Video metadata extracted successfully');
       
       return metadata;
@@ -438,7 +429,7 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
   }
 }
 
-export function downloadPodcastAudioWithProgress(videoUrl: string, options: DownloadOptions = {}, metadata?: VideoMetadata): Promise<string> {
+export function downloadPodcastAudioWithProgress(videoUrl: string, options: DownloadOptions, metadata?: VideoMetadata): Promise<string> {
   checkBinaries();
   return new Promise(async (resolve, reject) => {
     const outputDir = options.outputDir || PODCAST_OUTPUT_DIR;
@@ -579,11 +570,12 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
     }
   });
 }
-export function downloadVideoNoAudioWithProgress(videoUrl: string, options: DownloadOptions = {}, metadata?: VideoMetadata): Promise<string> {
+export function downloadVideoNoAudioWithProgress(videoUrl: string, options: DownloadOptions, videoDefinition:string, metadata?: VideoMetadata, ): Promise<string> {
     checkBinaries();
+
     const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
     let outputFilenameTemplate = options.outputFilename || 'unknown-podcast/untitled-episode.%(ext)s';
-    const format = options.format || 'bestvideo[height<=720][ext=mp4]/best[height<=720][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]/best';
+    const format = options.format || `bestvideo[height<=${videoDefinition}][ext=mp4]/best[height<=${videoDefinition}][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]/best`;
 
     // Prepare output template with metadata if available
     if (metadata) {
@@ -606,46 +598,12 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
 }
 
 /**
- * Helper function to upload audio to S3
- */
-async function uploadAudioToS3(localPath: string, videoUrl: string, s3Service: S3Service, metadata?: VideoMetadata): Promise<S3UploadResult | null> {
-  if (!s3Service || !isValidYouTubeUrl(videoUrl)) {
-    if (!s3Service) logger.warn('S3 service not available, skipping upload.');
-    return null;
-  }
-
-  logger.info('🚀 Uploading audio to S3...');
-  
-  // Use provided metadata or fallback to fetching it
-  let videoMetadata = metadata;
-  if (!videoMetadata) {
-    try {
-      videoMetadata = await getVideoMetadata(videoUrl);
-    } catch (metaError) {
-      logger.warn('Could not fetch metadata for S3 naming, using fallback', { error: metaError });
-    }
-  }
-
-  const s3AudioKey = videoMetadata ? generateAudioS3Key(videoMetadata) : `audio/audio_${Date.now()}.mp3`;
-  const bucketName = getS3ArtifactBucket();
-  const uploadResult = await s3Service.uploadFile(localPath, bucketName, s3AudioKey);
-
-  if (uploadResult.success) {
-    logger.info(`✅ Audio uploaded to S3: ${uploadResult.location}`);
-    return uploadResult;
-  } else {
-    logger.error(`❌ Failed to upload audio to S3: ${uploadResult.error}`);
-    return null;
-  }
-}
-
-/**
  * Download video and audio separately, then merge them into a single file
  */
 export function downloadAndMergeVideo(
   channelId: string, 
   videoUrl: string, 
-  options: DownloadOptions = {}, 
+  options: DownloadOptions,
   metadata?: VideoMetadata,
   channelInfo?: SQSMessageBody,
   guestExtractionResult?: GuestExtractionResult
@@ -653,15 +611,18 @@ export function downloadAndMergeVideo(
   checkBinaries();
   return new Promise(async (resolve, reject) => {
     const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
-    let outputFilenameTemplate = options.outputFilename || 'unknown-podcast/untitled-episode.%(ext)s';
-    
+    let outputFilenameTemplate = options.outputFilename;
+    if (outputFilenameTemplate === undefined || outputFilenameTemplate === null) {
+      return reject(new Error('Output filename template is required for video download'));
+    }
     // Use provided metadata or fetch it once
     let videoMetadata = metadata;
     if (!videoMetadata) {
       try {
         videoMetadata = await getVideoMetadata(videoUrl, options);
       } catch (metaError) {
-        logger.warn('Could not fetch metadata for filename sanitization, using template as-is');
+        const errorMsg = typeof metaError === 'object' && metaError !== null && 'message' in metaError ? (metaError as { message?: string }).message : String(metaError);
+        return reject(new Error(`Could not fetch metadata for video URL: ${videoUrl}. Error: ${errorMsg}`));
       }
     }
     
@@ -696,7 +657,11 @@ export function downloadAndMergeVideo(
       // Create slug-based temporary filenames
       const podcastSlug = videoMetadata ? create_slug(videoMetadata.uploader || 'unknown') : 'unknown-podcast';
       const episodeSlug = videoMetadata ? create_slug(videoMetadata.title || 'untitled') : 'untitled-episode';
+      // const m3u8PlayList = await downloadContent(getManifestUrl(videoMetadata));
+      const thumbnail = await downloadContent(getThumbnailUrl(videoMetadata));
+      
       const timestamp = Date.now();
+      const videoDefinition = metadata?.filesize_approx && metadata.filesize_approx < 1000000 ? '1080' : '720'; // Use 1080 for small files, else default to 720
       
       const videoDownloadPromise = downloadVideoNoAudioWithProgress(videoUrl, {
         ...options,
@@ -710,7 +675,7 @@ export function downloadAndMergeVideo(
             });
           }
         }
-      }, videoMetadata);
+      }, videoDefinition, videoMetadata);
 
       const audioDownloadPromise = downloadPodcastAudioWithProgress(videoUrl, {
         ...options,
@@ -734,16 +699,27 @@ export function downloadAndMergeVideo(
 
       // Handle audio download separately to upload immediately when it's done
       var uploadedAudioInfo:S3UploadResult|null = null;
+      let thumbnail_s3_link = '';
       let episodePK = '';
       let episodeSK = '';
       const audioPromise = audioDownloadPromise.then(async (audioPath: string) => {
         tempAudioPath = audioPath;
         logger.info(`Audio download completed successfully: ${audioPath}`);
-                
         try {
           const s3Service = createS3ServiceFromEnv();
           if (s3Service) {
-            uploadedAudioInfo = await uploadAudioToS3(audioPath, videoUrl, s3Service, videoMetadata || undefined);
+            const thumbnail_s3_key = generateThumbnailS3Key(videoMetadata);
+            logger.info('Uploading thumbnail to S3...');
+            try {
+              thumbnail_s3_link = await s3Service.uploadThumbnailToS3(thumbnail!, 'spice-user-content-assets', thumbnail_s3_key)
+                .then(res => res?.location || '');
+            } catch (err: any) {
+              logger.error('Error uploading thumbnail to S3:', err.message || err);
+              thumbnail_s3_link = '';
+            }
+            const audios3Key = generateAudioS3Key(videoMetadata);
+            logger.info('Uploading audio to S3...');
+            uploadedAudioInfo = await s3Service.uploadFile(audioPath, getS3ArtifactBucket(), audios3Key);
             if (uploadedAudioInfo && options.onProgress) {
               options.onProgress({
                 percent: '100%',
@@ -761,41 +737,32 @@ export function downloadAndMergeVideo(
         // Use the new RDS service method that handles all the new schema fields
         try {
           const rdsService = createRDSServiceFromEnv();
+          if (rdsService) {
+            await rdsService.initClient(); // Ensure RDS client is initialized
+          }
           if (rdsService && videoMetadata && uploadedAudioInfo?.location) {
             logger.info('💾 Processing and saving podcast episode metadata to RDS...');
             
             // Use the RDS service to store new episode
             if (channelInfo) {
               // channelInfo is already in the new SQS message format - store directly
-              const { episodePK: savedPK, episodeSK: savedSK } = await rdsService.storeNewEpisode(
-                channelId,
+              const { episodeId } = await rdsService.storeNewEpisode(
                 channelInfo,
                 videoMetadata,
-                undefined, // Let it generate episode ID
-                undefined, // Use default sort key
-                true, // Enable guest enrichment
-                true  // Enable topic enrichment
+                thumbnail_s3_link // Pass thumbnail_s3_link as the fourth argument
               );
-              
-              episodePK = savedPK;
-              episodeSK = savedSK;
-              
-              logger.info(`✅ Episode metadata saved successfully to RDS: ${episodePK}`);
-              
+
+              logger.info(`✅ Episode metadata saved successfully to RDS: ${episodeId}`);
+
               // Update episode with guest extraction results if available
               if (guestExtractionResult) {
-                const episodeId = episodePK.replace('EPISODE#', '');
+                const episodeId = episodePK;
                 logger.info(`🎯 Updating episode with guest extraction results...`);
-                
                 await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
-                
                 logger.info(`✅ Guest extraction results updated for episode: ${episodeId}`);
                 logger.info(`🎯 Found ${guestExtractionResult.guest_names.length} guests and ${guestExtractionResult.topics.length} topics`);
               }
-              
             } else {
-              // Fallback for cases without channel info - create minimal episode record
-              const episodeId = generateEpisodeId();
               const messageBody: SQSMessageBody = {
                 videoId: videoMetadata.id || '',
                 episodeTitle: videoMetadata.title || 'Untitled',
@@ -816,25 +783,19 @@ export function downloadAndMergeVideo(
                   notificationReceived: new Date().toISOString()
                 }
               };
-              
-              const { episodePK: savedPK, episodeSK: savedSK } = await rdsService.storeNewEpisode(
-                channelId,
+              const { episodeId } = await rdsService.storeNewEpisode(
                 messageBody,
-                videoMetadata
+                videoMetadata,
+                thumbnail_s3_link // Pass thumbnail_s3_link as the fourth argument
               );
-              
-              episodePK = savedPK;
-              episodeSK = savedSK;
-              
-              logger.info(`✅ Fallback episode metadata saved successfully to RDS: ${episodePK}`);
-              
+
+              logger.info(`✅ Fallback episode metadata saved successfully to RDS: ${episodeId}`);
+
               // Update episode with guest extraction results if available
               if (guestExtractionResult) {
-                const episodeId = episodePK.replace('EPISODE#', '');
+                const episodeId = episodePK;
                 logger.info(`🎯 Updating fallback episode with guest extraction results...`);
-                
                 await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
-                
                 logger.info(`✅ Guest extraction results updated for fallback episode: ${episodeId}`);
               }
             }
@@ -848,7 +809,6 @@ export function downloadAndMergeVideo(
         return episodePK;
       });
       
-      // Wait for video download
       tempVideoPath = await videoDownloadPromise;
       episodePK = await audioPromise;
       
@@ -946,45 +906,54 @@ export function downloadAndMergeVideo(
             logger.info('🚀 Uploading merged video file to S3...');
             
             // Use already retrieved metadata instead of making another network call
-            let videoKey: string;
+            let videoKey: string| undefined;
+            // let m3u8Key: string| undefined;
             if (videoMetadata) {
               const videoExtension = path.extname(finalMergedPath);
               videoKey = generateVideoS3Key(videoMetadata, videoExtension);
-            } else {
-              // Fallback naming
-              const filename = path.basename(finalMergedPath);
-              videoKey = `video/${filename}`;
+            } 
+
+            //Epic Fail condition to catch undefined keys to make me looks like an entry level dev
+            if (videoKey === undefined || videoKey === null) {
+              return reject(new Error('Failed to generate S3 key for video upload'));
             }
-            
             const bucketName = getS3ArtifactBucket();
-            const uploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
+            // const videoUploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
+            // const uploadResult = await s3Service.uploadm3u8ToS3(m3u8PlayList!, bucketName, m3u8Key);
             
-            if (uploadResult.success) {
-              logger.info(`✅ Video uploaded to S3: ${uploadResult.location}`);
-              // Update RDS with video S3 URL
-              try {
+            // If both uploads succeed, update the RDS episode with the m3u8
+            if (finalMergedPath) {
+              logger.info(`Starting creating lower definitions and uploading to S3...`);
+              const renderLowerDefinitionResult = await renderingLowerDefinitionVersions(finalMergedPath, videoMetadata!, options, s3Service, bucketName);
+              if (renderLowerDefinitionResult.success) {
+                logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
+                try {
                 const rdsService = createRDSServiceFromEnv();
                 if (rdsService && episodePK) {
-                  // Extract episodeId from PK format (EPISODE#episodeId)
-                  const episodeId = episodePK.replace('EPISODE#', '');
+                  const episodeId = episodePK;
+
                   logger.info('💾 Updating episode with video S3 URL...');
                   await rdsService.updateEpisode(episodeId, {
-                    episodeUri: uploadResult.location, // Set S3 video URL
-                    contentType: 'Video' // Update content type to Video
+                    episodeUri: renderLowerDefinitionResult.masterPlaylists3Link,
+                    contentType: 'Video'
                   });
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL`);
                 }
-              } catch (updateError: any) {
-                logger.warn('⚠️ RDS video URL update error:', updateError.message);
+                } catch (updateError: any) {
+                  logger.warn('⚠️ RDS video URL update error:', updateError.message);
+                }
+              } else {
+                logger.warn('⚠️ Lower definition rendering/upload failed');
               }
               
-              const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
+              
+              
+              const shouldDeleteLocal = true;
               if (shouldDeleteLocal) {
                 try {
                   await s3Service.deleteLocalFile(finalMergedPath);
                   logger.info(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
                   
-                  // Clean up empty directories after deleting the final video file
                   const videoDir = path.dirname(finalMergedPath);
                   await cleanupEmptyDirectories(videoDir);
                 } catch (deleteError) {
@@ -994,7 +963,7 @@ export function downloadAndMergeVideo(
                 logger.info(`📁 Keeping local video file: ${path.basename(finalMergedPath)}`);
               }
             } else {
-              logger.error(`❌ Failed to upload video to S3: ${uploadResult.error}`);
+              logger.error(`❌ Failed to upload video to S3`);
               const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
               if (shouldDeleteLocal) {
                 try {
@@ -1094,7 +1063,7 @@ export function downloadAndMergeVideo(
 /**
  * Enhanced mergeVideoAudio function with validation
  */
-export function mergeVideoAudioWithValidation(videoPath: string, audioPath: string, outputPath: string, _options: DownloadOptions = {}): Promise<string> {
+export function mergeVideoAudioWithValidation(videoPath: string, audioPath: string, outputPath: string, _options: DownloadOptions): Promise<string> {
   checkBinaries();
   
   return new Promise((resolve, reject) => {
@@ -1272,7 +1241,7 @@ async function cleanupFileAndDirectories(filePath: string, stopAtRoot: string = 
  * @param metadata - Optional video metadata to use for naming
  * @returns Promise<string> - Returns S3 key if upload is successful, otherwise local file path
  */
-export async function downloadVideoWithAudioSimple(videoUrl: string, options: DownloadOptions = {}, metadata?: VideoMetadata): Promise<string> {
+export async function downloadVideoWithAudioSimple(videoUrl: string, options: DownloadOptions, metadata?: VideoMetadata): Promise<string> {
   checkBinaries();
   const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
   let outputFilenameTemplate = options.outputFilename || 'video-with-audio.%(ext)s';
@@ -1425,131 +1394,142 @@ function createRDSServiceFromEnv(): RDSService | null {
     return null;
   }
 }
-
-/**
- * Manually enrich guests for existing episodes by episode ID
- */
-export async function enrichExistingEpisodeGuests(episodeId: string): Promise<EpisodeRecord | null> {
-  logger.info(`🔍 Starting manual guest enrichment for episode: ${episodeId}`);
-  
-  try {
-    const rdsService = createRDSServiceFromEnv();
-    if (!rdsService) {
-      logger.error('❌ RDS service not available for guest enrichment');
-      return null;
+export async function downloadContent(url: string): Promise<Buffer | null> {
+    if (!url) {
+        console.error("Error: No URL provided for download.");
+        return null;
     }
 
-    const enrichedEpisode = await rdsService.enrichGuestInfo(episodeId);
-    
-    if (enrichedEpisode) {
-      logger.info(`✅ Successfully enriched guests for episode: ${episodeId}`);
-      return enrichedEpisode;
-    } else {
-      logger.warn(`⚠️ Failed to enrich guests for episode: ${episodeId}`);
-      return null;
-    }
-  } catch (error: any) {
-    logger.error(`❌ Error during manual guest enrichment for episode ${episodeId}:`, error);
-    return null;
-  }
-}
-
-/**
- * Batch enrich guests for multiple episodes
- */
-export async function batchEnrichEpisodeGuests(episodeIds: string[]): Promise<{
-  successful: string[];
-  failed: string[];
-}> {
-  logger.info(`🔍 Starting batch guest enrichment for ${episodeIds.length} episodes`);
-  
-  const results = {
-    successful: [] as string[],
-    failed: [] as string[]
-  };
-
-  for (const episodeId of episodeIds) {
+    console.log(`Downloading content from: ${url}`);
     try {
-      const enrichedEpisode = await enrichExistingEpisodeGuests(episodeId);
-      
-      if (enrichedEpisode) {
-        results.successful.push(episodeId);
-      } else {
-        results.failed.push(episodeId);
-      }
-      
-      // Add delay between batch operations to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (error: any) {
-      logger.error(`❌ Batch enrichment error for episode ${episodeId}:`, error);
-      results.failed.push(episodeId);
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        console.log(`Successfully downloaded content from ${url}.`);
+        return buffer;
+    } catch (error) {
+        if (error instanceof Error) {
+            console.error(`Error downloading content from ${url}: ${error.message}`);
+        } else {
+            console.error("An unknown error occurred during download.");
+        }
+        return null;
     }
-  }
-
-  logger.info(`✅ Batch guest enrichment completed: ${results.successful.length} successful, ${results.failed.length} failed`);
-  return results;
 }
 
-/**
- * Manually enrich topics for existing episodes by episode ID
- */
-export async function enrichExistingEpisodeTopics(episodeId: string): Promise<EpisodeRecord | null> {
-  logger.info(`🔍 Starting manual topic enrichment for episode: ${episodeId}`);
-  
-  try {
-    const rdsService = createRDSServiceFromEnv();
-    if (!rdsService) {
-      logger.error('❌ RDS service not available for topic enrichment');
-      return null;
-    }
+const executeCommand = (command: string, args: string[], cwd: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+        logger.info(`Executing in CWD (${cwd}): ${command} ${args.join(' ')}`);
+        const proc = spawn(command, args, { cwd, stdio: 'pipe' });
+        let stderrOutput = '';
+        proc.stderr.on('data', (data) => {
+            const msg = data.toString().trim();
+            stderrOutput += msg + '\n';
+            logger.debug(`FFMPEG STDERR: ${msg}`);
+        });
+        proc.on('error', reject);
+        proc.on('close', code => {
+            if (code === 0) {
+                resolve();
+            } else {
+                logger.error(`FFmpeg exited with code ${code}. Stderr: ${stderrOutput}`);
+                reject(new Error(`FFmpeg exited with code ${code}.\nFFmpeg stderr:\n${stderrOutput}`));
+            }
+        });
+    });
+};
 
-    const enrichedEpisode = await rdsService.enrichTopicInfo(episodeId);
-    
-    if (enrichedEpisode) {
-      logger.info(`✅ Successfully enriched topics for episode: ${episodeId}`);
-      return enrichedEpisode;
-    } else {
-      logger.warn(`⚠️ Failed to enrich topics for episode: ${episodeId}`);
-      return null;
-    }
-  } catch (error: any) {
-    logger.error(`❌ Error during manual topic enrichment for episode ${episodeId}:`, error);
-    return null;
-  }
-}
+export async function renderingLowerDefinitionVersions(
+    finalMergedPath: string,
+    metadata: VideoMetadata,
+    options: DownloadOptions,
+    s3Service: S3Service,
+    bucketName: string
+): Promise<{ success: boolean; message?: string; masterPlaylists3Link: string }> {
 
-/**
- * Batch enrich topics for multiple episodes
- */
-export async function batchEnrichEpisodeTopics(episodeIds: string[]): Promise<{
-  successful: string[];
-  failed: string[];
-}> {
-  logger.info(`🔍 Starting batch topic enrichment for ${episodeIds.length} episodes`);
-  
-  const results = {
-    successful: [] as string[],
-    failed: [] as string[]
-  };
+    const outputDir = path.join(path.dirname(finalMergedPath), 'hls_output');
+    const episodeName = sanitizeFilename(metadata.title);
+    let masterPlaylists3Link = '';
 
-  for (const episodeId of episodeIds) {
+    const renditions = [
+        // { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
+        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+        { resolution: '854x480', bitrate: '700k', name: '480p' },
+        { resolution: '640x360', bitrate: '400k', name: '360p' },
+    ];
+
     try {
-      const enrichedEpisode = await enrichExistingEpisodeTopics(episodeId);
-      
-      if (enrichedEpisode) {
-        results.successful.push(episodeId);
-      } else {
-        results.failed.push(episodeId);
-      }
-      
-      // Add delay between batch operations to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (error: any) {
-      logger.error(`❌ Batch topic enrichment error for episode ${episodeId}:`, error);
-      results.failed.push(episodeId);
-    }
-  }
+        await fsPromises.mkdir(outputDir, { recursive: true });
 
-  logger.info(`✅ Batch topic enrichment completed: ${results.successful.length} successful, ${results.failed.length} failed`);
-  return results;
+        for (const rendition of renditions) {
+            logger.info(`🚀 Starting transcode for ${rendition.name}...`);
+            const renditionDir = path.join(outputDir, rendition.name);
+            await fsPromises.mkdir(renditionDir, { recursive: true });
+
+            const ffmpegArgs = [
+                '-i', path.resolve(finalMergedPath),
+                '-vf', `scale=${rendition.resolution}`,
+                '-c:v', 'libx264', '-x264-params', `keyint=48:min-keyint=48:scenecut=0`,
+                '-b:v', rendition.bitrate,
+                '-c:a', 'aac', '-b:a', '96k',
+                '-f', 'hls',
+                '-hls_time', '6',
+                '-hls_playlist_type', 'vod',
+                '-hls_segment_type', 'fmp4',
+                '-hls_segment_filename', 'data%02d.m4s',
+                `${rendition.name}.m3u8`
+            ];
+            await executeCommand(FFMPEG_PATH, ffmpegArgs, renditionDir);
+            logger.info(`✅ Completed transcode for ${rendition.name}.`);
+        }
+
+        logger.info('📜 Generating master playlist...');
+        let masterPlaylistContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
+        for (const rendition of renditions) {
+            const bandwidth = parseInt(rendition.bitrate.replace('k', '')) * 1000;
+            masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${rendition.resolution}\n`;
+            masterPlaylistContent += `${rendition.name}/${rendition.name}.m3u8\n`;
+        }
+        const masterPlaylistPath = path.join(outputDir, 'master.m3u8');
+        await fsPromises.writeFile(masterPlaylistPath, masterPlaylistContent);
+        logger.info('✅ Master playlist created.');
+
+        logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
+        const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
+
+        const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
+            const filePath = path.join(outputDir, relativeFilePath);
+            const fileStat = await fsPromises.stat(filePath);
+            if (fileStat.isFile()) {
+                const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/video/${relativeFilePath.replace(/\\/g, '/')}`;
+                logger.info(`  - Uploading ${relativeFilePath} to ${s3Key}`);
+                return s3Service.uploadFile(filePath, bucketName, s3Key);
+            }
+        });
+            
+        await Promise.all(uploadPromises);
+        logger.info('✅ All files uploaded successfully.');
+
+        const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${episodeName}/video/master.m3u8`;
+        masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
+        logger.info(`🔗 Master Playlist S3 Link: ${masterPlaylists3Link}`);
+        
+        return { success: true, message: 'Lower definition versions rendered and uploaded.', masterPlaylists3Link };
+     } catch (error: any) {
+        logger.error(`❌ Error in renderingLowerDefinitionVersions: ${error.message}`, error);
+        return { success: false, message: error.message, masterPlaylists3Link: '' };
+    } finally {
+        if (true) {
+            try {
+                logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
+                await fsPromises.rm(outputDir, { recursive: true, force: true });
+                logger.info('✅ Cleanup complete.');
+            } catch (cleanupError: any) {
+                logger.error(`❌ Failed to clean up directory ${outputDir}: ${cleanupError.message}`);
+            }
+        }
+    }
 }

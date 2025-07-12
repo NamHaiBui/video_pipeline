@@ -1,3 +1,5 @@
+import { VideoMetadata } from "@/types";
+
 /**
  * Create a URL-safe slug from input string
  */
@@ -286,3 +288,22 @@ export function parsePostgresArray(pgArray: string): string[] {
   });
 }
 
+export function getManifestUrl(metadata: VideoMetadata): string {
+    for (const fmt of metadata.formats) {
+        if (fmt.manifest_url) {
+            console.log(`Found manifest URL in format '${fmt.format_id}'.`);
+            return fmt.manifest_url;
+        }
+    }
+    console.warn("Warning: No manifest_url found in any of the formats.");
+    return "";
+}
+
+export function getThumbnailUrl(metadata: VideoMetadata): string {
+    if (metadata.thumbnail) {
+        console.log(`Found high-quality thumbnail URL: ${metadata.thumbnail}`);
+        return metadata.thumbnail;
+    }
+    console.warn("Warning: No top-level thumbnail found.");
+    return "";
+}

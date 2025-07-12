@@ -2,8 +2,8 @@ import axios from 'axios';
 import { OpenAI } from 'openai';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { v4 as uuidv4 } from 'uuid';
-import { logger } from './logger.js';
-import { RDSService } from './rdsService.js';
+import { logger } from './utils/logger.js';
+import { RDSService, GuestRecord } from './rdsService.js';
 
 // ========================= TypeScript Interfaces (Data Models) =========================
 
@@ -87,9 +87,9 @@ export class GuestExtractionService {
             perplexityBaseUrl: "https://api.perplexity.ai",
             perplexityModel: "sonar",
             googleSearchApiUrl: "https://www.googleapis.com/customsearch/v1",
-            s3Bucket: process.env.S3_BUCKET_NAME || "spice-user-content-assets",
+            s3Bucket: "spice-user-content-assets",
             s3Prefix: "guest-images/",
-            awsRegion: process.env.AWS_REGION || "us-east-1",
+            awsRegion: "us-east-1",
             maxRetries: 3,
             ...config
         };
@@ -123,32 +123,34 @@ export class GuestExtractionService {
             .trim();
     }
 
-    private async checkExistingGuests(guestNames: string[]): Promise<{ existsMap: Record<string, boolean>; guestIdMap: Record<string, string> }> {
+    private async checkExistingGuests(guestNames: string[]): Promise<{ existsMap: Record<string, boolean>; guestIdMap: Record<string, string>; guestInfoMap: Record<string, any> }> {
         logger.info("Checking for existing guests in database...");
         const existsMap: Record<string, boolean> = {};
         const guestIdMap: Record<string, string> = {};
+        const guestInfoMap: Record<string, any> = {};
 
         if (guestNames.length === 0 || !this.rdsService) {
             logger.info("No guests to check or RDS service not available.");
             guestNames.forEach(name => (existsMap[name] = false));
-            return { existsMap, guestIdMap };
+            return { existsMap, guestIdMap, guestInfoMap };
         }
-        
-        try {
-            // This would need to be implemented in RDSService
-            // For now, assume all guests are new
-            guestNames.forEach(name => {
+
+        for (const name of guestNames) {
+            const guest = await this.rdsService.getGuestByName(name);
+            if (guest) {
+                existsMap[name] = true;
+                guestIdMap[name] = guest.guestName;
+                guestInfoMap[name] = guest;
+                logger.info(`Existing guest found: ${name}`);
+            } else {
                 existsMap[name] = false;
                 logger.info(`New guest: ${name}`);
-            });
-        } catch (error) {
-            logger.error('Error checking existing guests:', error as Error);
-            guestNames.forEach(name => (existsMap[name] = false));
+            }
         }
 
         const existingCount = Object.values(existsMap).filter(Boolean).length;
         logger.info(`Summary: ${existingCount} existing, ${guestNames.length - existingCount} new guests`);
-        return { existsMap, guestIdMap };
+        return { existsMap, guestIdMap, guestInfoMap };
     }
 
     // ========================= Image Retrieval and Verification =========================
@@ -227,13 +229,13 @@ export class GuestExtractionService {
             const imageBase64 = Buffer.from(imageResponse.data).toString('base64');
             
             const prompt = `You are a strict profile image verifier. Analyze this image for "${name}" described as "${description}".
-REQUIREMENTS:
-1. The person MUST match BOTH the name AND description
-2. Must be a real photograph (not painting, drawing, or CGI)
-3. Must be a clear portrait/headshot
-4. Must be professional quality
-Respond with JSON only:
-{"is_correct_person": true/false, "is_good_profile_pic": true/false, "confidence": "high"/"medium"/"low", "reasoning": "Brief explanation"}`;
+                            REQUIREMENTS:
+                            1. The person MUST match BOTH the name AND description
+                            2. Must be a real photograph (not painting, drawing, or CGI)
+                            3. Must be a clear portrait/headshot
+                            4. Must be professional quality
+                            Respond with JSON only:
+                            {"is_correct_person": true/false, "is_good_profile_pic": true/false, "confidence": "high"/"medium"/"low", "reasoning": "Brief explanation"}`;
 
             const response = await this.geminiClient.chat.completions.create({
                 model: this.config.geminiFlashModel,
@@ -321,14 +323,14 @@ Respond with JSON only:
         const { podcast_title, episode_title, episode_description } = podcastData;
 
         const prompt = `Extract guest names and main topics from this podcast episode.
-CURRENT EPISODE:
-Podcast: "${podcast_title}"
-Episode: "${episode_title}"
-Description: ${episode_description}
-RULES:
-1. GUEST NAMES: Extract interviewed/featured people (NOT the host). If none, return empty list.
-2. TOPICS: 3-7 single-word topics, capitalized.
-3. DESCRIPTION: Brief 1-2 sentence summary of the episode.`;
+                        CURRENT EPISODE:
+                        Podcast: "${podcast_title}"
+                        Episode: "${episode_title}"
+                        Description: ${episode_description}
+                        RULES:
+                        1. GUEST NAMES: Extract interviewed/featured people (NOT the host). If none, return empty list.
+                        2. TOPICS: 3-7 single-word topics, capitalized.
+                        3. DESCRIPTION: Brief 1-2 sentence summary of the episode.`;
 
         const response = await this.geminiClient.chat.completions.create({
             model: this.config.geminiModel,
@@ -382,40 +384,51 @@ RULES:
         }
     }
 
-    private async fetchNewGuestBiosAndImages(extractionResult: Awaited<ReturnType<GuestExtractionService['extractGuestsAndTopics']>>, existsMap: Record<string, boolean>) {
+    private async fetchNewGuestBiosAndImages(extractionResult: Awaited<ReturnType<GuestExtractionService['extractGuestsAndTopics']>>, existsMap: Record<string, boolean>, guestInfoMap: Record<string, any>) {
         const newGuests = extractionResult.guest_names.filter(name => !existsMap[name]);
-        
         if (newGuests.length === 0) {
             logger.info("No new guests found, skipping bio and image fetching.");
             return {};
         }
-
         logger.info(`Fetching bios and images for ${newGuests.length} NEW guests...`);
-        
         const guestDetails: Record<string, any> = {};
-
-        for (const name of newGuests) {
-            const guestUuid = uuidv4();
-            
-            // Fetch Bio
-            const bioInfo = await this.fetchGuestBio(name, {
-                podcast_title: extractionResult.podcast_title,
-                episode_title: extractionResult.episode_title,
-                episode_description: extractionResult._episode_description,
-            });
-
-            // Fetch Image
-            const imageResult = await this.processGuestImage(name, bioInfo.description, guestUuid);
-            
-            guestDetails[name] = {
-                ID: guestUuid,
-                description: bioInfo.description,
-                confidence: bioInfo.confidence,
-                image: imageResult
-            };
+        for (const name of extractionResult.guest_names) {
+            if (existsMap[name] && guestInfoMap[name]) {
+                guestDetails[name] = {
+                    ID: guestInfoMap[name].guestName,
+                    description: guestInfoMap[name].guestDescription,
+                    confidence: 'high',
+                    image: { s3Url: guestInfoMap[name].guestImage },
+                    guestLanguage: guestInfoMap[name].guestLanguage
+                };
+            } else {
+                const guestUuid = uuidv4();
+                const bioInfo = await this.fetchGuestBio(name, {
+                    podcast_title: extractionResult.podcast_title,
+                    episode_title: extractionResult.episode_title,
+                    episode_description: extractionResult._episode_description,
+                });
+                const imageResult = await this.processGuestImage(name, bioInfo.description, guestUuid);
+                guestDetails[name] = {
+                    ID: guestUuid,
+                    description: bioInfo.description,
+                    confidence: bioInfo.confidence,
+                    image: imageResult
+                };
+                // Upload new guest to RDS
+                const guestRecord: GuestRecord = {
+                    guestId: guestUuid,
+                    guestName: name,
+                    guestDescription: bioInfo.description,
+                    guestImage: imageResult.s3Url || '',
+                    guestLanguage: ''
+                };
+                if (this.rdsService) {
+                    await this.rdsService.insertGuest(guestRecord);
+                }
+            }
         }
-        
-        logger.info("All new guest bios and images processed.");
+        logger.info("All guest bios and images processed.");
         return guestDetails;
     }
 
@@ -462,17 +475,13 @@ RULES:
 
     public async extractPodcastWithBiosAndImages(podcastData: { podcast_title: string; episode_title: string; episode_description: string; }): Promise<GuestExtractionResult> {
         logger.info("Starting podcast extraction with guest verification & image fetching");
-        
         try {
             // Step 1: Extract guests and topics
             const extractionResult = await this.extractGuestsAndTopics(podcastData);
-            
-            // Step 2: Check database for existing guests
-            const { existsMap } = await this.checkExistingGuests(extractionResult.guest_names);
-            
-            // Step 3 & 4: Fetch bios and images for NEW guests
-            const guestDescriptions = await this.fetchNewGuestBiosAndImages(extractionResult, existsMap);
-
+            // Step 2: Check DB for existing guests and get info
+            const { existsMap, guestInfoMap } = await this.checkExistingGuests(extractionResult.guest_names);
+            // Step 3 & 4: Fetch bios and images for all guests, upload new ones
+            const guestDescriptions = await this.fetchNewGuestBiosAndImages(extractionResult, existsMap, guestInfoMap);
             const finalResult: GuestExtractionResult = {
                 podcast_title: extractionResult.podcast_title,
                 episode_title: extractionResult.episode_title,
@@ -481,10 +490,8 @@ RULES:
                 topics: extractionResult.topics,
                 guest_details: guestDescriptions,
             };
-            
             logger.info("Podcast extraction complete!");
             return finalResult;
-
         } catch (error) {
             logger.error('Processing failed:', error as Error);
             throw error;
@@ -500,10 +507,9 @@ RULES:
             searchApiKey: process.env.SEARCH_API_KEY,
             searchEngineId: process.env.SEARCH_ENGINE_ID,
             s3Bucket: process.env.S3_BUCKET_NAME || "spice-user-content-assets",
-            awsRegion: process.env.AWS_REGION || "us-east-1"
+            awsRegion:  "us-east-1"
         };
 
-        // Check if at least Gemini is configured (minimum requirement)
         if (!config.geminiApiKey) {
             logger.warn('Guest extraction service disabled - Gemini API key not configured');
             return null;

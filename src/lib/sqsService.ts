@@ -6,7 +6,7 @@ import {
   ReceiveMessageCommandOutput, 
   Message 
 } from '@aws-sdk/client-sqs';
-import { logger } from './logger.js';
+import { logger } from './utils/logger.js';
 
 export interface SQSServiceConfig {
   region: string;

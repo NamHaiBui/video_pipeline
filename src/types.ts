@@ -1,45 +1,166 @@
 import { GuestExtractionResult } from './lib/guestExtractionService.js';
 
+// Main interface for the entire JSON output from yt-dlp
 export interface VideoMetadata {
-  title: string;
-  uploader: string;
   id: string;
-  duration: number;
+  title: string;
+  formats: Format[];
+  thumbnails: Thumbnail[];
+  thumbnail: string;
   description: string;
-  upload_date: string;
+  channel_id: string;
+  channel_url: string;
+  duration: number;
   view_count: number;
-  like_count?: number;
-  dislike_count?: number;
-  average_rating?: number;
   age_limit: number;
   webpage_url: string;
+  categories: string[];
+  tags: string[];
+  playable_in_embed: boolean;
+  live_status: string;
+  _format_sort_fields: string[];
+  automatic_captions: { [key: string]: AutomaticCaption[] };
+  subtitles: {};
+  comment_count: number;
+  chapters: Chapter[];
+  heatmap: Heatmap[];
+  like_count: number;
+  channel: string;
+  channel_follower_count: number;
+  uploader: string;
+  uploader_id: string;
+  uploader_url: string;
+  upload_date: string;
+  timestamp: number;
+  availability: string;
+  webpage_url_basename: string;
+  webpage_url_domain: string;
   extractor: string;
   extractor_key: string;
-  thumbnail: string;
-  thumbnails: Array<{
-    url: string;
-    id: string;
-    width?: number;
-    height?: number;
-  }>;
-  formats: Array<{
-    format_id: string;
-    url: string;
-    ext: string;
-    format: string;
-    format_note?: string;
-    width?: number;
-    height?: number;
-    fps?: number;
-    acodec?: string;
-    vcodec?: string;
-    abr?: number;
-    vbr?: number;
-    filesize?: number;
-    filesize_approx?: number;
-  }>;
-  [key: string]: any; 
+  display_id: string;
+  fulltitle: string;
+  duration_string: string;
+  is_live: boolean;
+  was_live: boolean;
+  epoch: number;
+  format: string;
+  format_id: string;
+  ext: string;
+  protocol: string;
+  language?: string;
+  format_note: string;
+  filesize_approx?: number;
+  tbr?: number;
+  width?: number;
+  height?: number;
+  resolution: string;
+  fps?: number;
+  dynamic_range?: string;
+  vcodec: string;
+  vbr?: number;
+  aspect_ratio?: number;
+  acodec: string;
+  abr?: number;
+  asr?: number;
+  audio_channels?: number;
+  _type: string;
+  _version: Version;
 }
+
+// Interface for each available format
+export interface Format {
+  format_id: string;
+  format_note: string;
+  ext: string;
+  protocol: string;
+  acodec: string;
+  vcodec: string;
+  url: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  rows?: number;
+  columns?: number;
+  fragments?: Fragment[];
+  audio_ext: string;
+  video_ext: string;
+  vbr: number;
+  abr: number;
+  resolution: string;
+  aspect_ratio?: number;
+  http_headers: HttpHeaders;
+  format: string;
+  manifest_url?: string;
+  language?: string;
+  quality?: number;
+  has_drm?: boolean;
+  source_preference?: number;
+  asr?: number;
+  filesize?: number;
+  audio_channels?: number;
+  tbr?: number;
+  filesize_approx?: number;
+  container?: string;
+  downloader_options?: DownloaderOptions;
+  dynamic_range?: string;
+}
+
+// Interface for video fragments (used in storyboards)
+export interface Fragment {
+  url: string;
+  duration: number;
+}
+
+// Interface for HTTP headers
+export interface HttpHeaders {
+  "User-Agent": string;
+  Accept: string;
+  "Accept-Language": string;
+  "Sec-Fetch-Mode": string;
+}
+
+// Interface for downloader options
+export interface DownloaderOptions {
+  http_chunk_size: number;
+}
+
+// Interface for video thumbnails
+export interface Thumbnail {
+  url: string;
+  preference: number;
+  id: string;
+  height?: number;
+  width?: number;
+  resolution?: string;
+}
+
+// Interface for automatic captions
+export interface AutomaticCaption {
+  ext: string;
+  url: string;
+  name: string;
+}
+
+// Interface for video chapters
+export interface Chapter {
+  start_time: number;
+  title: string;
+  end_time: number;
+}
+
+// Interface for the video heatmap
+export interface Heatmap {
+  start_time: number;
+  end_time: number;
+  value: number;
+}
+
+// Interface for the version information
+export interface Version {
+  version: string;
+  repository: string;
+}
+
 
 export interface ProgressInfo {
   percent: string;
@@ -157,38 +278,13 @@ export interface SQSJobMessage {
     notificationReceived?: string;
     [key: string]: any;
   };
-  
-  // Legacy format fields (for backward compatibility)
-  jobId?: string; // Job ID for legacy downloads (auto-generated if not provided)
-  
+
+  jobId?: string;
   options?: {
     format?: string;
     quality?: string;
     extractAudio?: boolean;
     priority?: 'high' | 'normal' | 'low';
-  };
-  metadata?: Record<string, any>;
-  
-  // Legacy channelInfo - for backward compatibility (deprecated)
-  channelInfo?: {
-    channelId: string;
-    channelName: string;
-    hostName?: string;
-    hostDescription?: string;
-    country?: string;
-    genre?: string; // genreId will be passed as 'genre' in SQS message
-    rssUrl?: string;
-    guests?: string[];
-    guestDescriptions?: string[];
-    guestImageUrl?: string;
-    episodeImages?: string[];
-    topics?: string[];
-    channelDescription?: string;
-    channelThumbnail?: string;
-    subscriberCount?: number;
-    verified?: boolean;
-    notificationReceived?: string;
-    [key: string]: any;
   };
 }
 

@@ -1,8 +1,9 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'fs';
 import path from 'path';
-import { logger } from './logger.js';
+import { logger } from './utils/logger.js';
+import { Upload } from '@aws-sdk/lib-storage';
 
 export interface S3Config {
   region: string;
@@ -79,25 +80,38 @@ export class S3Service {
           case '.json':
             contentType = 'application/json';
             break;
+          case '.txt':
+            contentType = 'text/plain';
+            break;
+          case '.jpeg':
+            contentType = 'image/jpeg';
+            break;
+          case '.m3u8':
+            contentType = 'application/vnd.apple.mpegurl';
+            break;
           default:
             contentType = 'application/octet-stream';
         }
       }
 
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: fileStream,
-        ContentType: contentType,
-        ContentLength: stats.size,
-        Metadata: {
-          'upload-timestamp': new Date().toISOString(),
-          'original-filename': path.basename(filePath),
-          'file-size': stats.size.toString()
+      // Use Upload for multipart upload
+      const upload = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: bucket,
+          Key: key,
+          Body: fileStream,
+          ContentType: contentType,
+          ContentLength: stats.size,
+          Metadata: {
+            'upload-timestamp': new Date().toISOString(),
+            'original-filename': path.basename(filePath),
+            'file-size': stats.size.toString()
+          }
         }
       });
 
-      const result = await this.s3Client.send(command);
+      const result = await upload.done();
       const location = `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`;
 
       logger.info(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
@@ -113,15 +127,87 @@ export class S3Service {
     } catch (error: any) {
       logger.error(`❌ Failed to upload ${filePath} to S3:`, error.message);
       return {
-        success: false,
-        key,
-        bucket,
-        location: '',
-        error: error.message
+          success: false,
+          key,
+          bucket,
+          location: '',
+          error: error instanceof Error ? error.message : String(error)
       };
     }
   }
+  
+/**
+ * Uploads in-memory data (Buffer) to an S3 bucket.
+ * @param data The Buffer content to upload.
+ * @param bucket The target S3 bucket name.
+ * @param key The desired name/path of the file in the S3 bucket.
+ * @returns A promise that resolves to true if successful, false otherwise.
+ */
+async uploadm3u8ToS3(data: Buffer, bucket: string, key: string): Promise<S3UploadResult> {
+    const command = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: data,
+        ContentType: 'application/vnd.apple.mpegurl' 
+    });
 
+    console.log(`Uploading content to S3 bucket '${bucket}' as '${key}'...`);
+    try {
+        await this.s3Client.send(command);
+        console.log("Upload Successful!");
+        return {
+            success: true,
+            key,
+            bucket,
+            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`
+        };
+    } catch (error) {
+        if (error instanceof Error) {
+            console.error(`An S3 client error occurred: ${error.message}`);
+        } else {
+            console.error("An unknown error occurred during S3 upload.");
+        }
+        return {
+            success: false,
+            key,
+            bucket,
+            location: '',
+            error: error instanceof Error ? error.message : String(error)
+        };
+    }
+}
+async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3UploadResult> {
+    const command = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: data,
+        ContentType: 'image/jpeg'
+    });
+    console.log(`Uploading thumbnail to S3 bucket '${bucket}' as '${key}'...`);
+    try {
+        await this.s3Client.send(command);
+        console.log("Upload Successful!");      
+        return {
+            success: true,
+            key,
+            bucket,
+            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`
+        };
+    } catch (error) {
+        if (error instanceof Error) {
+            console.error(`An S3 client error occurred: ${error.message}`);
+        } else {
+            console.error("An unknown error occurred during S3 upload.");
+        }
+        return {
+            success: false,
+            key,      
+            bucket,
+            location: '',
+            error: error instanceof Error ? error.message : String(error)
+        };
+    }
+  }
   /**
    * Upload audio file to the audio bucket
    */
@@ -144,17 +230,6 @@ export class S3Service {
     return this.uploadFile(filePath, this.config.videoBucket, key);
   }
 
-  /**
-   * Upload metadata file to the metadata bucket (or video bucket if not specified)
-   */
-  async uploadMetadataFile(filePath: string, keyPrefix?: string): Promise<S3UploadResult> {
-    const filename = path.basename(filePath);
-    const key = keyPrefix ? `${keyPrefix}/${filename}` : filename;
-    const bucket = this.config.metadataBucket || this.config.videoBucket;
-    
-    logger.info(`📄 Uploading metadata file to S3: ${filename}`);
-    return this.uploadFile(filePath, bucket, key, 'application/json');
-  }
 
   /**
    * Generate a presigned URL for downloading a file
@@ -171,52 +246,6 @@ export class S3Service {
     } catch (error: any) {
       logger.error(`Failed to generate presigned URL for s3://${bucket}/${key}:`, error.message);
       throw error;
-    }
-  }
-
-  /**
-   * Upload string content directly to S3
-   */
-  async uploadFileContent(
-    content: string,
-    bucket: string,
-    key: string,
-    contentType: string = 'text/plain'
-  ): Promise<S3UploadResult> {
-    try {
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: content,
-        ACL: 'public-read',
-        ContentType: contentType,
-        Metadata: {
-          'upload-timestamp': new Date().toISOString(),
-          'content-length': content.length.toString()
-        }
-      });
-
-      await this.s3Client.send(command);
-      const location = `https://${bucket}.s3.${this.config.region}.amazonaws.com/${key}`;
-
-      logger.info(`✅ Successfully uploaded content to s3://${bucket}/${key}`);
-      
-      return {
-        success: true,
-        key,
-        bucket,
-        location,
-      };
-
-    } catch (error: any) {
-      logger.error(`❌ Failed to upload content to S3:`, error.message);
-      return {
-        success: false,
-        key,
-        bucket,
-        location: '',
-        error: error.message
-      };
     }
   }
 

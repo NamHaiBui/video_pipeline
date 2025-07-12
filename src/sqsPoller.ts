@@ -1,6 +1,6 @@
 import { Message } from '@aws-sdk/client-sqs';
 import { createSQSServiceFromEnv } from './lib/sqsService.js';
-import { logger } from './lib/logger.js';
+import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
 import { processDownload, downloadVideoForExistingEpisode } from './server.js';
 import { v4 as uuidv4 } from 'uuid';

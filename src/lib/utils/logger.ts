@@ -25,7 +25,7 @@ import {
   ResourceAlreadyExistsException,
   ResourceNotFoundException 
 } from '@aws-sdk/client-cloudwatch-logs';
-import { LOGGING, ENV_VARS } from '../constants.js';
+import { LOGGING, ENV_VARS } from '../../constants.js';
 
 /**
  * Log levels in order of severity

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import axios, { AxiosResponse } from 'axios';
 import ProgressBar from 'progress';
-import { logger } from './logger.js';
+import { logger } from './utils/logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

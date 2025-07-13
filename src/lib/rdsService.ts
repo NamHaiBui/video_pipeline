@@ -45,9 +45,9 @@ export interface EpisodeRecord {
   episodeId: string;
   episodeTitle: string;
   episodeDescription: string;
-  episodeThumbnailImageUrl?: string; // S3 URL for episode thumbnail
-  episodeUrl?: string; // S3 URL for episode audio/video file
-  originalUrl: string; // Original source site URL
+  episodeImages?: string[]; // S3 URLs for episode images (text[])
+  episodeUri?: string; // S3 URL for episode audio/video file
+  originalUri: string; // Original source site URL
   durationMillis?: number;
   publishedDate: string; // ISO date string
   createdAt: string; // ISO date string
@@ -65,7 +65,7 @@ export interface EpisodeRecord {
   
   guests?: string[]; // JSON array of guest names
   guestDescriptions?: string[]; // JSON array of guest descriptions
-  guestImages?: string[]; // JSON array of S3 URLs for guest images
+  guestImageUrl?: string[]; // JSON array of S3 URLs for guest images
   
   topics?: string[]; // JSON array of topics/tags
   summaryMetadata?: Record<string, any>; // JSON for summary metadata
@@ -85,13 +85,7 @@ export interface EpisodeRecord {
   additionalData: Record<string, any>; // JSON for future purposes
   processingDone: boolean;
   isSynced: boolean;
-  
-  // Legacy fields for backward compatibility (can be removed later)
-  pk?: string; // Primary key: EPISODE#{episodeId}
-  sk?: string; // Sort key: METADATA
-  originalUri?: string; // Alias for originalUrl
-  episodeUri?: string; // Alias for episodeUrl
-  episodeImages?: string[]; // S3 URLs for episode images
+
 }
 export interface GuestRecord {
   guestId?: string; 
@@ -138,9 +132,11 @@ export class RDSService {
   /**
    * Use the global client for all queries
    */
-  private getClient(): Client {
-    if (!this.client) throw new Error('RDS client not initialized. Call initClient() on startup.');
-    return this.client;
+  private async getClient(): Promise<Client> {
+    if (!this.client) {
+      await this.initClient();
+    }
+    return this.client!;
   }
   /**
    * Gracefully close the global RDS client connection (call on server shutdown)
@@ -160,19 +156,19 @@ export class RDSService {
    * Get guest by name from the database
    */
   async getGuestByName(guestName: string): Promise<GuestRecord | null> {
-    const client = this.getClient();
+    const client = await this.getClient();
     try {
+      // Only select guestName, guestDescription, guestImage, guestLanguage (guestId is not needed for lookup)
       const query = `
-        SELECT 
-          "guestName", "guestDescription", "guestImage", "guestLanguage"
+        SELECT "guestName", "guestDescription", "guestImage", "guestLanguage"
         FROM public."Guests"
         WHERE "guestName" = $1
       `;
       const result = await client.query(query, [guestName]);
       if (result.rows.length === 0) return null;
       const row = result.rows[0];
+      logger.info(`Guest found: ${JSON.stringify(row)}`);
       return {
-        guestId: row.guestId,
         guestName: row.guestName,
         guestDescription: row.guestDescription,
         guestImage: row.guestImage,
@@ -189,11 +185,12 @@ export class RDSService {
    */
   async storeNewEpisode(
     messageBody: SQSMessageBody,
+    s3AudioLink:string,
     metadata?: VideoMetadata,
     thumbnailUrl?: string
   ): Promise<{ episodeId: string }> {
     
-    const client = this.getClient();
+    const client = await this.getClient();
     
     try {
       // Generate episode ID if not provided
@@ -204,18 +201,19 @@ export class RDSService {
         episodeId,
         episodeTitle: messageBody.episodeTitle,
         episodeDescription: sanitizeDescription(metadata?.description || ''),
+        episodeImages: thumbnailUrl ? [thumbnailUrl] : [],
         hostName: messageBody.hostName,
         hostDescription: messageBody.hostDescription,
         channelName: messageBody.channelName,
         channelId: messageBody.channelId,
-        originalUrl: messageBody.originalUri,
+        originalUri: messageBody.originalUri,
         publishedDate: messageBody.publishedDate,
-        episodeUrl: undefined, // Will be set when video/audio is processed
+        episodeUri: s3AudioLink, 
         country: messageBody.country,
         genre: messageBody.genre,
         durationMillis: metadata?.duration ? metadata.duration * 1000 : 0,
         rssUrl: undefined, 
-        contentType: messageBody.contentType || 'Video',
+        contentType: messageBody.contentType || 'video',
         processingDone: false,
         isSynced: false,
         processingInfo: {
@@ -231,7 +229,6 @@ export class RDSService {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         deletedAt: null,
-        episodeImages: [], // Set to empty array or populate as needed
       };
 
       // Insert into database using correct column names (updated schema)
@@ -261,10 +258,10 @@ export class RDSService {
         episodeData.channelName,                            // $6
         episodeData.guests || [],                           // $7 (text[])
         episodeData.guestDescriptions || [],                // $8 (text[])
-        episodeData.guestImages || [],                      // $9 (text[])
+        episodeData.guestImageUrl || [],                      // $9 (text[])
         episodeData.publishedDate ? new Date(episodeData.publishedDate) : null, // $10 (timestamp)
-        episodeData.episodeUrl,                             // $11 (episodeUri)
-        episodeData.originalUrl,                            // $12 (originalUri)
+        episodeData.episodeUri,                             // $11 (episodeUri)
+        episodeData.originalUri,                            // $12 (originalUri)
         episodeData.channelId,                              // $13
         episodeData.country,                                // $14
         episodeData.genre,                                  // $15
@@ -302,97 +299,38 @@ export class RDSService {
    * Get episode by ID
    */
   async getEpisode(episodeId: string): Promise<EpisodeRecord | null> {
-    const client = this.getClient();
+    const client = await this.getClient();
     
     try {
       logger.info(`Fetching episode: ${episodeId}`);
       
+      // Only select necessary attributes for episode lookup
       const query = `
-        SELECT 
-          "episodeId", "episodeTitle", "episodeDescription", "episodeThumbnailImageUrl",
-          "episodeUrl", "originalUrl", "durationMillis", "publishedDate", "createdAt", "updatedAt", "deletedAt",
-          "channelId", "channelName", "rssUrl", "channelThumbnailUrl",
-          "hostName", "hostDescription", "hostImageUrl",
-          "guests", "guestDescriptions", "guestImages",
-          "topics", "summaryMetadata",
-          "country", "genre", "languageCode",
-          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
-          "contentType", "processingInfo", "additionalData", "processingDone", "isSynced"
-        FROM public."Episodes" 
+        SELECT "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt"
+        FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
-      
       const result = await client.query(query, [episodeId]);
-      
       if (result.rows.length === 0) {
         logger.info(`Episode not found: ${episodeId}`);
         return null;
       }
-      
       const row = result.rows[0];
-      
-      // Parse JSON fields safely
-      const processingInfo = row.processing_info ? JSON.parse(row.processing_info) : {
-        episodeTranscribingDone: false,
-        summaryTranscribingDone: false,
-        summarizingDone: false,
-        numChunks: 0,
-        numRemovedChunks: 0,
-        chunkingDone: false,
-        quotingDone: false
-      };
-      const guests = row.guests ? JSON.parse(row.guests) : [];
-      const guestDescriptions = row.guest_descriptions ? JSON.parse(row.guest_descriptions) : [];
-      const guestImages = row.guest_images ? JSON.parse(row.guest_images) : [];
-      const topics = row.topics ? JSON.parse(row.topics) : [];
-      const summaryMetadata = row.summary_metadata ? JSON.parse(row.summary_metadata) : {};
-      const additionalData = row.additional_data ? JSON.parse(row.additional_data) : {};
-      
-      const episode: EpisodeRecord = {
+      const episode: Partial<EpisodeRecord> = {
         episodeId: row.episodeId,
         episodeTitle: row.episodeTitle,
         episodeDescription: row.episodeDescription,
-        episodeThumbnailImageUrl: row.episodeThumbnailImageUrl,
-        episodeUrl: row.episodeUrl,
-        originalUrl: row.originalUrl,
-        durationMillis: row.durationMillis,
+        episodeImages: Array.isArray(row.episodeImages) ? row.episodeImages : (row.episodeImages ? [row.episodeImages] : []),
+        episodeUri: row.episodeUri,
+        originalUri: row.originalUri,
+        channelId: row.channelId,
+        channelName: row.channelName,
         publishedDate: row.publishedDate,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
-        deletedAt: row.deletedAt,
-        channelId: row.channelId,
-        channelName: row.channelName,
-        rssUrl: row.rssUrl,
-        channelThumbnailUrl: row.channelThumbnailUrl,
-        hostName: row.hostName,
-        hostDescription: row.hostDescription,
-        hostImageUrl: row.hostImageUrl,
-        guests: guests,
-        guestDescriptions: guestDescriptions,
-        guestImages: guestImages,
-        topics: topics,
-        summaryMetadata: summaryMetadata,
-        country: row.country,
-        genre: row.genre,
-        languageCode: row.languageCode,
-        transcriptUri: row.transcriptUri,
-        processedTranscriptUri: row.processedTranscriptUri,
-        summaryAudioUri: row.summaryAudioUri,
-        summaryDurationMillis: row.summaryDurationMillis,
-        summaryTranscriptUri: row.summaryTranscriptUri,
-        contentType: row.contentType,
-        processingInfo: processingInfo,
-        additionalData: additionalData,
-        processingDone: row.processingDone,
-        isSynced: row.isSynced,
-        // Legacy fields for backward compatibility
-        originalUri: row.originalUrl, // Alias
-        episodeUri: row.episodeUrl    // Alias
       };
-      
       logger.info(`Episode fetched successfully: ${episodeId}`);
-      return episode;
-      
+      return episode as EpisodeRecord;
     } catch (error) {
       logger.error(`Failed to fetch episode ${episodeId}:`, error as Error);
       throw error;
@@ -403,12 +341,12 @@ export class RDSService {
    * Update episode data
    */
   async updateEpisode(episodeId: string, updateData: Partial<EpisodeRecord>): Promise<void> {
-    const client = this.getClient();
+
+    logger.info(`Updating episode: ${episodeId} with data: ${JSON.stringify(updateData, null, 2)}`);
     
     try {
-      logger.info(`Updating episode: ${episodeId}`);
-      
-      // Build SQL update query dynamically based on provided data
+      const client = await this.getClient();
+      logger.info(`RDS client is available: ${!!client}`);
       const updateFields: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
@@ -430,13 +368,13 @@ export class RDSService {
         updateFields.push(`"hostDescription" = $${paramIndex++}`);
         values.push(updateData.hostDescription);
       }
-      if (updateData.episodeUrl !== undefined) {
-        updateFields.push(`"episodeUrl" = $${paramIndex++}`);
-        values.push(updateData.episodeUrl);
+      if (updateData.episodeUri !== undefined) {
+        updateFields.push(`"episodeUri" = $${paramIndex++}`);
+        values.push(updateData.episodeUri);
       }
-      if (updateData.originalUrl !== undefined) {
-        updateFields.push(`"originalUrl" = $${paramIndex++}`);
-        values.push(updateData.originalUrl);
+      if (updateData.originalUri !== undefined) {
+        updateFields.push(`"originalUri" = $${paramIndex++}`);
+        values.push(updateData.originalUri);
       }
       if (updateData.contentType !== undefined) {
         updateFields.push(`"contentType" = $${paramIndex++}`);
@@ -469,23 +407,19 @@ export class RDSService {
       // Handle guest-related fields
       if (updateData.guests !== undefined) {
         updateFields.push(`"guests" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guests));
+        values.push(updateData.guests);
       }
       if (updateData.guestDescriptions !== undefined) {
         updateFields.push(`"guestDescriptions" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guestDescriptions));
+        values.push(updateData.guestDescriptions);
       }
-      if (updateData.guestImages !== undefined) {
-        updateFields.push(`"guestImages" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guestImages));
+      if (updateData.guestImageUrl !== undefined) {
+        updateFields.push(`"guestImageUrl" = $${paramIndex++}`);
+        values.push(updateData.guestImageUrl);
       }
       if (updateData.topics !== undefined) {
         updateFields.push(`"topics" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.topics));
-      }
-      if (updateData.summaryMetadata !== undefined) {
-        updateFields.push(`"summaryMetadata" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.summaryMetadata));
+        values.push(updateData.topics);
       }
       // Handle transcript and summary fields
       if (updateData.transcriptUri !== undefined) {
@@ -515,8 +449,23 @@ export class RDSService {
       }
       // Handle additional data (merge with existing)
       if (updateData.additionalData !== undefined) {
+        // Fetch existing additionalData from DB
+        let existingAdditionalData = {};
+        try {
+          const result = await client.query(
+            'SELECT "additionalData" FROM public."Episodes" WHERE "episodeId" = $1',
+            [episodeId]
+          );
+          if (result.rows.length > 0 && result.rows[0].additionalData) {
+            existingAdditionalData = result.rows[0].additionalData;
+          }
+        } catch (err) {
+          logger.warn(`Could not fetch existing additionalData for episode ${episodeId}: ${err}`);
+        }
+        // Merge new additionalData into existing
+        const mergedAdditionalData = { ...existingAdditionalData, ...updateData.additionalData };
         updateFields.push(`"additionalData" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.additionalData));
+        values.push(JSON.stringify(mergedAdditionalData));
       }
       // Handle soft delete
       if (updateData.deletedAt !== undefined) {
@@ -527,11 +476,9 @@ export class RDSService {
       updateFields.push(`"updatedAt" = $${paramIndex++}`);
       values.push(new Date().toISOString());
       if (updateFields.length === 1) {
-        // Only updatedAt field, no actual changes
         logger.info(`No fields to update for episode: ${episodeId}`);
         return;
       }
-      // Add episodeId as the last parameter for WHERE clause
       values.push(episodeId);
       const query = `
         UPDATE public."Episodes" 
@@ -558,20 +505,20 @@ export class RDSService {
    */
   async updateEpisodeWithGuestExtraction(episodeId: string, extractionResult: GuestExtractionResult): Promise<void> {
     try {
-      logger.info(`Updating episode ${episodeId} with guest extraction results`);
-      
+      logger.info(`Updating episode ${episodeId} with guest extraction results: ${JSON.stringify(extractionResult, null, 2)}`);
+
       // Prepare guest data for RDS
       const guestNames = extractionResult.guest_names;
       const guestDescriptions = guestNames.map(name => {
         const guestDetail = extractionResult.guest_details[name];
-        return guestDetail?.description || 'No description available';
+        return guestDetail?.guestDescription || 'No description available';
       });
 
       // Prepare guest images data
-      const guestImages = guestNames.map(name => {
+      const guestImageUrl = guestNames.map(name => {
         const guestDetail = extractionResult.guest_details[name];
-        if (guestDetail?.image?.s3Url) {
-          return guestDetail.image.s3Url;
+        if (guestDetail?.guestImage) {
+          return guestDetail.guestImage?.s3Url || guestDetail.guestImage || null; 
         }
         return null;
       }).filter(Boolean);
@@ -583,21 +530,17 @@ export class RDSService {
         successfulEnrichments: Object.keys(extractionResult.guest_details).length,
         confidenceBreakdown: this.calculateConfidenceBreakdown(extractionResult.guest_details),
         topicsExtracted: extractionResult.topics.length,
-        hasGuestImages: guestImages.length > 0,
-        guestImageCount: guestImages.length
+        hasGuestImages: guestImageUrl.length > 0,
+        guestImageCount: guestImageUrl.length
       };
 
-      // Get existing additional data to merge
-      const existingEpisode = await this.getEpisode(episodeId);
-      const existingAdditionalData = existingEpisode?.additionalData || {};
 
       const updateData = {
         guests: guestNames,
         guestDescriptions: guestDescriptions,
-        guestImages: guestImages, 
+        guestImageUrl: guestImageUrl, 
         topics: extractionResult.topics,
         additionalData: {
-          ...existingAdditionalData,
           guestEnrichmentMetadata: enrichmentMetadata,
           extractedDescription: extractionResult.description
         }
@@ -605,7 +548,7 @@ export class RDSService {
 
       await this.updateEpisode(episodeId, updateData);
       
-      logger.info(`Updated episode ${episodeId} with ${guestNames.length} guests, ${extractionResult.topics.length} topics, and ${guestImages.length} guest images`);
+      logger.info(`Updated episode ${episodeId} with ${guestNames.length} guests, ${extractionResult.topics.length} topics, and ${guestImageUrl.length} guest images`);
       
     } catch (error) {
       logger.error(`Failed to update episode ${episodeId} with guest extraction results:`, error as Error);
@@ -616,7 +559,7 @@ export class RDSService {
    * Insert a new guest record into the database
    */
   async insertGuest(guest: GuestRecord): Promise<void> {
-    const client = this.getClient();
+    const client = await this.getClient();
     try {
       const query = `
         INSERT INTO public."Guests" (
@@ -682,6 +625,9 @@ export class RDSService {
         if (!guestDetail) continue;
         // Check if guest exists
         const existingGuest = await this.getGuestByName(name);
+        if (existingGuest){
+          logger.info(existingGuest.guestDescription)
+        }
         if (!existingGuest) {
           await this.insertGuest({
             guestName: name,

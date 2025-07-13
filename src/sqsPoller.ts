@@ -82,6 +82,26 @@ class JobTracker {
 const jobTracker = new JobTracker(MAX_CONCURRENT_JOBS);
 
 /**
+ * Move a failed SQS message to the Dead Letter Queue (DLQ)
+ */
+async function moveToDLQ(message: Message): Promise<void> {
+  if (!sqsService || !process.env.SQS_DLQ_URL || !message.Body) {
+    logger.error('DLQ move failed: SQS service, DLQ URL, or message body missing');
+    return;
+  }
+  try {
+    await sqsService.sendMessage(process.env.SQS_DLQ_URL, { Body: message.Body });
+    logger.info('Moved failed message to DLQ');
+    // Delete from main queue after moving to DLQ
+    if (message.ReceiptHandle) {
+      await sqsService.deleteMessage(message.ReceiptHandle);
+    }
+  } catch (err: any) {
+    logger.error('Failed to move message to DLQ:', err);
+  }
+}
+
+/**
  * Process an SQS message
  */
 async function handleSQSMessage(message: Message): Promise<boolean> {
@@ -141,17 +161,14 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         .then(() => {
           logger.info(`Video enrichment ${jobData.id} completed successfully`);
           jobTracker.completeJob(trackingJobId);
-          
-          // Poll for new messages if we have capacity
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
         })
-        .catch(error => {
+        .catch(async error => {
           logger.error(`Error processing video enrichment job ${jobData.id}: ${error.message}`, undefined, { error });
           jobTracker.completeJob(trackingJobId);
-          
-          // Poll for new messages if we have capacity
+          await moveToDLQ(message);
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -188,17 +205,14 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         .then(() => {
           logger.info(`New entry creation ${generatedJobId} completed successfully`);
           jobTracker.completeJob(trackingJobId);
-          
-          // Poll for new messages if we have capacity
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
         })
-        .catch(error => {
+        .catch(async error => {
           logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
           jobTracker.completeJob(trackingJobId);
-          
-          // Poll for new messages if we have capacity
+          await moveToDLQ(message);
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -248,17 +262,14 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       .then(() => {
         logger.info(`Legacy job ${jobData.jobId} completed successfully`);
         jobTracker.completeJob(jobData.jobId!);
-        
-        // Poll for new messages if we have capacity
         if (jobTracker.canAcceptMoreJobs()) {
           pollSQSMessages();
         }
       })
-      .catch(error => {
+      .catch(async error => {
         logger.error(`Error processing legacy job ${jobData.jobId}: ${error.message}`, undefined, { error });
         jobTracker.completeJob(jobData.jobId!);
-        
-        // Poll for new messages if we have capacity
+        await moveToDLQ(message);
         if (jobTracker.canAcceptMoreJobs()) {
           pollSQSMessages();
         }
@@ -272,6 +283,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     return true;
   } catch (error: any) {
     logger.error(`Error handling SQS message: ${error.message}`, undefined, { error });
+    await moveToDLQ(message);
     return false; // Keep in queue
   }
 }

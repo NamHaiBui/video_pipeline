@@ -388,7 +388,6 @@ export class GuestExtractionService {
         const newGuests = extractionResult.guest_names.filter(name => !existsMap[name]);
         if (newGuests.length === 0) {
             logger.info("No new guests found, skipping bio and image fetching.");
-            return {};
         }
         logger.info(`Fetching bios and images for ${newGuests.length} NEW guests...`);
         const guestDetails: Record<string, any> = {};
@@ -396,9 +395,9 @@ export class GuestExtractionService {
             if (existsMap[name] && guestInfoMap[name]) {
                 guestDetails[name] = {
                     ID: guestInfoMap[name].guestName,
-                    description: guestInfoMap[name].guestDescription,
+                    guestDescription: guestInfoMap[name].guestDescription,
                     confidence: 'high',
-                    image: { s3Url: guestInfoMap[name].guestImage },
+                    guestImage: { s3Url: guestInfoMap[name].guestImage },
                     guestLanguage: guestInfoMap[name].guestLanguage
                 };
             } else {
@@ -411,11 +410,10 @@ export class GuestExtractionService {
                 const imageResult = await this.processGuestImage(name, bioInfo.description, guestUuid);
                 guestDetails[name] = {
                     ID: guestUuid,
-                    description: bioInfo.description,
+                    guestDescription: bioInfo.description,
                     confidence: bioInfo.confidence,
-                    image: imageResult
+                    guestImage: imageResult
                 };
-                // Upload new guest to RDS
                 const guestRecord: GuestRecord = {
                     guestId: guestUuid,
                     guestName: name,
@@ -429,6 +427,7 @@ export class GuestExtractionService {
             }
         }
         logger.info("All guest bios and images processed.");
+        logger.info(`Final guest details: ${JSON.stringify(guestDetails, null, 2)}`);
         return guestDetails;
     }
 

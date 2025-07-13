@@ -369,7 +369,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         
       }
       
-      const {mergedFilePath, episodePK, episodeSK} = await downloadAndMergeVideo(channelId, url,
+      const {mergedFilePath, episodeId} = await downloadAndMergeVideo(channelId, url,
         {
         outputDir: downloadsDir,
         outputFilename: outputFilename,
@@ -526,21 +526,21 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     logger.info(`Video+audio download completed: ${videoPath}`);
 
     // 4. Update RDS entry with video file name
-    let episodeUrl: string;
+    let episodeUri: string;
     if (isS3Enabled && !path.isAbsolute(videoPath)) {
-      episodeUrl = `https://${process.env.S3_BUCKET_NAME}.s3.us-east-1.amazonaws.com/${videoPath}`;
-      logger.info(`Using S3 URL for RDS: ${episodeUrl}`);
+      episodeUri = `https://${process.env.S3_BUCKET_NAME}.s3.us-east-1.amazonaws.com/${videoPath}`;
+      logger.info(`Using S3 URL for RDS: ${episodeUri}`);
     } else {
       // Local path returned, convert to relative path
-      episodeUrl = path.relative(downloadsDir, videoPath);
-      logger.info(`Using relative local path for RDS: ${episodeUrl}`);
+      episodeUri = path.relative(downloadsDir, videoPath);
+      logger.info(`Using relative local path for RDS: ${episodeUri}`);
     }
     
     await rdsService.updateEpisode(episodeId, {
-      episodeUri: episodeUrl,
+      episodeUri: episodeUri,
     });
 
-    logger.info(`Updated episode ${episodeId} with episodeUrl: ${episodeUrl}`);
+    logger.info(`Updated episode ${episodeId} with episodeUri: ${episodeUri}`);
   } catch (error: any) {
     logger.error(`Failed to download video for existing episode ${episodeId}: ${error.message}`, error);
     

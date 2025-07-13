@@ -42,7 +42,7 @@ export function getPublicUrl(bucket: string, key: string): string {
  * Generate S3 key for video files using unified naming convention
  * Format: [prefix]podcast-title-slug/episode-title-slug/original/video/master.{extension}
  */
-export function generateVideoS3Key(metadata: VideoMetadata, extension: string, customFilename?: string,): string {
+export function generateVideoS3Key(metadata: VideoMetadata, extension: string, videoDefinition:string,customFilename?: string,): string {
   const config = getS3KeyConfig();
   const podcastTitleSlug = create_slug(metadata.uploader);
   const episodeTitleSlug = customFilename ? create_slug(customFilename) : create_slug(metadata.title);
@@ -50,7 +50,7 @@ export function generateVideoS3Key(metadata: VideoMetadata, extension: string, c
   // Ensure extension starts with a dot
   const normalizedExtension = extension.startsWith('.') ? extension : `.${extension}`;
 
-  const key = `${podcastTitleSlug}/${episodeTitleSlug}/original/videos/master${normalizedExtension}`;
+  const key = `${podcastTitleSlug}/${episodeTitleSlug}/original/videos/${videoDefinition}${normalizedExtension}`;
   return config.videoPrefix ? `${config.videoPrefix}${key}` : key;
 }
 

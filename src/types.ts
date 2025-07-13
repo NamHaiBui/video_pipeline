@@ -345,11 +345,11 @@ export interface RDSEpisodeData {
   /** Description/summary of the episode */
   episodeDescription: string;
   /** S3 URL for the episode thumbnail image */
-  episodeThumbnailImageUrl?: string;
+  episodeImages?: string;
   /** S3 URL for the episode (audio/video file) */
-  episodeUrl?: string;
+  episodeUri?: string;
   /** Original URL from the source site */
-  originalUrl: string;
+  originalUri: string;
   /** Duration in milliseconds */
   durationMillis: number;
   /** When the episode was published */
@@ -382,7 +382,7 @@ export interface RDSEpisodeData {
   /** Array of guest descriptions (as JSON) */
   guestDescriptions?: string[];
   /** S3 URL for guest images (as JSON) */
-  guestImages?: string[];
+  guestImageUrl?: string[];
   
   /** Array of topics/tags (as JSON) */
   topics?: string[];

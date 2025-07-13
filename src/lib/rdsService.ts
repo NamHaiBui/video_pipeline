@@ -91,6 +91,7 @@ export interface EpisodeRecord {
   sk?: string; // Sort key: METADATA
   originalUri?: string; // Alias for originalUrl
   episodeUri?: string; // Alias for episodeUrl
+  episodeImages?: string[]; // S3 URLs for episode images
 }
 export interface GuestRecord {
   guestId?: string; 
@@ -202,7 +203,7 @@ export class RDSService {
       const episodeData: Partial<EpisodeRecord> = {
         episodeId,
         episodeTitle: messageBody.episodeTitle,
-        episodeDescription: metadata?.description || '',
+        episodeDescription: sanitizeDescription(metadata?.description || ''),
         hostName: messageBody.hostName,
         hostDescription: messageBody.hostDescription,
         channelName: messageBody.channelName,
@@ -213,7 +214,7 @@ export class RDSService {
         country: messageBody.country,
         genre: messageBody.genre,
         durationMillis: metadata?.duration ? metadata.duration * 1000 : 0,
-        rssUrl: undefined, // Can be set later
+        rssUrl: undefined, 
         contentType: messageBody.contentType || 'Video',
         processingDone: false,
         isSynced: false,
@@ -230,66 +231,60 @@ export class RDSService {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         deletedAt: null,
+        episodeImages: [], // Set to empty array or populate as needed
       };
 
-      // Insert into database using correct column names
+      // Insert into database using correct column names (updated schema)
       const query = `
         INSERT INTO public."Episodes" (
-          "episodeId", "episodeTitle", "episodeDescription", "episodeThumbnailImageUrl",
-          "episodeUrl", "originalUrl", "durationMillis", "publishedDate", "createdAt", "updatedAt", "deletedAt",
-          "channelId", "channelName", "rssUrl", "channelThumbnailUrl",
-          "hostName", "hostDescription", "hostImageUrl",
-          "guests", "guestDescriptions", "guestImages",
-          "topics", "summaryMetadata",
-          "country", "genre", "languageCode",
-          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
-          "contentType", "processingInfo", "additionalData", "processingDone", "isSynced"
+          "episodeId", "episodeTitle", "episodeDescription",
+          "hostName", "hostDescription", "channelName",
+          "guests", "guestDescriptions", "guestImageUrl",
+          "publishedDate", "episodeUri", "originalUri",
+          "channelId", "country", "genre", "episodeImages",
+          "durationMillis", "rssUrl", "transcriptUri", "processedTranscriptUri",
+          "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
+          "topics", "updatedAt", "deletedAt", "createdAt",
+          "processingInfo", "contentType", "additionalData", "processingDone", "isSynced"
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
         )
-        ON CONFLICT ("episodeId") DO UPDATE SET
-          "episodeTitle" = EXCLUDED."episodeTitle",
-          "episodeDescription" = EXCLUDED."episodeDescription",
-          "updatedAt" = EXCLUDED."updatedAt"
+        ON CONFLICT ("episodeId") DO NOTHING
       `;
       
       const values = [
         episodeData.episodeId,                              // $1
         episodeData.episodeTitle,                           // $2
         episodeData.episodeDescription,                     // $3
-        thumbnailUrl,                                       // $4 - episode_thumbnail_image_url
-        episodeData.episodeUrl,                             // $5
-        episodeData.originalUrl,                            // $6
-        episodeData.durationMillis,                         // $7
-        episodeData.publishedDate,                          // $8
-        episodeData.createdAt,                              // $9
-        episodeData.updatedAt,                              // $10
-        episodeData.deletedAt,                              // $11
-        episodeData.channelId,                              // $12
-        episodeData.channelName,                            // $13
-        episodeData.rssUrl,                                 // $14
-        null,                                               // $15 - channel_thumbnail_url
-        episodeData.hostName,                               // $16
-        episodeData.hostDescription,                        // $17
-        null,                                               // $18 - host_image_url
-        null,                                               // $19 - guests (JSON)
-        null,                                               // $20 - guest_descriptions (JSON)
-        null,                                               // $21 - guest_images (JSON)
-        null,                                               // $22 - topics (JSON)
-        null,                                               // $23 - summary_metadata (JSON)
-        episodeData.country,                                // $24
-        episodeData.genre,                                  // $25
-        'en',                                               // $26 - language_code
-        null,                                               // $27 - transcript_uri
-        null,                                               // $28 - processed_transcript_uri
-        null,                                               // $29 - summary_audio_uri
-        null,                                               // $30 - summary_duration_millis
-        null,                                               // $31 - summary_transcript_uri
-        episodeData.contentType,                            // $32
-        JSON.stringify(episodeData.processingInfo),         // $33
-        JSON.stringify(episodeData.additionalData),         // $34
-        episodeData.processingDone,                         // $35
-        episodeData.isSynced,                               // $36
+        episodeData.hostName,                               // $4
+        episodeData.hostDescription,                        // $5
+        episodeData.channelName,                            // $6
+        episodeData.guests || [],                           // $7 (text[])
+        episodeData.guestDescriptions || [],                // $8 (text[])
+        episodeData.guestImages || [],                      // $9 (text[])
+        episodeData.publishedDate ? new Date(episodeData.publishedDate) : null, // $10 (timestamp)
+        episodeData.episodeUrl,                             // $11 (episodeUri)
+        episodeData.originalUrl,                            // $12 (originalUri)
+        episodeData.channelId,                              // $13
+        episodeData.country,                                // $14
+        episodeData.genre,                                  // $15
+        episodeData.episodeImages || [],                    // $16 (text[])
+        episodeData.durationMillis,                         // $17
+        episodeData.rssUrl,                                 // $18
+        episodeData.transcriptUri,                          // $19
+        episodeData.processedTranscriptUri,                 // $20
+        episodeData.summaryAudioUri,                        // $21
+        episodeData.summaryDurationMillis,                  // $22
+        episodeData.summaryTranscriptUri,                   // $23
+        episodeData.topics || [],                           // $24 (text[])
+        new Date().toISOString(),                           // $25 (updatedAt)
+        episodeData.deletedAt,                              // $26
+        new Date().toISOString(),                           // $27 (createdAt)
+        JSON.stringify(episodeData.processingInfo),         // $28 (jsonb)
+        episodeData.contentType,                            // $29
+        JSON.stringify(episodeData.additionalData),         // $30 (jsonb)
+        episodeData.processingDone,                         // $31
+        episodeData.isSynced                                // $32
       ];
       
       await client.query(query, values);
@@ -300,8 +295,6 @@ export class RDSService {
     } catch (error) {
       logger.error(`Failed to store episode:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
     }
   }
 
@@ -403,8 +396,6 @@ export class RDSService {
     } catch (error) {
       logger.error(`Failed to fetch episode ${episodeId}:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
     }
   }
 
@@ -559,8 +550,6 @@ export class RDSService {
     } catch (error) {
       logger.error(`Failed to update episode ${episodeId}:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
     }
   }
   
@@ -632,7 +621,7 @@ export class RDSService {
       const query = `
         INSERT INTO public."Guests" (
           "guestId", "guestName", "guestDescription", "guestImage", "guestLanguage"
-        ) VALUES ($1, $2, $3, $4,$5)
+        ) VALUES ($1, $2, $3, $4, $5)
       `;
       await client.query(query, [
         guest.guestId || uuidv4(),  
@@ -733,4 +722,28 @@ export function createRDSServiceFromEnv(): RDSService | null {
   };
 
   return new RDSService(config);
+}
+
+/**
+ * Sanitize description for PostgreSQL storage by normalizing the string,
+ * removing control characters, and collapsing whitespace.
+ */
+function sanitizeDescription(description: string): string {
+  if (!description) {
+    return '';
+  }
+
+  // 1. Normalize to NFC for a consistent Unicode representation. This is a
+  // best practice for storing text to avoid issues with characters that
+  // can be represented in multiple ways.
+  const normalized = description.normalize('NFC');
+
+  // 2. Replace all Unicode control characters (\p{C}), including the null
+  // byte (\u0000) that PostgreSQL specifically forbids, with a space.
+  // The 'u' flag is required for Unicode property escapes like \p{C}.
+  const replaced = normalized.replace(/\p{C}/gu, ' ');
+
+  // 3. Collapse consecutive whitespace characters into a single space
+  // and trim any leading or trailing whitespace.
+  return replaced.replace(/\s+/g, ' ').trim();
 }

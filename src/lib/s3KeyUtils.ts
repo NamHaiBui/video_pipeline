@@ -68,7 +68,7 @@ export function generateThumbnailS3Key(metadata: VideoMetadata, customFilename?:
   const podcastTitleSlug = create_slug(metadata.uploader);
   const episodeTitleSlug = customFilename ? create_slug(customFilename) : create_slug(metadata.title);
 
-  const key = `Thumbnails/${podcastTitleSlug}/${episodeTitleSlug}.jpg`;
+  const key = `${podcastTitleSlug}/${episodeTitleSlug}/original/image/${episodeTitleSlug}.jpg`;
   return config.videoPrefix ? `${config.videoPrefix}${key}` : key;
 }
 

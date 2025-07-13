@@ -5,7 +5,7 @@ import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import { VideoMetadata, ProgressInfo, DownloadOptions, CommandResult, SQSJobMessage } from '../types.js';
 import { S3Service, S3UploadResult, createS3ServiceFromEnv } from './s3Service.js';
-import { RDSService, SQSMessageBody, EpisodeRecord } from './rdsService.js';
+import { RDSService, SQSMessageBody, EpisodeRecord, createRDSServiceFromEnv } from './rdsService.js';
 import { GuestExtractionResult } from './guestExtractionService.js';
 import { isValidYouTubeUrl } from './utils/urlUtils.js';
 import { generateAudioS3Key, generateLowerDefVideoS3Key, generateM3U8S3Key, generateThumbnailS3Key, generateVideoS3Key, getPublicUrl, getS3ArtifactBucket } from './s3KeyUtils.js';
@@ -711,7 +711,7 @@ export function downloadAndMergeVideo(
             const thumbnail_s3_key = generateThumbnailS3Key(videoMetadata);
             logger.info('Uploading thumbnail to S3...');
             try {
-              thumbnail_s3_link = await s3Service.uploadThumbnailToS3(thumbnail!, 'spice-user-content-assets', thumbnail_s3_key)
+              thumbnail_s3_link = await s3Service.uploadThumbnailToS3(thumbnail!, getS3ArtifactBucket(), thumbnail_s3_key)
                 .then(res => res?.location || '');
             } catch (err: any) {
               logger.error('Error uploading thumbnail to S3:', err.message || err);
@@ -918,14 +918,13 @@ export function downloadAndMergeVideo(
               return reject(new Error('Failed to generate S3 key for video upload'));
             }
             const bucketName = getS3ArtifactBucket();
-            // const videoUploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
+            const videoUploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
             // const uploadResult = await s3Service.uploadm3u8ToS3(m3u8PlayList!, bucketName, m3u8Key);
             
             // If both uploads succeed, update the RDS episode with the m3u8
-            if (finalMergedPath) {
+            if (videoUploadResult.success) {
               logger.info(`Starting creating lower definitions and uploading to S3...`);
-              const renderLowerDefinitionResult = await renderingLowerDefinitionVersions(finalMergedPath, videoMetadata!, options, s3Service, bucketName);
-              if (renderLowerDefinitionResult.success) {
+
                 logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
                 try {
                 const rdsService = createRDSServiceFromEnv();
@@ -934,7 +933,7 @@ export function downloadAndMergeVideo(
 
                   logger.info('💾 Updating episode with video S3 URL...');
                   await rdsService.updateEpisode(episodeId, {
-                    episodeUri: renderLowerDefinitionResult.masterPlaylists3Link,
+                    episodeUri: videoUploadResult.location,
                     contentType: 'Video'
                   });
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL`);
@@ -942,9 +941,8 @@ export function downloadAndMergeVideo(
                 } catch (updateError: any) {
                   logger.warn('⚠️ RDS video URL update error:', updateError.message);
                 }
-              } else {
-                logger.warn('⚠️ Lower definition rendering/upload failed');
-              }
+               
+              logger.info(`✅ Merged video uploaded to S3 successfully`, { location: videoUploadResult.location });
               
               
               
@@ -1374,26 +1372,6 @@ export async function downloadVideoWithAudioSimple(videoUrl: string, options: Do
   return downloadedPath;
 }
 
-/**
- * Create RDS service with credentials from environment variables
- */
-function createRDSServiceFromEnv(): RDSService | null {
-  try {
-    const rdsConfig = {
-      host: process.env.RDS_HOST || 'localhost',
-      user: process.env.RDS_USER || 'postgres',
-      password: process.env.RDS_PASSWORD || '',
-      database: process.env.RDS_DATABASE || 'postgres',
-      port: parseInt(process.env.RDS_PORT || '5432'),
-      ssl: process.env.RDS_SSL_ENABLED === 'true' ? { rejectUnauthorized: false } : false,
-    };
-
-    return new RDSService(rdsConfig);
-  } catch (error: any) {
-    logger.error('❌ Failed to create RDS service from environment:', error.message);
-    return null;
-  }
-}
 export async function downloadContent(url: string): Promise<Buffer | null> {
     if (!url) {
         console.error("Error: No URL provided for download.");
@@ -1441,95 +1419,3 @@ const executeCommand = (command: string, args: string[], cwd: string): Promise<v
         });
     });
 };
-
-export async function renderingLowerDefinitionVersions(
-    finalMergedPath: string,
-    metadata: VideoMetadata,
-    options: DownloadOptions,
-    s3Service: S3Service,
-    bucketName: string
-): Promise<{ success: boolean; message?: string; masterPlaylists3Link: string }> {
-
-    const outputDir = path.join(path.dirname(finalMergedPath), 'hls_output');
-    const episodeName = sanitizeFilename(metadata.title);
-    let masterPlaylists3Link = '';
-
-    const renditions = [
-        // { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
-        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
-        { resolution: '854x480', bitrate: '700k', name: '480p' },
-        { resolution: '640x360', bitrate: '400k', name: '360p' },
-    ];
-
-    try {
-        await fsPromises.mkdir(outputDir, { recursive: true });
-
-        for (const rendition of renditions) {
-            logger.info(`🚀 Starting transcode for ${rendition.name}...`);
-            const renditionDir = path.join(outputDir, rendition.name);
-            await fsPromises.mkdir(renditionDir, { recursive: true });
-
-            const ffmpegArgs = [
-                '-i', path.resolve(finalMergedPath),
-                '-vf', `scale=${rendition.resolution}`,
-                '-c:v', 'libx264', '-x264-params', `keyint=48:min-keyint=48:scenecut=0`,
-                '-b:v', rendition.bitrate,
-                '-c:a', 'aac', '-b:a', '96k',
-                '-f', 'hls',
-                '-hls_time', '6',
-                '-hls_playlist_type', 'vod',
-                '-hls_segment_type', 'fmp4',
-                '-hls_segment_filename', 'data%02d.m4s',
-                `${rendition.name}.m3u8`
-            ];
-            await executeCommand(FFMPEG_PATH, ffmpegArgs, renditionDir);
-            logger.info(`✅ Completed transcode for ${rendition.name}.`);
-        }
-
-        logger.info('📜 Generating master playlist...');
-        let masterPlaylistContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
-        for (const rendition of renditions) {
-            const bandwidth = parseInt(rendition.bitrate.replace('k', '')) * 1000;
-            masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${rendition.resolution}\n`;
-            masterPlaylistContent += `${rendition.name}/${rendition.name}.m3u8\n`;
-        }
-        const masterPlaylistPath = path.join(outputDir, 'master.m3u8');
-        await fsPromises.writeFile(masterPlaylistPath, masterPlaylistContent);
-        logger.info('✅ Master playlist created.');
-
-        logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
-        const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
-
-        const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
-            const filePath = path.join(outputDir, relativeFilePath);
-            const fileStat = await fsPromises.stat(filePath);
-            if (fileStat.isFile()) {
-                const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/video/${relativeFilePath.replace(/\\/g, '/')}`;
-                logger.info(`  - Uploading ${relativeFilePath} to ${s3Key}`);
-                return s3Service.uploadFile(filePath, bucketName, s3Key);
-            }
-        });
-            
-        await Promise.all(uploadPromises);
-        logger.info('✅ All files uploaded successfully.');
-
-        const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${episodeName}/video/master.m3u8`;
-        masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
-        logger.info(`🔗 Master Playlist S3 Link: ${masterPlaylists3Link}`);
-        
-        return { success: true, message: 'Lower definition versions rendered and uploaded.', masterPlaylists3Link };
-     } catch (error: any) {
-        logger.error(`❌ Error in renderingLowerDefinitionVersions: ${error.message}`, error);
-        return { success: false, message: error.message, masterPlaylists3Link: '' };
-    } finally {
-        if (true) {
-            try {
-                logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
-                await fsPromises.rm(outputDir, { recursive: true, force: true });
-                logger.info('✅ Cleanup complete.');
-            } catch (cleanupError: any) {
-                logger.error(`❌ Failed to clean up directory ${outputDir}: ${cleanupError.message}`);
-            }
-        }
-    }
-}

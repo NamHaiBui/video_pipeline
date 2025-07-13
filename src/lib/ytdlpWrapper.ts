@@ -15,7 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
+type VideoQuality = '1080p' | '720p' | '480p' | '360p';
 function parseVideoDate(dateString: string): Date | null {
   if (!dateString) return null;
   
@@ -919,12 +919,19 @@ export function downloadAndMergeVideo(
             }
             const bucketName = getS3ArtifactBucket();
             const videoUploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
-            // const uploadResult = await s3Service.uploadm3u8ToS3(m3u8PlayList!, bucketName, m3u8Key);
+            videoDefinition
             
             // If both uploads succeed, update the RDS episode with the m3u8
             if (videoUploadResult.success) {
               logger.info(`Starting creating lower definitions and uploading to S3...`);
-
+              try {
+                  // Ensure only '1080p' or '720p' is passed as originalQuality
+                  const originalQuality: '1080p' | '720p' = videoDefinition === '1080' ? '1080p' : '720p';
+                  await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
+                  logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
+              } catch (renditionError) {
+                  logger.error(`❌ Failed to create and upload lower definition video renditions. This will not stop the main process.`, renditionError instanceof Error ? renditionError : new Error(String(renditionError)));
+              }
                 logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
                 try {
                 const rdsService = createRDSServiceFromEnv();
@@ -1058,6 +1065,7 @@ export function downloadAndMergeVideo(
     }
   });
 }
+
 /**
  * Enhanced mergeVideoAudio function with validation
  */
@@ -1397,25 +1405,84 @@ export async function downloadContent(url: string): Promise<Buffer | null> {
         return null;
     }
 }
-
-const executeCommand = (command: string, args: string[], cwd: string): Promise<void> => {
+/**
+ * Transcodes a video file to a specified resolution using a direct ffmpeg spawn.
+ * @param inputPath - The path to the source video file.
+ * @param outputPath - The path where the transcoded video will be saved.
+ * @param resolution - The target vertical resolution.
+ * @returns A promise that resolves when transcoding is complete.
+ */
+function transcodeRendition(inputPath: string, outputPath: string, resolution: VideoQuality): Promise<void> {
     return new Promise((resolve, reject) => {
-        logger.info(`Executing in CWD (${cwd}): ${command} ${args.join(' ')}`);
-        const proc = spawn(command, args, { cwd, stdio: 'pipe' });
-        let stderrOutput = '';
-        proc.stderr.on('data', (data) => {
-            const msg = data.toString().trim();
-            stderrOutput += msg + '\n';
-            logger.debug(`FFMPEG STDERR: ${msg}`);
+        const height = parseInt(resolution.replace('p', ''), 10);
+        logger.info(`Starting transcoding to ${resolution}...`);
+
+        const args = [
+            '-i', inputPath,
+            '-vf', `scale=-2:${height}`, 
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-y', 
+            outputPath
+        ];
+
+        const ffmpegProcess = spawn(FFMPEG_PATH, args);
+        let ffmpegError = '';
+
+        ffmpegProcess.stderr?.on('data', (data: Buffer) => {
+            ffmpegError += data.toString();
         });
-        proc.on('error', reject);
-        proc.on('close', code => {
+
+        ffmpegProcess.on('error', (error: Error) => {
+            logger.error(`Failed to start ffmpeg process for ${resolution} rendition: ${error.message}`);
+            reject(error);
+        });
+
+        ffmpegProcess.on('close', (code: number | null) => {
             if (code === 0) {
+                logger.info(`Finished transcoding to ${resolution}.`);
                 resolve();
             } else {
-                logger.error(`FFmpeg exited with code ${code}. Stderr: ${stderrOutput}`);
-                reject(new Error(`FFmpeg exited with code ${code}.\nFFmpeg stderr:\n${stderrOutput}`));
+                logger.error(`ffmpeg process for ${resolution} exited with error code ${code}`);
+                logger.error(`ffmpeg error output: ${ffmpegError}`);
+                reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
             }
         });
     });
-};
+}
+async function createAndUploadRenditions(
+    originalFilePath: string,
+    originalQuality: '1080p' | '720p',
+    s3Service: S3Service,
+    metadata: VideoMetadata
+): Promise<void> {
+    const renditionsToCreate: VideoQuality[] = [];
+    if (originalQuality === '1080p') {
+        renditionsToCreate.push('720p');
+    }
+    renditionsToCreate.push('480p', '360p');
+
+    const tempDir = path.dirname(originalFilePath);
+    const createdFiles: string[] = [];
+
+    for (const quality of renditionsToCreate) {
+        const outputFileName = `${path.basename(originalFilePath, path.extname(originalFilePath))}_${quality}.mp4`;
+        const outputFilePath = path.join(tempDir, outputFileName);
+        createdFiles.push(outputFilePath);
+
+        try {
+            // 1. Transcode the video
+            await transcodeRendition(originalFilePath, outputFilePath, quality);
+
+            // 2. Upload the transcoded file
+            const s3Key = generateLowerDefVideoS3Key(metadata, quality);
+            const bucketName = getS3ArtifactBucket();
+            await s3Service.uploadFile(outputFilePath, bucketName, s3Key);
+            logger.info(`✅ Successfully uploaded ${quality} rendition to S3.`);
+
+        } catch (error) {
+            logger.error(`❌ Failed to process ${quality} rendition.`, error instanceof Error ? error : new Error('error instance is undefined'));
+            // Continue to the next rendition even if one fails
+        }
+    }
+  }

@@ -112,7 +112,7 @@ export class S3Service {
       });
 
       const result = await upload.done();
-      const location = result.Key || key;
+      const location = result.Location || `https://${bucket}.s3.${this.config.region}.amazonaws.com/${key}`;
       logger.info(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
       logger.info(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
       

@@ -12,6 +12,7 @@ import { generateAudioS3Key, generateLowerDefVideoS3Key, generateM3U8S3Key, gene
 import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getManifestUrl, getThumbnailUrl } from './utils/utils.js';
 import { logger } from './utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
+import { sendToTranscriptionQueue } from '../sqsPoller.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -799,10 +800,22 @@ export function downloadAndMergeVideo(
                 await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
                 logger.info(`✅ Guest extraction results updated for fallback episode: ${episodeId}`);
               }
+
             }
+            logger.info(`Episode stored with ID: ${episodeId}, Guest info updated: ${updatedGuestInfo}`);
+            if (!episodeId || episodeId.length === 0) {
+              throw new Error('RDS service returned empty episodeId after storing new episode');
+            }
+            // Send message to transcription queue if enabled and audio upload succeeded
+            logger.info('Sending message to transcription queue...');
+            const transcribeSQSMessage = { episodeId: episodeId, audioUri: uploadedAudioInfo.location! };
+            logger.info(`Transcription message: ${JSON.stringify(transcribeSQSMessage).substring(0, 200)}...`);
+            await sendToTranscriptionQueue(transcribeSQSMessage);
+            logger.info('✅ Message sent to transcription queue successfully');
           } else {
             logger.warn('⚠️ RDS service not available, metadata missing, or audio upload failed - skipping episode metadata processing');
           }
+
         } catch (error: any) {
           logger.error(`❌ Error processing episode metadata: ${error.message}`);
         }
@@ -920,20 +933,22 @@ export function downloadAndMergeVideo(
             
             if (videoUploadResult.success) {
               logger.info(`Starting creating lower definitions and uploading to S3...`);
-              try {
+              // try {
                   // Ensure only '1080p' or '720p' is passed as originalQuality
-                  const originalQuality: '1080p' | '720p' = videoDefinition === '1080' ? '1080p' : '720p';
-                  await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
-                  logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
-              } catch (renditionError) {
-                  logger.error(`❌ Failed to create and upload lower definition video renditions. This will not stop the main process.`, renditionError instanceof Error ? renditionError : new Error(String(renditionError)));
-              }
+                const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
+                // await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
+                const renditionResult = await renderingLowerDefinitionVersions(finalMergedPath, videoMetadata, originalQuality, s3Service, bucketName);
+                logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
+              // } catch (renditionError) {
+              //     logger.error(`❌ Failed to create and upload lower definition video renditions. This will not stop the main process.`, renditionError instanceof Error ? renditionError : new Error(String(renditionError)));
+              // }
                 try {
                 const rdsService = createRDSServiceFromEnv();
                 if (rdsService) {
                   logger.info('💾 Updating episode with video S3 URL in additionalData...');
                   await rdsService.updateEpisode(episodeId, {
                       additionalData: {
+                        master_m3u8: renditionResult.masterPlaylists3Link,
                         videoLocation: videoUploadResult.location
                       },
                       contentType: 'Video'
@@ -1447,12 +1462,12 @@ function transcodeRendition(inputPath: string, outputPath: string, resolution: V
 }
 async function createAndUploadRenditions(
     originalFilePath: string,
-    originalQuality: '1080p' | '720p',
+    originalQuality: 1080 | 720,
     s3Service: S3Service,
     metadata: VideoMetadata
 ): Promise<void> {
     const renditionsToCreate: VideoQuality[] = [];
-    if (originalQuality === '1080p') {
+    if (originalQuality === 1080) {
         renditionsToCreate.push('720p');
     }
     renditionsToCreate.push('480p', '360p');
@@ -1481,3 +1496,121 @@ async function createAndUploadRenditions(
         }
     }
   }
+
+export async function renderingLowerDefinitionVersions(
+    finalMergedPath: string,
+    metadata: VideoMetadata,
+    topEdition: 1080 | 720,
+    s3Service: S3Service,
+    bucketName: string
+): Promise<{ success: boolean; message?: string; masterPlaylists3Link: string }> {
+
+    const outputDir = path.join(path.dirname(finalMergedPath), 'hls_output');
+    const episodeName = sanitizeFilename(metadata.title);
+    let masterPlaylists3Link = '';
+
+    const renditions_1080 = [
+        { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
+        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+        { resolution: '854x480', bitrate: '700k', name: '480p' },
+        { resolution: '640x360', bitrate: '400k', name: '360p' },
+    ];
+    const renditions_720 = [
+        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+        { resolution: '854x480', bitrate: '700k', name: '480p' },
+        { resolution: '640x360', bitrate: '400k', name: '360p' },
+    ];
+    try {
+        await fsPromises.mkdir(outputDir, { recursive: true });
+
+        for (const rendition of (topEdition === 1080 ? renditions_1080 : renditions_720)) {
+            logger.info(`🚀 Starting transcode for ${rendition.name}...`);
+            const renditionDir = path.join(outputDir);
+            await fsPromises.mkdir(renditionDir, { recursive: true });
+
+            const ffmpegArgs = [
+                '-i', path.resolve(finalMergedPath),
+                '-vf', `scale=${rendition.resolution}`,
+                '-c:v', 'libx264', '-x264-params', `keyint=48:min-keyint=48:scenecut=0`,
+                '-b:v', rendition.bitrate,
+                '-c:a', 'aac', '-b:a', '96k',
+                '-f', 'hls',
+                '-hls_flags', 'single_file',
+                '-hls_time', '6',
+                '-hls_playlist_type', 'vod',
+                '-hls_segment_type', 'fmp4',
+                `${rendition.name}.m3u8`
+            ];
+            await executeCommand(FFMPEG_PATH, ffmpegArgs, renditionDir);
+            logger.info(`✅ Completed transcode for ${rendition.name}.`);
+        }
+
+        logger.info('📜 Generating master playlist...');
+        let masterPlaylistContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
+        for (const rendition of (topEdition === 1080 ? renditions_1080 : renditions_720)) {
+            const bandwidth = parseInt(rendition.bitrate.replace('k', '')) * 1000;
+            masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${rendition.resolution}\n`;
+            masterPlaylistContent += `${rendition.name}/${rendition.name}.m3u8\n`;
+        }
+        const masterPlaylistPath = path.join(outputDir, 'master.m3u8');
+        await fsPromises.writeFile(masterPlaylistPath, masterPlaylistContent);
+        logger.info('✅ Master playlist created.');
+
+        logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
+        const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
+
+        const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
+            const filePath = path.join(outputDir, relativeFilePath);
+            const fileStat = await fsPromises.stat(filePath);
+            if (fileStat.isFile()) {
+                const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath.replace(/\\/g, '/')}`;
+                logger.info(`  - Uploading ${relativeFilePath} to ${s3Key}`);
+                return s3Service.uploadFile(filePath, bucketName, s3Key);
+            }
+        });
+            
+        await Promise.all(uploadPromises);
+        logger.info('✅ All files uploaded successfully.');
+
+        const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;
+        masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
+        logger.info(`🔗 Master Playlist S3 Link: ${masterPlaylists3Link}`);
+        
+        return { success: true, message: 'Lower definition versions rendered and uploaded.', masterPlaylists3Link };
+     } catch (error: any) {
+        logger.error(`❌ Error in renderingLowerDefinitionVersions: ${error.message}`, error);
+        return { success: false, message: error.message, masterPlaylists3Link: '' };
+    } finally {
+        if (true) {
+            try {
+                logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
+                await fsPromises.rm(outputDir, { recursive: true, force: true });
+                logger.info('✅ Cleanup complete.');
+            } catch (cleanupError: any) {
+                logger.error(`❌ Failed to clean up directory ${outputDir}: ${cleanupError.message}`);
+            }
+        }
+    }
+}
+
+const executeCommand = (command: string, args: string[], cwd: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+        logger.info(`Executing in CWD (${cwd}): ${command} ${args.join(' ')}`);
+        const proc = spawn(command, args, { cwd, stdio: 'pipe' });
+        let stderrOutput = '';
+        proc.stderr.on('data', (data) => {
+            const msg = data.toString().trim();
+            stderrOutput += msg + '\n';
+            logger.debug(`FFMPEG STDERR: ${msg}`);
+        });
+        proc.on('error', reject);
+        proc.on('close', code => {
+            if (code === 0) {
+                resolve();
+            } else {
+                logger.error(`FFmpeg exited with code ${code}. Stderr: ${stderrOutput}`);
+                reject(new Error(`FFmpeg exited with code ${code}.\nFFmpeg stderr:\n${stderrOutput}`));
+            }
+        });
+    });
+};

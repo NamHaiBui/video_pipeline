@@ -101,6 +101,7 @@ async function moveToDLQ(message: Message): Promise<void> {
   }
 }
 
+
 /**
  * Process an SQS message
  */
@@ -284,7 +285,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
   } catch (error: any) {
     logger.error(`Error handling SQS message: ${error.message}`, undefined, { error });
     await moveToDLQ(message);
-    return false; // Keep in queue
+    return true; // Keep in queue
   }
 }
 
@@ -329,7 +330,18 @@ async function pollSQSMessages(): Promise<void> {
     logger.error(`Error polling SQS: ${error.message}`, undefined, { error });
   }
 }
-
+export async function sendToTranscriptionQueue(message: Record<string, string>): Promise<void> {
+  if (!sqsService || !process.env.SQS_TRANSCRIBE_EPISODE_URL || !message.episodeId) {
+    logger.warn('Transcription queue not configured or message missing episodeId');
+    return;
+  }
+  try {
+    await sqsService.sendMessage(JSON.stringify(message), undefined, process.env.SQS_TRANSCRIBE_EPISODE_URL);
+    logger.info(`Sent job ${message.episodeId} to transcription queue`);
+  } catch (err: any) {
+    logger.error(`Failed to send job ${message.episodeId} to transcription queue:`, err);
+  }
+}
 /**
  * Start the SQS polling loop
  */
@@ -377,4 +389,4 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-export { jobTracker, pollSQSMessages };
+export { jobTracker, pollSQSMessages, handleSQSMessage, moveToDLQ };

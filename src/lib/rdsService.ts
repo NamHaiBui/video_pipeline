@@ -258,8 +258,9 @@ export class RDSService {
         episodeData.channelName,                            // $6
         episodeData.guests || [],                           // $7 (text[])
         episodeData.guestDescriptions || [],                // $8 (text[])
-        episodeData.guestImageUrl || [],                      // $9 (text[])
-        episodeData.publishedDate ? new Date(episodeData.publishedDate) : null, // $10 (timestamp)
+        episodeData.guestImageUrl || [],                    // $9 (text[])
+        episodeData.publishedDate ? new Date(episodeData.publishedDate) 
+                                  : null,                   // $10 (timestamp)
         episodeData.episodeUri,                             // $11 (episodeUri)
         episodeData.originalUri,                            // $12 (originalUri)
         episodeData.channelId,                              // $13
@@ -506,7 +507,6 @@ export class RDSService {
   async updateEpisodeWithGuestExtraction(episodeId: string, extractionResult: GuestExtractionResult): Promise<void> {
     try {
       logger.info(`Updating episode ${episodeId} with guest extraction results: ${JSON.stringify(extractionResult, null, 2)}`);
-
       // Prepare guest data for RDS
       const guestNames = extractionResult.guest_names;
       const guestDescriptions = guestNames.map(name => {
@@ -534,7 +534,6 @@ export class RDSService {
         guestImageCount: guestImageUrl.length
       };
 
-
       const updateData = {
         guests: guestNames,
         guestDescriptions: guestDescriptions,
@@ -555,6 +554,7 @@ export class RDSService {
       throw error;
     }
   }
+
   /**
    * Insert a new guest record into the database
    */

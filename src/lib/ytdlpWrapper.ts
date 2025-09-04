@@ -1797,7 +1797,7 @@ export async function renderingLowerDefinitionVersions(
         });
         ffmpegArgs.push('-filter_complex', filterComplexParts.join(';'));
         
-        // 2. Map the processed streams to outputs and set encoding options for each
+  // 2. Map the processed streams to outputs and set encoding options for each
         const streamMapVar: string[] = [];
         
         // Add audio codec selection logic to avoid AAC encoder issues
@@ -1816,11 +1816,14 @@ export async function renderingLowerDefinitionVersions(
         const audioCodecParams = getAudioCodecParams();
         
   const cores = getCpuCores();
-  // Optimize thread allocation: ensure each encoder gets sufficient threads while maximizing parallelism
-  // For single job scenarios, give more threads per encoder; for multiple jobs, balance across renditions
+  // Ensure FFmpeg itself can use all available cores for filtering/muxing as well
+  // Place global threads flag before any inputs/options
+  ffmpegArgs.unshift('-threads', String(cores));
+
+  // Optimize thread allocation: distribute cores across encoders to target ~100% total CPU
+  // Each encoder gets at least 2 threads; otherwise divide cores across renditions without the 50% cap
   const minThreadsPerEncoder = 2;
-  const maxThreadsPerEncoder = Math.max(minThreadsPerEncoder, Math.floor(cores / 2)); // Use up to half cores per encoder
-  const threadsPerEncoder = Math.max(minThreadsPerEncoder, Math.min(maxThreadsPerEncoder, Math.floor(cores / renditions.length)));
+  const threadsPerEncoder = Math.max(minThreadsPerEncoder, Math.floor(cores / renditions.length) || 1);
   renditions.forEach((r, i) => {
             const renditionDir = path.join(outputDir, r.name);
             fsPromises.mkdir(renditionDir, { recursive: true }); // Create sub-directory for each rendition

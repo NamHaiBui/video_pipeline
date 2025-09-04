@@ -1097,6 +1097,9 @@ async function startServer(): Promise<void> {
       console.log(`🛡️ ECS Task Protection: ${isECSDeployment ? 'Enabled' : 'Disabled'}`);
       console.log(`🔒 Shutdown Protection: Enabled (use API endpoints to shutdown)`);
       
+      // Log CPU utilization configuration
+      const { logCpuConfiguration } = await import('./lib/utils/concurrency.js');
+      logCpuConfiguration();
       if (isECSDeployment) {
         console.log(`🔗 ECS Cluster: ${ECS_CLUSTER_NAME}`);
         console.log(`📋 Task ARN: ${ECS_TASK_ARN}`);
@@ -1174,6 +1177,10 @@ async function startServer(): Promise<void> {
       console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
       console.log(`📁 Downloads: http://localhost:${PORT}/downloads/`);
       console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
+      
+      // Log CPU utilization configuration
+      const { logCpuConfiguration } = await import('./lib/utils/concurrency.js');
+      logCpuConfiguration();
       
       // Start SQS polling if enabled
       if (enableSQS) {

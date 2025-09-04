@@ -23,6 +23,8 @@
   "test:concurrency": "tsx scripts/test-concurrency.ts",
   "test:retry": "tsx scripts/test-retry.ts",
   "test:ecs-protection": "tsx scripts/test-ecs-protection.ts",
+  "test:cpu-utilization": "tsx scripts/test-cpu-utilization.ts",
+  "show:performance-comparison": "tsx scripts/performance-comparison.ts",
   "backfill:master": "tsx scripts/backfill-master-m3u8.ts"
   },
   "keywords": [

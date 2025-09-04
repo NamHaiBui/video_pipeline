@@ -175,9 +175,10 @@ export class S3Service {
         }
       }
 
-  // Tune multipart upload for throughput
-  const partSizeBytes = Math.max(5, parseInt(process.env.S3_UPLOAD_PART_SIZE_MB || '16', 10)) * 1024 * 1024;
-  const queueSize = Math.max(1, parseInt(process.env.S3_UPLOAD_QUEUE_SIZE || '8', 10));
+  // Tune multipart upload for maximum throughput based on available CPU/IO capacity
+  const ioConcurrency = computeDefaultConcurrency('io');
+  const partSizeBytes = Math.max(5, parseInt(process.env.S3_UPLOAD_PART_SIZE_MB || '32', 10)) * 1024 * 1024; // Increased default from 16MB to 32MB
+  const queueSize = Math.max(1, parseInt(process.env.S3_UPLOAD_QUEUE_SIZE || String(Math.min(ioConcurrency, 16)), 10)); // Scale with IO capacity, cap at 16
 
   // Use Upload for multipart upload with retry - recreate stream on each attempt
       const result = await withSemaphore(s3Semaphore, 's3_upload', async () => {
@@ -291,7 +292,7 @@ export class S3Service {
         return { success: true, path: destinationPath };
       }
 
-      const partSize = Math.max(5, (opts?.partSizeMB ?? parseInt(process.env.S3_DOWNLOAD_PART_SIZE_MB || '16', 10))) * 1024 * 1024;
+      const partSize = Math.max(5, (opts?.partSizeMB ?? parseInt(process.env.S3_DOWNLOAD_PART_SIZE_MB || '32', 10))) * 1024 * 1024; // Increased default from 16MB to 32MB
       const parts = Math.ceil(totalSize / partSize);
       const dlConcurrency = opts?.concurrency ?? getConcurrencyFromEnv('S3_DOWNLOAD_CONCURRENCY', computeDefaultConcurrency('io'));
 

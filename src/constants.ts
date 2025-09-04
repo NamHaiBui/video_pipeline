@@ -224,11 +224,6 @@ export const HTTP_STATUS = {
 // DOWNLOAD TYPES
 // =============================================================================
 
-export const DOWNLOAD_TYPES = {
-  AUDIO: 'audio',
-  VIDEO: 'video', // Kept for backward compatibility
-  PODCAST: 'podcast',
-} as const;
 
 // =============================================================================
 // TIME CONSTANTS
@@ -412,7 +407,6 @@ export const PODCAST_ENV_VARS = {
 // =============================================================================
 
 export type PodcastFormat = typeof PODCAST.PREFERRED_AUDIO_FORMATS[number];
-export type DownloadType = typeof DOWNLOAD_TYPES[keyof typeof DOWNLOAD_TYPES];
 export type MetricUnit = typeof METRICS.UNITS[keyof typeof METRICS.UNITS];
 export type RetryableError = typeof RETRYABLE_ERRORS[number];
 export type PodcastCategory = typeof PODCAST.CONTENT_CATEGORIES[number];

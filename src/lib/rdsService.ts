@@ -1,4 +1,5 @@
-import { Client } from 'pg';
+import { Client, Pool, PoolClient } from 'pg';
+import { withSemaphore, dbSemaphore } from './utils/concurrency.js';
 import { VideoMetadata, RDSEpisodeData, EpisodeProcessingInfo } from '../types.js';
 import { logger } from './utils/logger.js';
 import { GuestExtractionService, GuestExtractionResult } from './guestExtractionService.js';
@@ -15,6 +16,10 @@ interface RDSConfig {
   database: string;
   port: number;
   ssl?: boolean | { rejectUnauthorized: boolean };
+  // Connection pool settings
+  max?: number;
+  idleTimeoutMillis?: number;
+  connectionTimeoutMillis?: number;
 }
 
 export interface SQSMessageBody {
@@ -24,7 +29,7 @@ export interface SQSMessageBody {
   channelId: string;
   originalUri: string;
   publishedDate: string;
-  contentType: 'Video';
+  contentType: 'video';
   hostName: string;
   hostDescription: string;
   languageCode?: string;
@@ -45,9 +50,9 @@ export interface EpisodeRecord {
   episodeId: string;
   episodeTitle: string;
   episodeDescription: string;
-  episodeThumbnailImageUrl?: string; // S3 URL for episode thumbnail
-  episodeUrl?: string; // S3 URL for episode audio/video file
-  originalUrl: string; // Original source site URL
+  episodeImages?: string[]; // S3 URLs for episode images (text[])
+  episodeUri?: string; // S3 URL for episode audio/video file
+  originalUri: string; // Original source site URL
   durationMillis?: number;
   publishedDate: string; // ISO date string
   createdAt: string; // ISO date string
@@ -63,9 +68,9 @@ export interface EpisodeRecord {
   hostDescription?: string;
   hostImageUrl?: string; // S3 URL for host image
   
-  guests?: string[]; // JSON array of guest names
-  guestDescriptions?: string[]; // JSON array of guest descriptions
-  guestImages?: string[]; // JSON array of S3 URLs for guest images
+  guests?: string[]; // PostgreSQL text[] array
+  guestDescriptions?: string[]; // PostgreSQL text[] array
+  guestImageUrl?: string[]; // JSON string stored in text field
   
   topics?: string[]; // JSON array of topics/tags
   summaryMetadata?: Record<string, any>; // JSON for summary metadata
@@ -80,17 +85,12 @@ export interface EpisodeRecord {
   summaryDurationMillis?: number;
   summaryTranscriptUri?: string; // S3 URL
   
-  contentType: 'Audio' | 'Video';
+  contentType: 'audio' | 'video';
   processingInfo: EpisodeProcessingInfo; // JSON
   additionalData: Record<string, any>; // JSON for future purposes
   processingDone: boolean;
   isSynced: boolean;
-  
-  // Legacy fields for backward compatibility (can be removed later)
-  pk?: string; // Primary key: EPISODE#{episodeId}
-  sk?: string; // Sort key: METADATA
-  originalUri?: string; // Alias for originalUrl
-  episodeUri?: string; // Alias for episodeUrl
+
 }
 export interface GuestRecord {
   guestId?: string; 
@@ -101,8 +101,19 @@ export interface GuestRecord {
 }
 
 /**
- * PostgreSQL-based RDS Service for managing podcast episode data
- * This is a simplified version focusing on core functionality
+ * PostgreSQL-based RDS Service for managing podcast episode data with ACID compliance
+ * 
+ * ACID Properties Implemented:
+ * - Atomicity: All database operations are wrapped in transactions that either complete fully or rollback completely
+ * - Consistency: All data validation and constraints are enforced before committing transactions
+ * - Isolation: READ COMMITTED isolation level prevents dirty reads, with row-level locking for critical operations
+ * - Durability: PostgreSQL's WAL ensures committed transactions survive system failures
+ * 
+ * Additional Features:
+ * - Connection pooling for better performance and resource management
+ * - Automatic retry logic for transient failures (deadlocks, serialization failures)
+ * - Duplicate episode detection with proper locking to prevent race conditions
+ * - Comprehensive error handling with transaction rollback on failures
  */
 export class RDSService {
   
@@ -110,10 +121,42 @@ export class RDSService {
   private config: RDSConfig;
   private guestExtractionService?: GuestExtractionService;
   private client: Client | null = null;
+  private pool: Pool | null = null;
+  private usePool: boolean = false;
 
-  constructor(config: RDSConfig, guestExtractionService?: GuestExtractionService) {
+  constructor(config: RDSConfig, guestExtractionService?: GuestExtractionService, usePool: boolean = false) {
     this.config = config;
     this.guestExtractionService = guestExtractionService;
+    this.usePool = usePool;
+  }
+
+  /**
+   * Initialize the connection pool (recommended for production)
+   */
+  async initPool(): Promise<void> {
+    if (this.pool) return;
+    
+    const poolConfig = {
+      host: this.config.host,
+      user: this.config.user,
+      password: this.config.password,
+      database: this.config.database,
+      port: this.config.port,
+      ssl: this.config.ssl,
+      max: this.config.max || 20,                          // Maximum number of clients in the pool
+      idleTimeoutMillis: this.config.idleTimeoutMillis || 30000,     // Close idle clients after 30 seconds
+      connectionTimeoutMillis: this.config.connectionTimeoutMillis || 2000,  // Return error after 2 seconds if connection cannot be established
+    };
+    
+    this.pool = new Pool(poolConfig);
+    this.usePool = true;
+    
+    // Handle pool errors
+    this.pool.on('error', (err) => {
+      logger.error('Unexpected error on idle client in pool:', err);
+    });
+    
+    logger.info('PostgreSQL connection pool initialized');
   }
 
   /**
@@ -135,86 +178,384 @@ export class RDSService {
   }
 
   /**
-   * Use the global client for all queries
+   * Use either the connection pool or a single client for queries
    */
-  private getClient(): Client {
-    if (!this.client) throw new Error('RDS client not initialized. Call initClient() on startup.');
-    return this.client;
-  }
-  /**
-   * Gracefully close the global RDS client connection (call on server shutdown)
-   */
-  async closeClient(): Promise<void> {
-    if (this.client) {
-      try {
-        await this.client.end();
-        logger.info('Global RDS client connection closed');
-      } catch (error) {
-        logger.error('Error closing RDS client:', error as Error);
+  private async getClient(): Promise<Client | PoolClient> {
+    if (this.usePool && this.pool) {
+      // Return a client from the pool - it will be automatically returned when done
+      return this.pool.connect();
+    } else {
+      // Use single client connection
+      if (!this.client) {
+        await this.initClient();
       }
-      this.client = null;
+      return this.client!;
     }
   }
+
+  /**
+   * Release a client back to the pool (only needed when using pool)
+   */
+  private releaseClient(client: Client | PoolClient): void {
+    if (this.usePool && this.pool && 'release' in client) {
+      (client as PoolClient).release();
+    }
+  }
+
+  /**
+   * Gracefully close all connections (call on server shutdown)
+   */
+  async closeClient(): Promise<void> {
+    try {
+      if (this.pool) {
+        await this.pool.end();
+        logger.info('PostgreSQL connection pool closed');
+        this.pool = null;
+      }
+      
+      if (this.client) {
+        await this.client.end();
+        logger.info('PostgreSQL single client connection closed');
+        this.client = null;
+      }
+    } catch (error) {
+      logger.error('Error closing PostgreSQL connections:', error as Error);
+    }
+  }
+  /**
+   * Check if an episode with the same title already exists for a channel
+   * Returns the episode record with processing status information
+   */
+  async checkEpisodeExists(episodeTitle: string, channelId: string): Promise<EpisodeRecord | null> {
+    let client: Client | PoolClient | null = null;
+    try {
+      client = await this.getClient();
+      logger.info(`Checking if episode exists: "${episodeTitle}" for channel: ${channelId}`);
+      
+      const query = `
+        SELECT "episodeId", "episodeTitle", "channelId", "channelName", "originalUri", "createdAt", "additionalData"
+        FROM public."Episodes"
+        WHERE "episodeTitle" = $1 AND "channelId" = $2 AND "deletedAt" IS NULL
+        ORDER BY "createdAt" DESC
+        LIMIT 1
+      `;
+      
+      const result = await client.query(query, [sanitizeText(episodeTitle), channelId]);
+      
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        logger.info(`Found existing episode: ${row.episodeId} - "${row.episodeTitle}"`);
+        
+        // Parse additionalData to check processing status
+        const additionalData = row.additionalData || {};
+        const hasVideoLocation = additionalData.videoLocation !== undefined;
+        const hasMasterM3u8 = additionalData.master_m3u8 !== undefined;
+        
+        logger.info(`Episode processing status check:`, {
+          episodeId: row.episodeId,
+          hasVideoLocation,
+          hasMasterM3u8,
+          shouldSkipProcessing: hasVideoLocation && hasMasterM3u8,
+          shouldRerunProcessing: hasVideoLocation && !hasMasterM3u8
+        });
+        
+        const episode = {
+          episodeId: row.episodeId,
+          episodeTitle: row.episodeTitle,
+          channelId: row.channelId,
+          channelName: row.channelName,
+          originalUri: row.originalUri,
+          createdAt: row.createdAt,
+          additionalData: additionalData,
+        } as EpisodeRecord;
+        
+        this.releaseClient(client);
+        return episode;
+      }
+      
+      this.releaseClient(client);
+      return null;
+    } catch (error: any) {
+      if (client) {
+        this.releaseClient(client);
+      }
+      logger.error('Error checking episode existence:', error as Error);
+      throw error;
+    }
+  }
+
+  /**
+   * Check episode processing status based on additionalData keys
+   * Returns detailed processing status information
+   */
+  async checkEpisodeProcessingStatus(episodeTitle: string, channelId: string): Promise<{
+    exists: boolean;
+    episode?: EpisodeRecord;
+    shouldSkipProcessing: boolean;
+    shouldRerunProcessing: boolean;
+    reason: string;
+  }> {
+    const episode = await this.checkEpisodeExists(episodeTitle, channelId);
+    
+    if (!episode) {
+      return {
+        exists: false,
+        shouldSkipProcessing: false,
+        shouldRerunProcessing: false,
+        reason: 'Episode does not exist'
+      };
+    }
+    
+    const additionalData = episode.additionalData || {};
+    const hasVideoLocation = additionalData.videoLocation !== undefined;
+    const hasMasterM3u8 = additionalData.master_m3u8 !== undefined;
+    
+    if (hasVideoLocation && hasMasterM3u8) {
+      return {
+        exists: true,
+        episode,
+        shouldSkipProcessing: true,
+        shouldRerunProcessing: false,
+        reason: 'Episode exists with both videoLocation and master_m3u8 keys - processing complete'
+      };
+    }
+    
+    if (hasVideoLocation && !hasMasterM3u8) {
+      return {
+        exists: true,
+        episode,
+        shouldSkipProcessing: false,
+        shouldRerunProcessing: true,
+        reason: 'Episode exists with videoLocation but missing master_m3u8 key - needs reprocessing'
+      };
+    }
+    
+    return {
+      exists: true,
+      episode,
+      shouldSkipProcessing: false,
+      shouldRerunProcessing: false,
+      reason: 'Episode exists but no videoLocation key found - standard processing needed'
+    };
+  }
+
+  /**
+   * Check if an episode with the same youtubeVideoId already exists
+   * Returns the episode record if found
+   */
+  async checkEpisodeExistsByYoutubeVideoId(youtubeVideoId: string): Promise<EpisodeRecord | null> {
+    let client: Client | PoolClient | null = null;
+    try {
+      client = await this.getClient();
+      logger.info(`Checking if episode exists by youtubeVideoId: ${youtubeVideoId}`);
+      
+      const query = `
+        SELECT "episodeId", "episodeTitle", "channelId", "channelName", "originalUri", "createdAt", "additionalData"
+        FROM public."Episodes"
+        WHERE "additionalData"->>'youtubeVideoId' = $1 AND "deletedAt" IS NULL
+        ORDER BY "createdAt" DESC
+        LIMIT 1
+      `;
+      
+      const result = await client.query(query, [youtubeVideoId]);
+      
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        logger.info(`Found existing episode by youtubeVideoId: ${row.episodeId} - "${row.episodeTitle}"`);
+        
+        const episode = {
+          episodeId: row.episodeId,
+          episodeTitle: row.episodeTitle,
+          channelId: row.channelId,
+          channelName: row.channelName,
+          originalUri: row.originalUri,
+          createdAt: row.createdAt,
+          additionalData: row.additionalData || {},
+        } as EpisodeRecord;
+        
+        this.releaseClient(client);
+        return episode;
+      }
+      
+      this.releaseClient(client);
+      return null;
+    } catch (error: any) {
+      if (client) {
+        this.releaseClient(client);
+      }
+      logger.error('Error checking episode existence by youtubeVideoId:', error as Error);
+      throw error;
+    }
+  }
+
   /**
    * Get guest by name from the database
    */
   async getGuestByName(guestName: string): Promise<GuestRecord | null> {
-    const client = this.getClient();
+    let client: Client | PoolClient | null = null;
     try {
+      client = await this.getClient();
+      // Only select guestName, guestDescription, guestImage, guestLanguage (guestId is not needed for lookup)
       const query = `
-        SELECT 
-          "guestName", "guestDescription", "guestImage", "guestLanguage"
+        SELECT "guestName", "guestDescription", "guestImage", "guestLanguage"
         FROM public."Guests"
         WHERE "guestName" = $1
       `;
       const result = await client.query(query, [guestName]);
-      if (result.rows.length === 0) return null;
+      
+      if (result.rows.length === 0) {
+        this.releaseClient(client);
+        return null;
+      }
+      
       const row = result.rows[0];
-      return {
-        guestId: row.guestId,
+      logger.info(`Guest found: ${JSON.stringify(row)}`);
+      const guest = {
         guestName: row.guestName,
         guestDescription: row.guestDescription,
         guestImage: row.guestImage,
         guestLanguage: row.guestLanguage || 'en',
       };
-    } catch (error) {
+      
+      this.releaseClient(client);
+      return guest;
+    } catch (error: any) {
+      if (client) {
+        this.releaseClient(client);
+      }
       logger.error('Error fetching guest by name:', error as Error);
       return null;
     }
   }
   
   /**
-   * Store new episode data from SQS message
+   * Execute a database operation with automatic retry on deadlock
    */
-  async storeNewEpisode(
+  private async executeWithRetry<T>(
+    operation: (client: Client | PoolClient) => Promise<T>,
+    maxRetries: number = 3,
+    baseDelayMs: number = 100
+  ): Promise<T> {
+    let lastError: Error;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      let client: Client | PoolClient | null = null;
+      try {
+        client = await this.getClient();
+        const result = await operation(client);
+        this.releaseClient(client);
+        return result;
+      } catch (error: any) {
+        if (client) {
+          this.releaseClient(client);
+        }
+        lastError = error;
+        
+        // Check if this is a retryable error (deadlock, serialization failure, etc.)
+        const isRetryable = error.code === '40001' || // serialization_failure
+                           error.code === '40P01' || // deadlock_detected
+                           error.code === '55P03';   // lock_not_available
+        
+        if (!isRetryable || attempt === maxRetries) {
+          throw error;
+        }
+        
+        // Exponential backoff with jitter
+        const delay = baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 100;
+        logger.warn(`Database operation failed (attempt ${attempt}/${maxRetries}), retrying in ${delay.toFixed(0)}ms...`, {
+          error: error.message,
+          code: error.code,
+          attempt,
+          maxRetries
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    
+    throw lastError!;
+  }
+
+  /**
+   * Store new episode data from SQS message with automatic retry on conflicts
+   */
+  async storeNewEpisodeWithRetry(
     messageBody: SQSMessageBody,
+    s3AudioLink: string,
     metadata?: VideoMetadata,
     thumbnailUrl?: string
   ): Promise<{ episodeId: string }> {
-    
-    const client = this.getClient();
+    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
+      return this.storeNewEpisodeInternal(client, messageBody, s3AudioLink, metadata, thumbnailUrl);
+    }));
+  }
+
+  /**
+   * Internal implementation of store new episode (for use within transactions)
+   */
+  private async storeNewEpisodeInternal(
+    client: Client | PoolClient,
+    messageBody: SQSMessageBody,
+    s3AudioLink: string,
+    metadata?: VideoMetadata,
+    thumbnailUrl?: string
+  ): Promise<{ episodeId: string }> {
+    // Start transaction with appropriate isolation level
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     
     try {
+      // Check for duplicate episodes first (within transaction)
+      // 1. Check by episode title and channel
+      const existingEpisodeByTitle = await this.checkEpisodeExistsInTransaction(
+        client, 
+        messageBody.episodeTitle, 
+        messageBody.channelId
+      );
+      
+      if (existingEpisodeByTitle) {
+        await client.query('ROLLBACK');
+        logger.warn(`⚠️ Episode already exists by title: "${messageBody.episodeTitle}" for channel: ${messageBody.channelId}`);
+        logger.warn(`Existing episode ID: ${existingEpisodeByTitle.episodeId}, created: ${existingEpisodeByTitle.createdAt}`);
+        throw new Error(`Duplicate episode detected: "${messageBody.episodeTitle}" already exists for this channel`);
+      }
+      
+      // 2. Check by youtubeVideoId if available
+      const youtubeVideoId = messageBody.additionalData?.youtubeVideoId;
+      if (youtubeVideoId) {
+        const existingEpisodeByVideoId = await this.checkEpisodeExistsByYoutubeVideoIdInTransaction(
+          client,
+          youtubeVideoId
+        );
+        
+        if (existingEpisodeByVideoId) {
+          await client.query('ROLLBACK');
+          logger.warn(`⚠️ Episode already exists by youtubeVideoId: ${youtubeVideoId}`);
+          logger.warn(`Existing episode ID: ${existingEpisodeByVideoId.episodeId}, title: "${existingEpisodeByVideoId.episodeTitle}"`);
+          throw new Error(`Duplicate episode detected: youtubeVideoId "${youtubeVideoId}" already exists`);
+        }
+      }
+      
       // Generate episode ID if not provided
       const episodeId = uuidv4();
       
       // Prepare episode data matching the actual database schema
       const episodeData: Partial<EpisodeRecord> = {
         episodeId,
-        episodeTitle: messageBody.episodeTitle,
-        episodeDescription: metadata?.description || '',
+        episodeTitle: sanitizeText(messageBody.episodeTitle),
+        episodeDescription: sanitizeText(metadata?.description || ''),
+        episodeImages: thumbnailUrl ? [thumbnailUrl] : [],
         hostName: messageBody.hostName,
         hostDescription: messageBody.hostDescription,
         channelName: messageBody.channelName,
         channelId: messageBody.channelId,
-        originalUrl: messageBody.originalUri,
+        originalUri: messageBody.originalUri,
         publishedDate: messageBody.publishedDate,
-        episodeUrl: undefined, // Will be set when video/audio is processed
+        episodeUri: s3AudioLink, 
         country: messageBody.country,
         genre: messageBody.genre,
         durationMillis: metadata?.duration ? metadata.duration * 1000 : 0,
-        rssUrl: undefined, // Can be set later
-        contentType: messageBody.contentType || 'Video',
+        rssUrl: undefined, 
+        contentType: messageBody.contentType || 'video',
         processingDone: false,
         isSynced: false,
         processingInfo: {
@@ -232,76 +573,171 @@ export class RDSService {
         deletedAt: null,
       };
 
-      // Insert into database using correct column names
+      // Insert into database using correct column names (updated schema)
       const query = `
         INSERT INTO public."Episodes" (
-          "episodeId", "episodeTitle", "episodeDescription", "episodeThumbnailImageUrl",
-          "episodeUrl", "originalUrl", "durationMillis", "publishedDate", "createdAt", "updatedAt", "deletedAt",
-          "channelId", "channelName", "rssUrl", "channelThumbnailUrl",
-          "hostName", "hostDescription", "hostImageUrl",
-          "guests", "guestDescriptions", "guestImages",
-          "topics", "summaryMetadata",
-          "country", "genre", "languageCode",
-          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
-          "contentType", "processingInfo", "additionalData", "processingDone", "isSynced"
+          "episodeId", "episodeTitle", "episodeDescription",
+          "hostName", "hostDescription", "channelName",
+          "guests", "guestDescriptions", "guestImageUrl",
+          "publishedDate", "episodeUri", "originalUri",
+          "channelId", "country", "genre", "episodeImages",
+          "durationMillis", "rssUrl", "transcriptUri", "processedTranscriptUri",
+          "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
+          "topics", "updatedAt", "deletedAt", "createdAt",
+          "processingInfo", "contentType", "additionalData", "processingDone", "isSynced"
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
         )
-        ON CONFLICT ("episodeId") DO UPDATE SET
-          "episodeTitle" = EXCLUDED."episodeTitle",
-          "episodeDescription" = EXCLUDED."episodeDescription",
-          "updatedAt" = EXCLUDED."updatedAt"
       `;
       
       const values = [
         episodeData.episodeId,                              // $1
         episodeData.episodeTitle,                           // $2
         episodeData.episodeDescription,                     // $3
-        thumbnailUrl,                                       // $4 - episode_thumbnail_image_url
-        episodeData.episodeUrl,                             // $5
-        episodeData.originalUrl,                            // $6
-        episodeData.durationMillis,                         // $7
-        episodeData.publishedDate,                          // $8
-        episodeData.createdAt,                              // $9
-        episodeData.updatedAt,                              // $10
-        episodeData.deletedAt,                              // $11
-        episodeData.channelId,                              // $12
-        episodeData.channelName,                            // $13
-        episodeData.rssUrl,                                 // $14
-        null,                                               // $15 - channel_thumbnail_url
-        episodeData.hostName,                               // $16
-        episodeData.hostDescription,                        // $17
-        null,                                               // $18 - host_image_url
-        null,                                               // $19 - guests (JSON)
-        null,                                               // $20 - guest_descriptions (JSON)
-        null,                                               // $21 - guest_images (JSON)
-        null,                                               // $22 - topics (JSON)
-        null,                                               // $23 - summary_metadata (JSON)
-        episodeData.country,                                // $24
-        episodeData.genre,                                  // $25
-        'en',                                               // $26 - language_code
-        null,                                               // $27 - transcript_uri
-        null,                                               // $28 - processed_transcript_uri
-        null,                                               // $29 - summary_audio_uri
-        null,                                               // $30 - summary_duration_millis
-        null,                                               // $31 - summary_transcript_uri
-        episodeData.contentType,                            // $32
-        JSON.stringify(episodeData.processingInfo),         // $33
-        JSON.stringify(episodeData.additionalData),         // $34
-        episodeData.processingDone,                         // $35
-        episodeData.isSynced,                               // $36
+        episodeData.hostName,                               // $4
+        episodeData.hostDescription,                        // $5
+        episodeData.channelName,                            // $6
+        episodeData.guests || [],                           // $7 (text[])
+        episodeData.guestDescriptions || [],                // $8 (text[])
+        JSON.stringify(episodeData.guestImageUrl || []),     // $9 (JSON string)
+        episodeData.publishedDate ? new Date(episodeData.publishedDate) 
+                                  : null,                   // $10 (timestamp)
+        episodeData.episodeUri,                             // $11 (episodeUri)
+        episodeData.originalUri,                            // $12 (originalUri)
+        episodeData.channelId,                              // $13
+        episodeData.country,                                // $14
+        episodeData.genre,                                  // $15
+        episodeData.episodeImages || [],                    // $16 (text[])
+        episodeData.durationMillis,                         // $17
+        episodeData.rssUrl,                                 // $18
+        episodeData.transcriptUri,                          // $19
+        episodeData.processedTranscriptUri,                 // $20
+        episodeData.summaryAudioUri,                        // $21
+        episodeData.summaryDurationMillis,                  // $22
+        episodeData.summaryTranscriptUri,                   // $23
+        episodeData.topics || [],                           // $24 (text[])
+        new Date().toISOString(),                           // $25 (updatedAt)
+        episodeData.deletedAt,                              // $26
+        new Date().toISOString(),                           // $27 (createdAt)
+        JSON.stringify(episodeData.processingInfo),         // $28 (jsonb)
+        episodeData.contentType,                            // $29
+        JSON.stringify(episodeData.additionalData),         // $30 (jsonb)
+        episodeData.processingDone,                         // $31
+        episodeData.isSynced                                // $32
       ];
       
-      await client.query(query, values);
+      const result = await client.query(query, values);
+      
+      if (result.rowCount !== 1) {
+        throw new Error(`Failed to insert episode: expected 1 row affected, got ${result.rowCount}`);
+      }
+      
+      // Commit the transaction
+      await client.query('COMMIT');
       
       logger.info(`Episode stored successfully: ${episodeId}`);
-
       return { episodeId };
+      
     } catch (error) {
+      // Rollback transaction on any error
+      await client.query('ROLLBACK');
       logger.error(`Failed to store episode:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
+    }
+  }
+
+  /**
+   * Store new episode data from SQS message with ACID compliance
+   */
+  async storeNewEpisode(
+    messageBody: SQSMessageBody,
+    s3AudioLink: string,
+    metadata?: VideoMetadata,
+    thumbnailUrl?: string
+  ): Promise<{ episodeId: string }> {
+    return this.storeNewEpisodeWithRetry(messageBody, s3AudioLink, metadata, thumbnailUrl);
+  }
+
+  /**
+   * Helper method to check episode existence within a transaction
+   */
+  private async checkEpisodeExistsInTransaction(
+    client: Client | PoolClient, 
+    episodeTitle: string, 
+    channelId: string
+  ): Promise<EpisodeRecord | null> {
+    const query = `
+      SELECT "episodeId", "episodeTitle", "channelId", "channelName", "originalUri", "createdAt", "additionalData"
+      FROM public."Episodes"
+      WHERE "episodeTitle" = $1 AND "channelId" = $2 AND "deletedAt" IS NULL
+      ORDER BY "createdAt" DESC
+      LIMIT 1
+      FOR UPDATE NOWAIT
+    `;
+    
+    try {
+      const result = await client.query(query, [sanitizeText(episodeTitle), channelId]);
+      
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        return {
+          episodeId: row.episodeId,
+          episodeTitle: row.episodeTitle,
+          channelId: row.channelId,
+          channelName: row.channelName,
+          originalUri: row.originalUri,
+          createdAt: row.createdAt,
+          additionalData: row.additionalData || {},
+        } as EpisodeRecord;
+      }
+      
+      return null;
+    } catch (error: any) {
+      if (error.code === '55P03') { // lock_not_available
+        throw new Error('Another process is currently creating an episode with the same title. Please retry.');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Helper method to check episode existence by youtubeVideoId within a transaction
+   */
+  private async checkEpisodeExistsByYoutubeVideoIdInTransaction(
+    client: Client | PoolClient,
+    youtubeVideoId: string
+  ): Promise<EpisodeRecord | null> {
+    const query = `
+      SELECT "episodeId", "episodeTitle", "channelId", "channelName", "originalUri", "createdAt", "additionalData"
+      FROM public."Episodes"
+      WHERE "additionalData"->>'youtubeVideoId' = $1 AND "deletedAt" IS NULL
+      ORDER BY "createdAt" DESC
+      LIMIT 1
+      FOR UPDATE NOWAIT
+    `;
+    
+    try {
+      const result = await client.query(query, [youtubeVideoId]);
+      
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        return {
+          episodeId: row.episodeId,
+          episodeTitle: row.episodeTitle,
+          channelId: row.channelId,
+          channelName: row.channelName,
+          originalUri: row.originalUri,
+          createdAt: row.createdAt,
+          additionalData: row.additionalData || {},
+        } as EpisodeRecord;
+      }
+      
+      return null;
+    } catch (error: any) {
+      if (error.code === '55P03') { // lock_not_available
+        throw new Error('Another process is currently creating an episode with the same youtubeVideoId. Please retry.');
+      }
+      throw error;
     }
   }
 
@@ -309,127 +745,120 @@ export class RDSService {
    * Get episode by ID
    */
   async getEpisode(episodeId: string): Promise<EpisodeRecord | null> {
-    const client = this.getClient();
+    let client: Client | PoolClient | null = null;
     
     try {
+      client = await this.getClient();
       logger.info(`Fetching episode: ${episodeId}`);
-      
+
       const query = `
-        SELECT 
-          "episodeId", "episodeTitle", "episodeDescription", "episodeThumbnailImageUrl",
-          "episodeUrl", "originalUrl", "durationMillis", "publishedDate", "createdAt", "updatedAt", "deletedAt",
-          "channelId", "channelName", "rssUrl", "channelThumbnailUrl",
-          "hostName", "hostDescription", "hostImageUrl",
-          "guests", "guestDescriptions", "guestImages",
-          "topics", "summaryMetadata",
-          "country", "genre", "languageCode",
-          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
-          "contentType", "processingInfo", "additionalData", "processingDone", "isSynced"
-        FROM public."Episodes" 
+        SELECT "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt", "guestImageUrl", "additionalData"
+        FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
-      
       const result = await client.query(query, [episodeId]);
       
       if (result.rows.length === 0) {
         logger.info(`Episode not found: ${episodeId}`);
+        this.releaseClient(client);
         return null;
       }
       
       const row = result.rows[0];
       
-      // Parse JSON fields safely
-      const processingInfo = row.processing_info ? JSON.parse(row.processing_info) : {
-        episodeTranscribingDone: false,
-        summaryTranscribingDone: false,
-        summarizingDone: false,
-        numChunks: 0,
-        numRemovedChunks: 0,
-        chunkingDone: false,
-        quotingDone: false
-      };
-      const guests = row.guests ? JSON.parse(row.guests) : [];
-      const guestDescriptions = row.guest_descriptions ? JSON.parse(row.guest_descriptions) : [];
-      const guestImages = row.guest_images ? JSON.parse(row.guest_images) : [];
-      const topics = row.topics ? JSON.parse(row.topics) : [];
-      const summaryMetadata = row.summary_metadata ? JSON.parse(row.summary_metadata) : {};
-      const additionalData = row.additional_data ? JSON.parse(row.additional_data) : {};
+      // Parse guestImageUrl from JSON string to array
+      let guestImageUrl: string[] = [];
+      if (row.guestImageUrl) {
+        try {
+          guestImageUrl = typeof row.guestImageUrl === 'string' 
+            ? JSON.parse(row.guestImageUrl) 
+            : row.guestImageUrl;
+        } catch (error) {
+          logger.warn(`Failed to parse guestImageUrl for episode ${episodeId}:`, error as Error);
+          guestImageUrl = [];
+        }
+      }
       
-      const episode: EpisodeRecord = {
+      const episode: Partial<EpisodeRecord> = {
         episodeId: row.episodeId,
         episodeTitle: row.episodeTitle,
         episodeDescription: row.episodeDescription,
-        episodeThumbnailImageUrl: row.episodeThumbnailImageUrl,
-        episodeUrl: row.episodeUrl,
-        originalUrl: row.originalUrl,
-        durationMillis: row.durationMillis,
+        episodeImages: Array.isArray(row.episodeImages) ? row.episodeImages : (row.episodeImages ? [row.episodeImages] : []),
+        episodeUri: row.episodeUri,
+        originalUri: row.originalUri,
+        channelId: row.channelId,
+        channelName: row.channelName,
         publishedDate: row.publishedDate,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
-        deletedAt: row.deletedAt,
-        channelId: row.channelId,
-        channelName: row.channelName,
-        rssUrl: row.rssUrl,
-        channelThumbnailUrl: row.channelThumbnailUrl,
-        hostName: row.hostName,
-        hostDescription: row.hostDescription,
-        hostImageUrl: row.hostImageUrl,
-        guests: guests,
-        guestDescriptions: guestDescriptions,
-        guestImages: guestImages,
-        topics: topics,
-        summaryMetadata: summaryMetadata,
-        country: row.country,
-        genre: row.genre,
-        languageCode: row.languageCode,
-        transcriptUri: row.transcriptUri,
-        processedTranscriptUri: row.processedTranscriptUri,
-        summaryAudioUri: row.summaryAudioUri,
-        summaryDurationMillis: row.summaryDurationMillis,
-        summaryTranscriptUri: row.summaryTranscriptUri,
-        contentType: row.contentType,
-        processingInfo: processingInfo,
-        additionalData: additionalData,
-        processingDone: row.processingDone,
-        isSynced: row.isSynced,
-        // Legacy fields for backward compatibility
-        originalUri: row.originalUrl, // Alias
-        episodeUri: row.episodeUrl    // Alias
+        guestImageUrl: guestImageUrl,
+        additionalData: row.additionalData || {},
       };
       
       logger.info(`Episode fetched successfully: ${episodeId}`);
-      return episode;
-      
-    } catch (error) {
+      this.releaseClient(client);
+      return episode as EpisodeRecord;
+    } catch (error: any) {
+      if (client) {
+        this.releaseClient(client);
+      }
       logger.error(`Failed to fetch episode ${episodeId}:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
     }
   }
 
   /**
-   * Update episode data
+   * Update episode data with proper transaction handling
    */
   async updateEpisode(episodeId: string, updateData: Partial<EpisodeRecord>): Promise<void> {
-    const client = this.getClient();
+    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
+      return this.updateEpisodeInternal(client, episodeId, updateData);
+    }));
+  }
+
+  /**
+   * Internal implementation of update episode (for use within transactions)
+   */
+  private async updateEpisodeInternal(
+    client: Client | PoolClient,
+    episodeId: string,
+    updateData: Partial<EpisodeRecord>
+  ): Promise<void> {
+    logger.info(`Updating episode: ${episodeId} with data: ${JSON.stringify(updateData, null, 2)}`);
+    
+    // Start transaction with appropriate isolation level
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     
     try {
-      logger.info(`Updating episode: ${episodeId}`);
+      logger.info(`RDS client is available: ${!!client}`);
       
-      // Build SQL update query dynamically based on provided data
+      // First check if episode exists and lock it
+      const episodeExistsQuery = `
+        SELECT "episodeId", "additionalData" 
+        FROM public."Episodes" 
+        WHERE "episodeId" = $1 AND "deletedAt" IS NULL
+        FOR UPDATE NOWAIT
+      `;
+      
+      const existsResult = await client.query(episodeExistsQuery, [episodeId]);
+      
+      if (existsResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Episode not found or deleted: ${episodeId}`);
+      }
+      
       const updateFields: string[] = [];
       const values: any[] = [];
       let paramIndex = 1;
-      //O(1) Run time
+      
       // Handle basic fields
       if (updateData.episodeTitle !== undefined) {
         updateFields.push(`"episodeTitle" = $${paramIndex++}`);
-        values.push(updateData.episodeTitle);
+        values.push(sanitizeText(updateData.episodeTitle));
       }
       if (updateData.episodeDescription !== undefined) {
         updateFields.push(`"episodeDescription" = $${paramIndex++}`);
-        values.push(updateData.episodeDescription);
+        values.push(sanitizeText(updateData.episodeDescription));
       }
       if (updateData.hostName !== undefined) {
         updateFields.push(`"hostName" = $${paramIndex++}`);
@@ -439,13 +868,13 @@ export class RDSService {
         updateFields.push(`"hostDescription" = $${paramIndex++}`);
         values.push(updateData.hostDescription);
       }
-      if (updateData.episodeUrl !== undefined) {
-        updateFields.push(`"episodeUrl" = $${paramIndex++}`);
-        values.push(updateData.episodeUrl);
+      if (updateData.episodeUri !== undefined) {
+        updateFields.push(`"episodeUri" = $${paramIndex++}`);
+        values.push(updateData.episodeUri);
       }
-      if (updateData.originalUrl !== undefined) {
-        updateFields.push(`"originalUrl" = $${paramIndex++}`);
-        values.push(updateData.originalUrl);
+      if (updateData.originalUri !== undefined) {
+        updateFields.push(`"originalUri" = $${paramIndex++}`);
+        values.push(updateData.originalUri);
       }
       if (updateData.contentType !== undefined) {
         updateFields.push(`"contentType" = $${paramIndex++}`);
@@ -478,23 +907,39 @@ export class RDSService {
       // Handle guest-related fields
       if (updateData.guests !== undefined) {
         updateFields.push(`"guests" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guests));
+        values.push(updateData.guests);
+        logger.info(`Storing guests:`, {
+          value: updateData.guests,
+          type: typeof updateData.guests,
+          isArray: Array.isArray(updateData.guests),
+          length: updateData.guests?.length
+        });
       }
       if (updateData.guestDescriptions !== undefined) {
         updateFields.push(`"guestDescriptions" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guestDescriptions));
+        values.push(updateData.guestDescriptions);
+        logger.info(`Storing guestDescriptions:`, {
+          value: updateData.guestDescriptions,
+          type: typeof updateData.guestDescriptions,
+          isArray: Array.isArray(updateData.guestDescriptions),
+          length: updateData.guestDescriptions?.length,
+          sample: updateData.guestDescriptions?.slice(0, 2)
+        });
       }
-      if (updateData.guestImages !== undefined) {
-        updateFields.push(`"guestImages" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.guestImages));
+      if (updateData.guestImageUrl !== undefined) {
+        updateFields.push(`"guestImageUrl" = $${paramIndex++}`);
+        values.push(JSON.stringify(updateData.guestImageUrl));
+        logger.info(`Storing guestImageUrl:`, {
+          value: updateData.guestImageUrl,
+          type: typeof updateData.guestImageUrl,
+          isArray: Array.isArray(updateData.guestImageUrl),
+          length: updateData.guestImageUrl?.length,
+          jsonString: JSON.stringify(updateData.guestImageUrl)
+        });
       }
       if (updateData.topics !== undefined) {
         updateFields.push(`"topics" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.topics));
-      }
-      if (updateData.summaryMetadata !== undefined) {
-        updateFields.push(`"summaryMetadata" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.summaryMetadata));
+        values.push(updateData.topics);
       }
       // Handle transcript and summary fields
       if (updateData.transcriptUri !== undefined) {
@@ -524,8 +969,11 @@ export class RDSService {
       }
       // Handle additional data (merge with existing)
       if (updateData.additionalData !== undefined) {
+        const existingAdditionalData = existsResult.rows[0].additionalData || {};
+        // Merge new additionalData into existing
+        const mergedAdditionalData = { ...existingAdditionalData, ...updateData.additionalData };
         updateFields.push(`"additionalData" = $${paramIndex++}`);
-        values.push(JSON.stringify(updateData.additionalData));
+        values.push(JSON.stringify(mergedAdditionalData));
       }
       // Handle soft delete
       if (updateData.deletedAt !== undefined) {
@@ -535,57 +983,100 @@ export class RDSService {
       // Always update the updatedAt timestamp
       updateFields.push(`"updatedAt" = $${paramIndex++}`);
       values.push(new Date().toISOString());
+      
       if (updateFields.length === 1) {
-        // Only updatedAt field, no actual changes
+        await client.query('ROLLBACK');
         logger.info(`No fields to update for episode: ${episodeId}`);
         return;
       }
-      // Add episodeId as the last parameter for WHERE clause
+      
       values.push(episodeId);
       const query = `
         UPDATE public."Episodes" 
         SET ${updateFields.join(', ')}
-        WHERE "episodeId" = $${paramIndex}
+        WHERE "episodeId" = $${paramIndex} AND "deletedAt" IS NULL
       `;
       
       const result = await client.query(query, values);
       
       if (result.rowCount === 0) {
-        logger.warn(`No episode found with ID: ${episodeId}`);
-      } else {
-        logger.info(`Episode updated successfully: ${episodeId}`);
+        await client.query('ROLLBACK');
+        throw new Error(`Episode not found or deleted: ${episodeId}`);
+      } else if (result.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        throw new Error(`Unexpected update result: expected 1 row affected, got ${result.rowCount}`);
       }
       
-    } catch (error) {
+      // Commit the transaction
+      await client.query('COMMIT');
+      logger.info(`Episode updated successfully: ${episodeId}`);
+      
+    } catch (error: any) {
+      // Rollback transaction on any error
+      await client.query('ROLLBACK');
+      if (error.code === '55P03') { // lock_not_available
+        logger.error(`Episode ${episodeId} is being updated by another process. Please retry.`);
+        throw new Error(`Episode ${episodeId} is currently being updated by another process. Please retry.`);
+      }
       logger.error(`Failed to update episode ${episodeId}:`, error as Error);
       throw error;
-    } finally {
-      await client.end();
     }
   }
   
   /**
-   * Update episode with guest extraction results
+   * Update episode with guest extraction results using transaction
    */
   async updateEpisodeWithGuestExtraction(episodeId: string, extractionResult: GuestExtractionResult): Promise<void> {
+    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
+      return this.updateEpisodeWithGuestExtractionInternal(client, episodeId, extractionResult);
+    }));
+  }
+
+  /**
+   * Internal implementation of update episode with guest extraction (for use within transactions)
+   */
+  private async updateEpisodeWithGuestExtractionInternal(
+    client: Client | PoolClient,
+    episodeId: string,
+    extractionResult: GuestExtractionResult
+  ): Promise<void> {
+    // Start transaction with appropriate isolation level
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    
     try {
-      logger.info(`Updating episode ${episodeId} with guest extraction results`);
+      logger.info(`Updating episode ${episodeId} with guest extraction results: ${JSON.stringify(extractionResult, null, 2)}`);
+      
+      // First verify episode exists and lock it
+      const episodeExistsQuery = `
+        SELECT "episodeId", "additionalData" 
+        FROM public."Episodes" 
+        WHERE "episodeId" = $1 AND "deletedAt" IS NULL
+        FOR UPDATE NOWAIT
+      `;
+      
+      const existsResult = await client.query(episodeExistsQuery, [episodeId]);
+      
+      if (existsResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new Error(`Episode not found or deleted: ${episodeId}`);
+      }
       
       // Prepare guest data for RDS
-      const guestNames = extractionResult.guest_names;
-      const guestDescriptions = guestNames.map(name => {
+      const guestNames: string[] = extractionResult.guest_names;
+      const guestDescriptions: string[] = guestNames.map(name => {
         const guestDetail = extractionResult.guest_details[name];
-        return guestDetail?.description || 'No description available';
+        return guestDetail?.guestDescription || 'No description available';
       });
 
-      // Prepare guest images data
-      const guestImages = guestNames.map(name => {
+      // Prepare guest images data - ensure array alignment with guest names
+      const guestImageUrl: string[] = guestNames.map(name => {
         const guestDetail = extractionResult.guest_details[name];
-        if (guestDetail?.image?.s3Url) {
-          return guestDetail.image.s3Url;
+        if (guestDetail?.guestImage) {
+          const imageUrl = guestDetail.guestImage?.s3Url || guestDetail.guestImage;
+          return typeof imageUrl === 'string' ? imageUrl : '';
         }
-        return null;
-      }).filter(Boolean);
+        return '';
+      }).filter(url => url !== ''); 
 
       // Prepare enrichment metadata
       const enrichmentMetadata = {
@@ -594,56 +1085,217 @@ export class RDSService {
         successfulEnrichments: Object.keys(extractionResult.guest_details).length,
         confidenceBreakdown: this.calculateConfidenceBreakdown(extractionResult.guest_details),
         topicsExtracted: extractionResult.topics.length,
-        hasGuestImages: guestImages.length > 0,
-        guestImageCount: guestImages.length
+        hasGuestImages: guestImageUrl.length > 0,
+        guestImageCount: guestImageUrl.length
       };
 
-      // Get existing additional data to merge
-      const existingEpisode = await this.getEpisode(episodeId);
-      const existingAdditionalData = existingEpisode?.additionalData || {};
+      // Merge additional data with existing
+      const existingAdditionalData = existsResult.rows[0].additionalData || {};
+      const mergedAdditionalData = {
+        ...existingAdditionalData,
+        guestEnrichmentMetadata: enrichmentMetadata,
+        extractedDescription: extractionResult.description
+      };
 
-      const updateData = {
+      // Log the arrays being stored for debugging
+      logger.info(`Storing guest data:`, {
         guests: guestNames,
         guestDescriptions: guestDescriptions,
-        guestImages: guestImages, 
-        topics: extractionResult.topics,
-        additionalData: {
-          ...existingAdditionalData,
-          guestEnrichmentMetadata: enrichmentMetadata,
-          extractedDescription: extractionResult.description
-        }
-      };
+        guestImageUrl: guestImageUrl,
+        guestImageUrlType: Array.isArray(guestImageUrl) ? 'array' : typeof guestImageUrl,
+        guestImageUrlLength: guestImageUrl.length,
+        guestDescriptionsType: Array.isArray(guestDescriptions) ? 'array' : typeof guestDescriptions,
+        guestDescriptionsLength: guestDescriptions.length
+      });
 
-      await this.updateEpisode(episodeId, updateData);
+      // Update the episode with all guest data
+      const updateQuery = `
+        UPDATE public."Episodes" 
+        SET 
+          "guests" = $1,
+          "guestDescriptions" = $2,
+          "guestImageUrl" = $3,
+          "topics" = $4,
+          "additionalData" = $5,
+          "updatedAt" = $6
+        WHERE "episodeId" = $7 AND "deletedAt" IS NULL
+      `;
       
-      logger.info(`Updated episode ${episodeId} with ${guestNames.length} guests, ${extractionResult.topics.length} topics, and ${guestImages.length} guest images`);
+      const updateValues = [
+        guestNames,                           // $1 (text[])
+        guestDescriptions,                    // $2 (text[])
+        JSON.stringify(guestImageUrl),        // $3 (JSON string)
+        extractionResult.topics,              // $4 (text[])
+        JSON.stringify(mergedAdditionalData), // $5 (jsonb)
+        new Date().toISOString(),             // $6 (timestamp)
+        episodeId                             // $7
+      ];
       
-    } catch (error) {
+      const updateResult = await client.query(updateQuery, updateValues);
+      
+      if (updateResult.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        throw new Error(`Failed to update episode ${episodeId}: expected 1 row affected, got ${updateResult.rowCount}`);
+      }
+      
+      // Commit the transaction
+      await client.query('COMMIT');
+      
+      logger.info(`Updated episode ${episodeId} with ${guestNames.length} guests, ${extractionResult.topics.length} topics, and ${guestImageUrl.length} guest images`);
+      
+    } catch (error: any) {
+      // Rollback transaction on any error
+      await client.query('ROLLBACK');
+      if (error.code === '55P03') { // lock_not_available
+        logger.error(`Episode ${episodeId} is being updated by another process during guest extraction. Please retry.`);
+        throw new Error(`Episode ${episodeId} is currently being updated by another process. Please retry guest extraction.`);
+      }
       logger.error(`Failed to update episode ${episodeId} with guest extraction results:`, error as Error);
       throw error;
     }
   }
+
   /**
-   * Insert a new guest record into the database
+   * Insert a new guest record into the database with transaction handling
    */
   async insertGuest(guest: GuestRecord): Promise<void> {
-    const client = this.getClient();
+    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
+      return this.insertGuestInternal(client, guest);
+    }));
+  }
+
+  /**
+   * Internal implementation of insert guest (for use within transactions)
+   */
+  private async insertGuestInternal(client: Client | PoolClient, guest: GuestRecord): Promise<void> {
+    // Start transaction
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    
     try {
-      const query = `
-        INSERT INTO public."Guests" (
-          "guestId", "guestName", "guestDescription", "guestImage", "guestLanguage"
-        ) VALUES ($1, $2, $3, $4,$5)
+      // Check if guest already exists
+      const existsQuery = `
+        SELECT "guestId" 
+        FROM public."Guests" 
+        WHERE "guestName" = $1
+        FOR UPDATE NOWAIT
       `;
-      await client.query(query, [
-        guest.guestId || uuidv4(),  
-        guest.guestName,
-        guest.guestDescription,
-        guest.guestImage,
-        guest.guestLanguage
-      ]);
-      logger.info(`Guest inserted/updated: ${guest.guestName}`);
-    } catch (error) {
+      
+      const existsResult = await client.query(existsQuery, [guest.guestName]);
+      
+      if (existsResult.rows.length > 0) {
+        // Update existing guest
+        const updateQuery = `
+          UPDATE public."Guests" 
+          SET 
+            "guestDescription" = $1,
+            "guestImage" = $2,
+            "guestLanguage" = $3
+          WHERE "guestName" = $4
+        `;
+        
+        await client.query(updateQuery, [
+          guest.guestDescription,
+          guest.guestImage,
+          guest.guestLanguage,
+          guest.guestName
+        ]);
+        
+        logger.info(`Guest updated: ${guest.guestName}`);
+      } else {
+        // Insert new guest
+        const insertQuery = `
+          INSERT INTO public."Guests" (
+            "guestId", "guestName", "guestDescription", "guestImage", "guestLanguage"
+          ) VALUES ($1, $2, $3, $4, $5)
+        `;
+        
+        await client.query(insertQuery, [
+          guest.guestId || uuidv4(),  
+          guest.guestName,
+          guest.guestDescription,
+          guest.guestImage,
+          guest.guestLanguage
+        ]);
+        
+        logger.info(`Guest inserted: ${guest.guestName}`);
+      }
+      
+      // Commit transaction
+      await client.query('COMMIT');
+      
+    } catch (error: any) {
+      // Rollback transaction on error
+      await client.query('ROLLBACK');
+      if (error.code === '55P03') { // lock_not_available
+        logger.error(`Guest ${guest.guestName} is being modified by another process. Please retry.`);
+        throw new Error(`Guest ${guest.guestName} is currently being modified by another process. Please retry.`);
+      }
       logger.error('Error inserting/updating guest:', error as Error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete a guest record from the database by name with transaction handling
+   */
+  async deleteGuestByName(guestName: string): Promise<boolean> {
+    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
+      return this.deleteGuestByNameInternal(client, guestName);
+    }));
+  }
+
+  /**
+   * Internal implementation of delete guest by name (for use within transactions)
+   */
+  private async deleteGuestByNameInternal(client: Client | PoolClient, guestName: string): Promise<boolean> {
+    // Start transaction
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    
+    try {
+      // First check if guest exists and lock it
+      const existsQuery = `
+        SELECT "guestId" 
+        FROM public."Guests" 
+        WHERE "guestName" = $1
+        FOR UPDATE NOWAIT
+      `;
+      
+      const existsResult = await client.query(existsQuery, [guestName]);
+      
+      if (existsResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        logger.info(`No guest found to delete: ${guestName}`);
+        return false;
+      }
+      
+      // Delete the guest
+      const deleteQuery = `
+        DELETE FROM public."Guests"
+        WHERE "guestName" = $1
+      `;
+      
+      const result = await client.query(deleteQuery, [guestName]);
+      
+      if (result.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        throw new Error(`Unexpected delete result: expected 1 row affected, got ${result.rowCount}`);
+      }
+      
+      // Commit transaction
+      await client.query('COMMIT');
+      
+      logger.info(`Guest deleted: ${guestName}`);
+      return true;
+      
+    } catch (error: any) {
+      // Rollback transaction on error
+      await client.query('ROLLBACK');
+      if (error.code === '55P03') { // lock_not_available
+        logger.error(`Guest ${guestName} is being modified by another process. Please retry.`);
+        throw new Error(`Guest ${guestName} is currently being modified by another process. Please retry.`);
+      }
+      logger.error('Error deleting guest:', error as Error);
+      throw error;
     }
   }
   
@@ -662,63 +1314,12 @@ export class RDSService {
     return breakdown;
   }
 
-  /**
-   * Enrich guest information (stub implementation)
-   */
-  async enrichGuestInfo(episodeId: string): Promise<EpisodeRecord | null> {
-    if (!this.guestExtractionService) {
-      logger.info(`Guest enrichment not available for episode: ${episodeId}`);
-      return null;
-    }
-
-    logger.info(`Starting guest enrichment for episode: ${episodeId}`);
-    try {
-      // Get existing episode data
-      const episode = await this.getEpisode(episodeId);
-      if (!episode) {
-        logger.warn(`Episode ${episodeId} not found for guest enrichment`);
-        return null;
-      }
-
-      // Use guest extraction service to enrich
-      const extractionResult = await this.guestExtractionService.extractPodcastWithBiosAndImages({
-        podcast_title: episode.channelName,
-        episode_title: episode.episodeTitle,
-        episode_description: episode.episodeDescription || ''
-      });
-
-      // Insert new guests into DB if not present
-      for (const name of extractionResult.guest_names) {
-        const guestDetail = extractionResult.guest_details[name];
-        if (!guestDetail) continue;
-        // Check if guest exists
-        const existingGuest = await this.getGuestByName(name);
-        if (!existingGuest) {
-          await this.insertGuest({
-            guestName: name,
-            guestDescription: guestDetail.description || '',
-            guestImage: guestDetail.image?.s3Url || '',
-            guestLanguage: 'en',
-          });
-        }
-      }
-
-      // Update episode with extraction results
-      await this.updateEpisodeWithGuestExtraction(episodeId, extractionResult);
-
-      logger.info(`Successfully enriched episode ${episodeId} with ${extractionResult.guest_names.length} guests and ${extractionResult.topics.length} topics`);
-      return await this.getEpisode(episodeId); 
-    } catch (error) {
-      logger.error(`Guest enrichment failed for episode ${episodeId}:`, error as Error);
-      return null;
-    }
-  }
 }
 
 /**
- * Create RDS service instance from environment variables
+ * Create RDS service instance from environment variables with optional connection pooling
  */
-export function createRDSServiceFromEnv(): RDSService | null {
+export function createRDSServiceFromEnv(usePool: boolean = false): RDSService | null {
   if (!process.env.RDS_HOST || !process.env.RDS_USER || !process.env.RDS_PASSWORD) {
     return null;
   }
@@ -730,7 +1331,44 @@ export function createRDSServiceFromEnv(): RDSService | null {
     database: process.env.RDS_DATABASE || 'spice_content',
     port: parseInt(process.env.RDS_PORT || '5432'),
     ssl: { rejectUnauthorized: false },
+    // Connection pool settings
+    max: parseInt(process.env.RDS_POOL_MAX || '20'),
+    idleTimeoutMillis: parseInt(process.env.RDS_IDLE_TIMEOUT || '30000'),
+    connectionTimeoutMillis: parseInt(process.env.RDS_CONNECTION_TIMEOUT || '2000'),
   };
 
-  return new RDSService(config);
+  const service = new RDSService(config, undefined, usePool);
+  
+  // Initialize pool if requested
+  if (usePool) {
+    service.initPool().catch(error => {
+      logger.error('Failed to initialize connection pool:', error);
+    });
+  }
+
+  return service;
+}
+
+/**
+ * Sanitize text for PostgreSQL storage by normalizing the string,
+ * removing control characters, and collapsing whitespace.
+ */
+function sanitizeText(text: string): string {
+  if (!text) {
+    return '';
+  }
+
+  // 1. Normalize to NFC for a consistent Unicode representation. This is a
+  // best practice for storing text to avoid issues with characters that
+  // can be represented in multiple ways.
+  const normalized = text.normalize('NFC');
+
+  // 2. Replace all Unicode control characters (\p{C}), including the null
+  // byte (\u0000) that PostgreSQL specifically forbids, with a space.
+  // The 'u' flag is required for Unicode property escapes like \p{C}.
+  const replaced = normalized.replace(/\p{C}/gu, ' ');
+
+  // 3. Collapse consecutive whitespace characters into a single space
+  // and trim any leading or trailing whitespace.
+  return replaced.replace(/\s+/g, ' ').trim();
 }

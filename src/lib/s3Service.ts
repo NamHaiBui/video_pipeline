@@ -1,9 +1,10 @@
-import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'fs';
 import path from 'path';
 import { logger } from './utils/logger.js';
 import { Upload } from '@aws-sdk/lib-storage';
+import { withSemaphore, s3Semaphore, metrics, withRetry, computeDefaultConcurrency, getConcurrencyFromEnv } from './utils/concurrency.js';
 
 export interface S3Config {
   region: string;
@@ -18,8 +19,88 @@ export interface S3UploadResult {
   success: boolean;
   key: string;
   bucket: string;
-  location: string;
+  location:string;
+  uri: string;
   error?: string;
+}
+
+/**
+ * Retry utility for S3 operations with exponential backoff
+ */
+class S3RetryUtility {
+  private static readonly MAX_RETRIES = 3;
+  private static readonly BASE_DELAY = 1000; // 1 second
+
+  // AWS error codes that should not be retried
+  private static readonly NON_RETRYABLE_ERROR_CODES = [
+    'AccessDenied',
+    'InvalidAccessKeyId',
+    'SignatureDoesNotMatch',
+    'TokenRefreshRequired',
+    'InvalidBucketName',
+    'NoSuchBucket',
+    'BucketNotEmpty',
+    'InvalidArgument'
+  ];
+
+  // Error names that should be retried (network/timeout related)
+  private static readonly RETRYABLE_ERROR_NAMES = [
+    'NetworkError',
+    'TimeoutError',
+    'AbortError',
+    'RequestTimeout',
+    'ServiceUnavailable',
+    'InternalError',
+    'SlowDown',
+    'Throttling'
+  ];
+
+  static async executeWithRetry<T>(
+    operation: () => Promise<T>,
+    operationName: string,
+    retryCount: number = 0
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error: any) {
+      // Check if this is a non-retryable error
+      const errorCode = error?.code || error?.name || '';
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      
+      // Don't retry authentication or validation errors
+      if (this.NON_RETRYABLE_ERROR_CODES.includes(errorCode)) {
+        logger.error(`❌ ${operationName} failed with non-retryable error: ${errorCode} - ${errorMessage}`);
+        throw error;
+      }
+
+      if (retryCount >= this.MAX_RETRIES - 1) {
+        const errorDetails = {
+          message: errorMessage,
+          code: errorCode,
+          stack: error?.stack,
+          originalError: error
+        };
+        logger.error(`❌ ${operationName} failed after ${this.MAX_RETRIES} attempts:`, errorMessage, errorDetails);
+        throw error;
+      }
+
+      const delay = this.BASE_DELAY * Math.pow(2, retryCount);
+      
+      // Special handling for AbortError
+      if (errorCode === 'AbortError' || errorMessage.includes('aborted')) {
+        logger.warn(`⚠️ ${operationName} was aborted (attempt ${retryCount + 1}/${this.MAX_RETRIES}), retrying in ${delay}ms...`);
+      } else {
+        logger.warn(`⚠️ ${operationName} failed (attempt ${retryCount + 1}/${this.MAX_RETRIES}) with error: ${errorCode} - ${errorMessage}, retrying in ${delay}ms...`);
+      }
+      
+      await this.sleep(delay);
+      return this.executeWithRetry(operation, operationName, retryCount + 1);
+    }
+  }
+
+  private static sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 }
 
 export class S3Service {
@@ -57,11 +138,11 @@ export class S3Service {
           key,
           bucket,
           location: '',
+          uri: '',
           error: `File does not exist: ${filePath}`
         };
       }
 
-      const fileStream = fs.createReadStream(filePath);
       const stats = fs.statSync(filePath);
       
       // Determine content type if not provided
@@ -94,27 +175,61 @@ export class S3Service {
         }
       }
 
-      // Use Upload for multipart upload
-      const upload = new Upload({
-        client: this.s3Client,
-        params: {
-          Bucket: bucket,
-          Key: key,
-          Body: fileStream,
-          ContentType: contentType,
-          ContentLength: stats.size,
-          Metadata: {
-            'upload-timestamp': new Date().toISOString(),
-            'original-filename': path.basename(filePath),
-            'file-size': stats.size.toString()
+  // Tune multipart upload for throughput
+  const partSizeBytes = Math.max(5, parseInt(process.env.S3_UPLOAD_PART_SIZE_MB || '16', 10)) * 1024 * 1024;
+  const queueSize = Math.max(1, parseInt(process.env.S3_UPLOAD_QUEUE_SIZE || '8', 10));
+
+  // Use Upload for multipart upload with retry - recreate stream on each attempt
+      const result = await withSemaphore(s3Semaphore, 's3_upload', async () => {
+        return withRetry(async () => {
+          // Create a fresh file stream for each retry attempt
+          const fileStream = fs.createReadStream(filePath);
+          const upload = new Upload({
+            client: this.s3Client,
+            params: {
+              Bucket: bucket,
+              Key: key,
+              Body: fileStream,
+              ContentType: contentType,
+              ContentLength: stats.size,
+              Metadata: {
+                'upload-timestamp': new Date().toISOString(),
+                'original-filename': path.basename(filePath),
+                'file-size': stats.size.toString()
+              }
+    },
+    queueSize,
+    partSize: partSizeBytes,
+    leavePartsOnError: false
+          });
+          return await upload.done();
+        }, {
+          attempts: parseInt(process.env.RETRY_ATTEMPTS || '3', 10),
+          baseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS || '500', 10),
+          label: 's3_upload',
+          isRetryable: (err) => {
+            const code = err?.code || err?.name || '';
+            const NON_RETRYABLE = new Set([
+              'AccessDenied',
+              'InvalidAccessKeyId',
+              'SignatureDoesNotMatch',
+              'TokenRefreshRequired',
+              'InvalidBucketName',
+              'NoSuchBucket',
+              'BucketNotEmpty',
+              'InvalidArgument'
+            ]);
+            return !NON_RETRYABLE.has(code);
+          },
+          onAttempt: ({ attempt, attempts, delay }) => {
+            logger.warn(`⚠️ S3 upload retry ${attempt}/${attempts} in ${delay}ms for ${key}`);
           }
-        }
+        });
       });
-
-      const result = await upload.done();
-      const location = `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`;
-
-      logger.info(`✅ Successfully uploaded ${filePath} to s3://${bucket}/${key}`);
+      // result.
+      const uri = `s3://${bucket}/${key}`;
+      const location = result.Location ||`https://${bucket}.s3.us-east-1.amazonaws.com/${key}`;
+      logger.info(`✅ Successfully uploaded ${filePath} to ${uri}`);
       logger.info(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
       
       return {
@@ -122,17 +237,112 @@ export class S3Service {
         key,
         bucket,
         location,
+        uri,
       };
 
     } catch (error: any) {
-      logger.error(`❌ Failed to upload ${filePath} to S3:`, error.message);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      const errorCode = error?.code || error?.name || 'UNKNOWN_ERROR';
+      const errorDetails = {
+        message: errorMessage,
+        code: errorCode,
+        stack: error?.stack,
+        originalError: error
+      };
+      
+      logger.error(`❌ Failed to upload ${filePath} to S3:`, errorMessage, errorDetails);
       return {
           success: false,
           key,
           bucket,
           location: '',
-          error: error instanceof Error ? error.message : String(error)
+          uri: '',
+          error: errorMessage
       };
+    }
+  }
+
+  /**
+   * High-throughput concurrent ranged download from S3 to a local file
+   */
+  async downloadFile(
+    bucket: string,
+    key: string,
+    destinationPath: string,
+    opts?: { partSizeMB?: number; concurrency?: number }
+  ): Promise<{ success: boolean; path?: string; error?: string }> {
+    try {
+      const head = await withSemaphore(s3Semaphore, 's3_head', async () =>
+        this.s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+      );
+      const totalSize = head.ContentLength ?? 0;
+      if (!totalSize || totalSize <= 0) {
+        // Fallback: single GET when size unknown
+        const single = await withSemaphore(s3Semaphore, 's3_get', async () =>
+          this.s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+        );
+        await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
+        const out = fs.createWriteStream(destinationPath);
+        await new Promise<void>((resolve, reject) => {
+          (single.Body as any).pipe(out)
+            .on('finish', resolve)
+            .on('error', reject);
+        });
+        return { success: true, path: destinationPath };
+      }
+
+      const partSize = Math.max(5, (opts?.partSizeMB ?? parseInt(process.env.S3_DOWNLOAD_PART_SIZE_MB || '16', 10))) * 1024 * 1024;
+      const parts = Math.ceil(totalSize / partSize);
+      const dlConcurrency = opts?.concurrency ?? getConcurrencyFromEnv('S3_DOWNLOAD_CONCURRENCY', computeDefaultConcurrency('io'));
+
+      await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
+      const fh = await fs.promises.open(destinationPath, 'w');
+      try {
+        // Pre-allocate (best effort)
+        try { await fh.truncate(totalSize); } catch {}
+
+        let completed = 0;
+        const downloadPart = async (index: number) => {
+          const start = index * partSize;
+          const end = Math.min(totalSize - 1, start + partSize - 1);
+          const range = `bytes=${start}-${end}`;
+
+          const res = await withSemaphore(s3Semaphore, 's3_get_part', async () =>
+            this.s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key, Range: range }))
+          );
+
+          const chunks: Buffer[] = [];
+          await new Promise<void>((resolve, reject) => {
+            (res.Body as any)
+              .on('data', (d: Buffer) => chunks.push(d))
+              .on('end', resolve)
+              .on('error', reject);
+          });
+          const buf = Buffer.concat(chunks);
+          await fh.write(buf, 0, buf.length, start);
+          completed++;
+          metrics.gauge('s3_download_parts_completed', completed);
+        };
+
+        // Manual concurrency pool
+        const pool = Math.max(1, dlConcurrency);
+        let next = 0;
+        const runners = new Array(pool).fill(0).map(async () => {
+          while (next < parts) {
+            const i = next++;
+            await downloadPart(i);
+          }
+        });
+        await Promise.all(runners);
+      } finally {
+        await fh.close();
+      }
+
+      return { success: true, path: destinationPath };
+    } catch (error: any) {
+      logger.error(`❌ Failed to download s3://${bucket}/${key}: ${error?.message || error}`);
+      try { await fs.promises.unlink(destinationPath); } catch {}
+      return { success: false, error: error?.message || String(error) };
     }
   }
   
@@ -144,66 +354,91 @@ export class S3Service {
  * @returns A promise that resolves to true if successful, false otherwise.
  */
 async uploadm3u8ToS3(data: Buffer, bucket: string, key: string): Promise<S3UploadResult> {
-    const command = new PutObjectCommand({
+    console.log(`Uploading content to S3 bucket '${bucket}' as '${key}'...`);
+    try {
+    await withSemaphore(s3Semaphore, 's3_put', async () => withRetry(async () => {
+      const command = new PutObjectCommand({
         Bucket: bucket,
         Key: key,
         Body: data,
         ContentType: 'application/vnd.apple.mpegurl' 
-    });
+      });
+      return await this.s3Client.send(command);
+    }, { label: 's3_put' }));
 
-    console.log(`Uploading content to S3 bucket '${bucket}' as '${key}'...`);
-    try {
-        await this.s3Client.send(command);
         console.log("Upload Successful!");
         return {
             success: true,
             key,
             bucket,
-            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`
+            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`,
+            uri: `s3://${bucket}/${key}`
         };
     } catch (error) {
-        if (error instanceof Error) {
-            console.error(`An S3 client error occurred: ${error.message}`);
-        } else {
-            console.error("An unknown error occurred during S3 upload.");
-        }
+        const errorMessage = (error as any)?.message || (error as any)?.toString() || 'Unknown S3 upload error';
+        const errorCode = (error as any)?.code || (error as any)?.name || 'UNKNOWN_ERROR';
+        const errorStack = (error as any)?.stack || 'No stack trace available';
+        
+        const errorDetails = {
+            message: errorMessage,
+            code: errorCode,
+            stack: errorStack,
+            originalError: error
+        };
+        
+        logger.error(`❌ Failed to upload buffer to S3:`, errorMessage, errorDetails);
+        
         return {
             success: false,
             key,
             bucket,
             location: '',
+            uri: '',
             error: error instanceof Error ? error.message : String(error)
         };
     }
 }
 async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3UploadResult> {
-    const command = new PutObjectCommand({
+    console.log(`Uploading thumbnail to S3 bucket '${bucket}' as '${key}'...`);
+    try {
+    await withSemaphore(s3Semaphore, 's3_put', async () => withRetry(async () => {
+      const command = new PutObjectCommand({
         Bucket: bucket,
         Key: key,
         Body: data,
         ContentType: 'image/jpeg'
-    });
-    console.log(`Uploading thumbnail to S3 bucket '${bucket}' as '${key}'...`);
-    try {
-        await this.s3Client.send(command);
+      });
+      return await this.s3Client.send(command);
+    }, { label: 's3_put' }));
+
         console.log("Upload Successful!");      
         return {
             success: true,
             key,
             bucket,
-            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`
+            location: `https://${bucket}.s3.us-east-1.amazonaws.com/${key}`,
+            uri: `s3://${bucket}/${key}`
         };
     } catch (error) {
-        if (error instanceof Error) {
-            console.error(`An S3 client error occurred: ${error.message}`);
-        } else {
-            console.error("An unknown error occurred during S3 upload.");
-        }
+        const errorMessage = (error as any)?.message || (error as any)?.toString() || 'Unknown S3 upload error';
+        const errorCode = (error as any)?.code || (error as any)?.name || 'UNKNOWN_ERROR';
+        const errorStack = (error as any)?.stack || 'No stack trace available';
+        
+        const errorDetails = {
+            message: errorMessage,
+            code: errorCode,
+            stack: errorStack,
+            originalError: error
+        };
+        
+        logger.error(`❌ Failed to upload stream to S3:`, errorMessage, errorDetails);
+        
         return {
             success: false,
             key,      
             bucket,
             location: '',
+            uri: '',
             error: error instanceof Error ? error.message : String(error)
         };
     }
@@ -236,12 +471,14 @@ async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3
    */
   async getPresignedDownloadUrl(bucket: string, key: string, expiresIn = 3600): Promise<string> {
     try {
-      const command = new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-      });
+      const url = await withSemaphore(s3Semaphore, 's3_get', async () => withRetry(async () => {
+        const command = new GetObjectCommand({
+          Bucket: bucket,
+          Key: key,
+        });
+        return await getSignedUrl(this.s3Client, command, { expiresIn });
+      }, { label: 's3_get' }));
 
-      const url = await getSignedUrl(this.s3Client, command, { expiresIn });
       return url;
     } catch (error: any) {
       logger.error(`Failed to generate presigned URL for s3://${bucket}/${key}:`, error.message);
@@ -254,12 +491,14 @@ async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3
    */
   async fileExists(bucket: string, key: string): Promise<boolean> {
     try {
-      const command = new GetObjectCommand({
-        Bucket: bucket,
-        Key: key
-      });
-      
-      await this.s3Client.send(command);
+      await withSemaphore(s3Semaphore, 's3_head', async () => withRetry(async () => {
+        const command = new GetObjectCommand({
+          Bucket: bucket,
+          Key: key
+        });
+        return await this.s3Client.send(command);
+      }, { label: 's3_head' }));
+
       return true;
     } catch (error: any) {
       if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
@@ -274,12 +513,14 @@ async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3
    */
   async deleteFile(bucket: string, key: string): Promise<boolean> {
     try {
-      const command = new DeleteObjectCommand({
-        Bucket: bucket,
-        Key: key
-      });
+      await withSemaphore(s3Semaphore, 's3_delete', async () => withRetry(async () => {
+        const command = new DeleteObjectCommand({
+          Bucket: bucket,
+          Key: key
+        });
+        return await this.s3Client.send(command);
+      }, { label: 's3_delete' }));
 
-      await this.s3Client.send(command);
       logger.info(`🗑️ Deleted s3://${bucket}/${key}`);
       return true;
     } catch (error: any) {
@@ -293,9 +534,11 @@ async uploadThumbnailToS3(data: Buffer, bucket: string, key: string): Promise<S3
    */
   async listBuckets(): Promise<string[]> {
     try {
-      const { ListBucketsCommand } = await import('@aws-sdk/client-s3');
-      const command = new ListBucketsCommand({});
-      const result = await this.s3Client.send(command);
+      const result = await S3RetryUtility.executeWithRetry(async () => {
+        const { ListBucketsCommand } = await import('@aws-sdk/client-s3');
+        const command = new ListBucketsCommand({});
+        return await this.s3Client.send(command);
+      }, 'List S3 buckets');
       
       return result.Buckets?.map(bucket => bucket.Name || '') || [];
     } catch (error: any) {

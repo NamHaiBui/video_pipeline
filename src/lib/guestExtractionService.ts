@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { withSemaphore, httpSemaphore, withRetry } from './utils/concurrency.js';
 import { OpenAI } from 'openai';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { v4 as uuidv4 } from 'uuid';
@@ -88,7 +89,7 @@ export class GuestExtractionService {
             perplexityModel: "sonar",
             googleSearchApiUrl: "https://www.googleapis.com/customsearch/v1",
             s3Bucket: "spice-user-content-assets",
-            s3Prefix: "guest-images/",
+            s3Prefix: "guests/",
             awsRegion: "us-east-1",
             maxRetries: 3,
             ...config
@@ -123,6 +124,34 @@ export class GuestExtractionService {
             .trim();
     }
 
+    private isGuestInfoComplete(guest: any): boolean {
+        // Check if all required fields are properly populated
+        const hasValidName = guest.guestName && guest.guestName.trim() !== '';
+        const hasValidDescription = guest.guestDescription && 
+                                   guest.guestDescription.trim() !== '' && 
+                                   guest.guestDescription !== 'No description available.' &&
+                                   guest.guestDescription !== 'Biography not available.';
+        const hasValidImage = guest.guestImage && 
+                             guest.guestImage.trim() !== '' && 
+                             guest.guestImage.startsWith('http');
+        const hasValidLanguage = guest.guestLanguage && guest.guestLanguage.trim() !== '';
+
+        const isComplete = hasValidName && hasValidDescription && hasValidImage && hasValidLanguage;
+        
+        if (!isComplete) {
+            logger.info(`Guest ${guest.guestName} is incomplete:`, {
+                hasValidName,
+                hasValidDescription,
+                hasValidImage,
+                hasValidLanguage,
+                description: guest.guestDescription?.substring(0, 50) + '...',
+                image: guest.guestImage?.substring(0, 50) + '...'
+            });
+        }
+        
+        return isComplete;
+    }
+
     private async checkExistingGuests(guestNames: string[]): Promise<{ existsMap: Record<string, boolean>; guestIdMap: Record<string, string>; guestInfoMap: Record<string, any> }> {
         logger.info("Checking for existing guests in database...");
         const existsMap: Record<string, boolean> = {};
@@ -138,10 +167,21 @@ export class GuestExtractionService {
         for (const name of guestNames) {
             const guest = await this.rdsService.getGuestByName(name);
             if (guest) {
-                existsMap[name] = true;
-                guestIdMap[name] = guest.guestName;
-                guestInfoMap[name] = guest;
-                logger.info(`Existing guest found: ${name}`);
+                // Check if guest information is complete
+                const isComplete = this.isGuestInfoComplete(guest);
+                
+                if (isComplete) {
+                    existsMap[name] = true;
+                    guestIdMap[name] = guest.guestName;
+                    guestInfoMap[name] = guest;
+                    logger.info(`Existing complete guest found: ${name}`);
+                } else {
+                    // Guest exists but is incomplete - delete and treat as new
+                    logger.info(`Incomplete guest found: ${name}. Deleting and recreating...`);
+                    await this.rdsService.deleteGuestByName(name);
+                    existsMap[name] = false;
+                    logger.info(`Deleted incomplete guest: ${name}. Will create new entry.`);
+                }
             } else {
                 existsMap[name] = false;
                 logger.info(`New guest: ${name}`);
@@ -149,19 +189,18 @@ export class GuestExtractionService {
         }
 
         const existingCount = Object.values(existsMap).filter(Boolean).length;
-        logger.info(`Summary: ${existingCount} existing, ${guestNames.length - existingCount} new guests`);
+        const newGuestCount = guestNames.length - existingCount;
+        logger.info(`Summary: ${existingCount} existing complete guests, ${newGuestCount} guests to be created/recreated`);
         return { existsMap, guestIdMap, guestInfoMap };
-    }
+    }    // ========================= Image Retrieval and Verification =========================
 
-    // ========================= Image Retrieval and Verification =========================
-
-    private validateImageUrl(imageUrl: string): boolean {
+private validateImageUrl(imageUrl: string): boolean {
         if (!imageUrl) return false;
         const nonPersonPatterns = ['logo', 'icon', 'banner', '.svg', 'placeholder'];
         return !nonPersonPatterns.some(pattern => imageUrl.toLowerCase().includes(pattern));
     }
 
-    private async getGoogleImageSearch(name: string, description: string): Promise<ImageInfo | null> {
+    private async getGoogleImageSearch(name: string, description: string, usedUrls: Set<string>, startIndex: number = 1): Promise<ImageInfo | null> {
         if (!this.config.searchApiKey || !this.config.searchEngineId) {
             logger.warn('Google Search API not configured');
             return null;
@@ -170,17 +209,26 @@ export class GuestExtractionService {
         const params = {
             key: this.config.searchApiKey,
             cx: this.config.searchEngineId,
-            q: `"${name}" ${description} portrait photo`.trim(),
+            q: `"${name}" ${description} real face portrait photo`.trim(),
             searchType: 'image',
             imgType: 'face',
-            num: 5,
+            num: 10, // Increased to get more options
+            start: startIndex,
         };
 
         try {
-            const response = await axios.get(this.config.googleSearchApiUrl, { params });
+            const response = await withSemaphore(httpSemaphore, 'http_google', () => withRetry(
+              () => axios.get(this.config.googleSearchApiUrl, { params }),
+              { label: 'google_search' }
+            ));
             const items = response.data.items || [];
+            
             for (const item of items) {
-                if (item.link && this.validateImageUrl(item.link)) {
+                if (item.link && 
+                    this.validateImageUrl(item.link) && 
+                    !usedUrls.has(item.link)) {
+                    
+                    usedUrls.add(item.link);
                     return {
                         url: item.link,
                         source: item.displayLink || 'Google Images',
@@ -196,20 +244,52 @@ export class GuestExtractionService {
         return null;
     }
 
-    private async getWikipediaImage(name: string): Promise<ImageInfo | null> {
+    private async getWikipediaImage(name: string, usedUrls: Set<string>, searchOffset: number = 0): Promise<ImageInfo | null> {
         const searchApi = "https://en.wikipedia.org/w/api.php";
         try {
-            const searchParams = { action: 'query', list: 'search', srsearch: name, format: 'json', srlimit: 1 };
-            const searchResponse = await axios.get(searchApi, { params: searchParams });
-            const pageTitle = searchResponse.data.query?.search?.[0]?.title;
+            const searchParams = { 
+                action: 'query', 
+                list: 'search', 
+                srsearch: name, 
+                format: 'json', 
+                srlimit: 3, // Get multiple results
+                sroffset: searchOffset 
+            };
+            
+            const searchResponse = await withSemaphore(httpSemaphore, 'http_wiki', () => withRetry(
+              () => axios.get(searchApi, { params: searchParams }),
+              { label: 'wikipedia_search' }
+            ));
+            const searchResults = searchResponse.data.query?.search || [];
 
-            if (pageTitle) {
-                const imageParams = { action: 'query', titles: pageTitle, prop: 'pageimages', format: 'json', pithumbsize: 500 };
-                const imageResponse = await axios.get(searchApi, { params: imageParams });
-                const pages = imageResponse.data.query?.pages || {};
-                const page = Object.values(pages)[0] as any;
-                if (page?.thumbnail?.source) {
-                    return { url: page.thumbnail.source, source: 'Wikipedia', method: 'wikipedia', status: 'found' };
+            // Try each search result until we find an unused image
+            for (const result of searchResults) {
+                const pageTitle = result.title;
+                if (pageTitle) {
+                    const imageParams = { 
+                        action: 'query', 
+                        titles: pageTitle, 
+                        prop: 'pageimages', 
+                        format: 'json', 
+                        pithumbsize: 500 
+                    };
+                    
+                    const imageResponse = await withSemaphore(httpSemaphore, 'http_wiki', () => withRetry(
+                      () => axios.get(searchApi, { params: imageParams }),
+                      { label: 'wikipedia_image' }
+                    ));
+                    const pages = imageResponse.data.query?.pages || {};
+                    const page = Object.values(pages)[0] as any;
+                    
+                    if (page?.thumbnail?.source && !usedUrls.has(page.thumbnail.source)) {
+                        usedUrls.add(page.thumbnail.source);
+                        return { 
+                            url: page.thumbnail.source, 
+                            source: 'Wikipedia', 
+                            method: 'wikipedia', 
+                            status: 'found' 
+                        };
+                    }
                 }
             }
         } catch (error) {
@@ -224,9 +304,38 @@ export class GuestExtractionService {
             return { verified: false, verification_details: { error: 'Gemini not configured' }, verification_status: 'error' };
         }
 
+        // Protocol check
         try {
-            const imageResponse = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-            const imageBase64 = Buffer.from(imageResponse.data).toString('base64');
+            const allowedProtocols = ['http:', 'https:', 'data:', 'x-raw-image:'];
+            let urlProtocol = '';
+            try {
+                urlProtocol = new URL(imageUrl).protocol;
+            } catch (e) {
+                // If URL constructor fails, fallback to string check
+                if (imageUrl.startsWith('data:')) urlProtocol = 'data:';
+                else if (imageUrl.startsWith('x-raw-image:')) urlProtocol = 'x-raw-image:';
+            }
+            
+            if (!allowedProtocols.includes(urlProtocol)) {
+                logger.warn(`Unsupported image protocol for verification: ${urlProtocol} (${imageUrl})`);
+                return { verified: false, verification_details: { error: `Unsupported protocol: ${urlProtocol}` }, verification_status: 'error' };
+            }
+
+            // Handle x-raw-image protocol differently
+            let imageBase64: string;
+            if (urlProtocol === 'x-raw-image:') {
+                // Extract base64 data from x-raw-image: protocol
+                const base64Data = imageUrl.replace('x-raw-image:', '');
+                imageBase64 = base64Data;
+                logger.info('Processing x-raw-image protocol data');
+            } else {
+                // Standard HTTP/HTTPS download
+                const imageResponse = await withSemaphore(httpSemaphore, 'http_image_dl', () => withRetry(
+                  () => axios.get(imageUrl, { responseType: 'arraybuffer' }),
+                  { label: 'image_download' }
+                ));
+                imageBase64 = Buffer.from(imageResponse.data).toString('base64');
+            }
             
             const prompt = `You are a strict profile image verifier. Analyze this image for "${name}" described as "${description}".
                             REQUIREMENTS:
@@ -264,52 +373,136 @@ export class GuestExtractionService {
         }
     }
 
+    private async searchForImage(guestName: string, guestDescription: string, usedUrls: Set<string>, attempt: number): Promise<ImageInfo | null> {
+        logger.info(`Image search attempt ${attempt} for: ${guestName}`);
+        
+        // Try Google Images first with different start indices for each attempt
+        const googleStartIndex = 1 + (attempt - 1) * 10;
+        let imageInfo = await this.getGoogleImageSearch(guestName, guestDescription, usedUrls, googleStartIndex);
+        
+        if (imageInfo) {
+            return imageInfo;
+        }
+        
+        // Try Wikipedia with offset for different results
+        const wikiOffset = (attempt - 1) * 3;
+        imageInfo = await this.getWikipediaImage(guestName, usedUrls, wikiOffset);
+        
+        return imageInfo;
+    }
+
     private async processGuestImage(guestName: string, guestDescription: string, guestUuid: string) {
         logger.info(`Processing Image for Guest: ${guestName}`);
         
-        // 1. Search for image
-        logger.info("Searching for images...");
-        let imageInfo = await this.getGoogleImageSearch(guestName, guestDescription) ?? await this.getWikipediaImage(guestName);
+        const maxRetries = 3;
+        const usedUrls = new Set<string>();
+        const attemptResults: Array<{attempt: number, imageUrl?: string, reason: string}> = [];
         
-        if (!imageInfo) {
-            return { uploaded: false, verified: false, url: null, reason: "No image found" };
-        }
-
-        logger.info(`Found image via ${imageInfo.method}: ${imageInfo.url!.substring(0, 80)}...`);
-
-        // 2. Verify with Gemini
-        logger.info("Verifying with Gemini AI...");
-        const verification = await this.verifyImageWithGemini(imageInfo.url!, guestName, guestDescription);
-        
-        if (!verification.verified) {
-            const reasoning = (verification.verification_details as any)?.reasoning || "No reason provided.";
-            logger.info(`Image failed verification. Reasoning: ${reasoning}`);
-            return { uploaded: false, verified: false, url: imageInfo.url, reason: reasoning };
-        }
-
-        logger.info(`Image verified! Confidence: ${(verification.verification_details as ImageVerification).confidence}`);
-
-        // 3. Upload to S3
-        logger.info("Uploading verified image to S3...");
-        try {
-            const response = await axios.get(imageInfo.url!, { responseType: 'arraybuffer' });
-            const safeName = guestName.replace(/\s/g, '_');
-            const s3Key = `${this.config.s3Prefix}${safeName}_${guestUuid}.jpg`;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            logger.info(`Attempt ${attempt}/${maxRetries} for ${guestName}`);
             
-            await this.s3Client.send(new PutObjectCommand({
-                Bucket: this.config.s3Bucket,
-                Key: s3Key,
-                Body: response.data,
-                ContentType: 'image/jpeg',
-            }));
+            try {
+                // 1. Search for image
+                logger.info("Searching for images...");
+                const imageInfo = await this.searchForImage(guestName, guestDescription, usedUrls, attempt);
+                
+                if (!imageInfo) {
+                    const reason = `No new image found on attempt ${attempt}`;
+                    logger.info(reason);
+                    attemptResults.push({ attempt, reason });
+                    continue;
+                }
 
-            const s3Url = `s3://${this.config.s3Bucket}/${s3Key}`;
-            logger.info(`Image uploaded to: ${s3Url}`);
-            return { uploaded: true, verified: true, s3Url, s3Key };
-        } catch (error) {
-            logger.error('Failed to upload image:', error as Error);
-            return { uploaded: false, verified: true, url: imageInfo.url, reason: `S3 upload failed: ${error}` };
+                logger.info(`Found image via ${imageInfo.method}: ${imageInfo.url!.substring(0, 80)}...`);
+
+                // 2. Verify with Gemini
+                logger.info("Verifying with Gemini AI...");
+                const verification = await this.verifyImageWithGemini(imageInfo.url!, guestName, guestDescription);
+                
+                if (!verification.verified) {
+                    const reasoning = (verification.verification_details as any)?.reasoning || "No reason provided.";
+                    logger.info(`Image failed verification. Reasoning: ${reasoning}`);
+                    attemptResults.push({ 
+                        attempt, 
+                        imageUrl: imageInfo.url!, 
+                        reason: `Verification failed: ${reasoning}` 
+                    });
+                    continue;
+                }
+
+                logger.info(`Image verified! Confidence: ${(verification.verification_details as ImageVerification).confidence}`);
+
+                // 3. Upload to S3
+                logger.info("Uploading verified image to S3...");
+                try {
+                    let imageData: Buffer;
+                    
+                    // Handle different protocols for S3 upload
+                    if (imageInfo.url!.startsWith('x-raw-image:')) {
+                        // Extract base64 data from x-raw-image: protocol
+                        const base64Data = imageInfo.url!.replace('x-raw-image:', '');
+                        imageData = Buffer.from(base64Data, 'base64');
+                        logger.info('Processing x-raw-image protocol data for S3 upload');
+                    } else {
+                        // Standard HTTP/HTTPS download
+                        const response = await withSemaphore(httpSemaphore, 'http_image_dl', () => withRetry(
+                          () => axios.get(imageInfo.url!, { responseType: 'arraybuffer' }),
+                          { label: 'image_download' }
+                        ));
+                        imageData = Buffer.from(response.data);
+                    }
+                    
+                    const safeName = guestName.replace(/\s/g, '_');
+                    const s3Key = `${this.config.s3Prefix}${safeName}_${guestUuid}.jpg`;
+                    
+                    await this.s3Client.send(new PutObjectCommand({
+                        Bucket: this.config.s3Bucket,
+                        Key: s3Key,
+                        Body: imageData,
+                        ContentType: 'image/jpeg',
+                    }));
+
+                    const s3Url = `https://${this.config.s3Bucket}.s3.us-east-1.amazonaws.com/${s3Key}`; 
+                    logger.info(`Image uploaded to: ${s3Url}`);
+                    
+                    return { 
+                        uploaded: true, 
+                        verified: true, 
+                        s3Url, 
+                        s3Key,
+                        attemptResults: attemptResults.concat([{ 
+                            attempt, 
+                            imageUrl: imageInfo.url!, 
+                            reason: 'Success' 
+                        }])
+                    };
+                } catch (error) {
+                    logger.error('Failed to upload image:', error as Error);
+                    attemptResults.push({ 
+                        attempt, 
+                        imageUrl: imageInfo.url!, 
+                        reason: `S3 upload failed: ${error}` 
+                    });
+                    // Continue to next attempt instead of returning immediately
+                }
+            } catch (error) {
+                logger.error(`Attempt ${attempt} failed with error:`, error as Error);
+                attemptResults.push({ 
+                    attempt, 
+                    reason: `Unexpected error: ${error}` 
+                });
+            }
         }
+
+        // All attempts failed
+        logger.info(`All ${maxRetries} attempts failed for ${guestName}`);
+        return { 
+            uploaded: false, 
+            verified: false, 
+            url: null, 
+            reason: `All ${maxRetries} attempts failed`,
+            attemptResults 
+        };
     }
 
     // ========================= Core Logic Functions =========================
@@ -388,7 +581,6 @@ export class GuestExtractionService {
         const newGuests = extractionResult.guest_names.filter(name => !existsMap[name]);
         if (newGuests.length === 0) {
             logger.info("No new guests found, skipping bio and image fetching.");
-            return {};
         }
         logger.info(`Fetching bios and images for ${newGuests.length} NEW guests...`);
         const guestDetails: Record<string, any> = {};
@@ -396,9 +588,9 @@ export class GuestExtractionService {
             if (existsMap[name] && guestInfoMap[name]) {
                 guestDetails[name] = {
                     ID: guestInfoMap[name].guestName,
-                    description: guestInfoMap[name].guestDescription,
+                    guestDescription: guestInfoMap[name].guestDescription,
                     confidence: 'high',
-                    image: { s3Url: guestInfoMap[name].guestImage },
+                    guestImage: { s3Url: guestInfoMap[name].guestImage },
                     guestLanguage: guestInfoMap[name].guestLanguage
                 };
             } else {
@@ -408,20 +600,20 @@ export class GuestExtractionService {
                     episode_title: extractionResult.episode_title,
                     episode_description: extractionResult._episode_description,
                 });
+
                 const imageResult = await this.processGuestImage(name, bioInfo.description, guestUuid);
                 guestDetails[name] = {
                     ID: guestUuid,
-                    description: bioInfo.description,
+                    guestDescription: bioInfo.description,
                     confidence: bioInfo.confidence,
-                    image: imageResult
+                    guestImage: imageResult.s3Url || ''
                 };
-                // Upload new guest to RDS
                 const guestRecord: GuestRecord = {
                     guestId: guestUuid,
                     guestName: name,
                     guestDescription: bioInfo.description,
                     guestImage: imageResult.s3Url || '',
-                    guestLanguage: ''
+                    guestLanguage: 'en' 
                 };
                 if (this.rdsService) {
                     await this.rdsService.insertGuest(guestRecord);
@@ -429,6 +621,7 @@ export class GuestExtractionService {
             }
         }
         logger.info("All guest bios and images processed.");
+        logger.info(`Final guest details: ${JSON.stringify(guestDetails, null, 2)}`);
         return guestDetails;
     }
 

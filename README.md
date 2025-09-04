@@ -131,6 +131,23 @@ This project has been fully converted from JavaScript to TypeScript, providing:
 
 ## Configuration
 
+Concurrency and retry (new):
+
+- SEMAPHORE_MAX_CONCURRENCY: global default cap for bounded concurrency. Default: auto (CPU/io aware).
+- S3_UPLOAD_CONCURRENCY: limit parallel S3 operations. Default: 2x CPU cores (min 4).
+- HTTP_CONCURRENCY: limit HTTP calls (APIs, downloads). Default: 2x CPU cores (min 4).
+- DISK_CONCURRENCY: limit heavy disk/FFmpeg jobs. Default: CPU cores.
+- DB_MAX_INFLIGHT: limit concurrent DB transactions. Default: max(2, CPU cores).
+- RETRY_ATTEMPTS: retry attempts for transient failures. Default: 3.
+- RETRY_BASE_DELAY_MS: base backoff in ms. Default: 500.
+
+Tuning tips:
+
+- Start conservative in production, then increase gradually while monitoring in-flight gauges and tail latencies.
+- Observe metrics snapshot logs and CloudWatch to identify saturation (queue_depth rising while in_flight ~= capacity).
+- Increase S3/HTTP first for I/O-bound workloads; keep DB_MAX_INFLIGHT modest to avoid lock pressure.
+- Rollback: set specific concurrency envs to 1 to serialize a subsystem temporarily.
+
 ### Environment Variables
 
 The pipeline supports various environment variables for configuration:

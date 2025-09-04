@@ -80,6 +80,8 @@ COPY .config/ ./.config/
 # Install all dependencies (including dev dependencies needed for postinstall)
 RUN npm ci
 
+COPY .env ./
+
 # Build the TypeScript application (before removing dev dependencies)
 RUN npm run build
 
@@ -100,7 +102,7 @@ USER nodejs
 EXPOSE 3000
 
 # Add labels for better container management
-LABEL maintainer="video_episode_downloader" \
+LABEL maintainer="episode_video_downloader" \
       description="Podcast Processing Pipeline - Convert YouTube videos to podcast episodes" \
       version="1.0.0"
 

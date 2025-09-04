@@ -307,3 +307,10 @@ export function getThumbnailUrl(metadata: VideoMetadata): string {
     console.warn("Warning: No top-level thumbnail found.");
     return "";
 }
+
+export function inWhiteList(title: string, uploader: string): boolean {
+  //TODO: Change this to a config file or database in the future 
+    const whiteList: { [key: string]: string } = {
+        'UCM1guA1E-RHLO2OyfQPOkEQ':'cheeky',
+    }
+    return title.toLowerCase().includes(whiteList[uploader]);}

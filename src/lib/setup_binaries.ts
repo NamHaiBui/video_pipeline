@@ -39,16 +39,29 @@ async function downloadFileWithProgress(url: string, outputPath: string, fileNam
 
     const { data, headers } = response;
     const totalLength = headers['content-length'];
-    const progressBar = new ProgressBar(`-> ${fileNameForProgress} [:bar] :percent :etas`, {
-      width: 40,
-      complete: '=',
-      incomplete: ' ',
-      renderThrottle: 100,
-      total: parseInt(totalLength as string),
-    });
+    const totalLengthNum = parseInt(totalLength as string) || 0;
+    
+    let progressBar: ProgressBar | null = null;
+    
+    // Only create progress bar if we have a valid content length
+    if (totalLengthNum > 0) {
+      progressBar = new ProgressBar(`-> ${fileNameForProgress} [:bar] :percent :etas`, {
+        width: 40,
+        complete: '=',
+        incomplete: ' ',
+        renderThrottle: 100,
+        total: totalLengthNum,
+      });
+    } else {
+      console.log(`Downloading ${fileNameForProgress}... (size unknown)`);
+    }
 
     const writer = fs.createWriteStream(outputPath);
-    data.on('data', (chunk: Buffer) => progressBar.tick(chunk.length));
+    data.on('data', (chunk: Buffer) => {
+      if (progressBar && totalLengthNum > 0) {
+        progressBar.tick(chunk.length);
+      }
+    });
     data.pipe(writer);
 
     return new Promise((resolve, reject) => {

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
@@ -25,46 +23,8 @@ services:
     container_name: video_episode_downloader
     ports:
       - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - ENABLE_SQS_POLLING=true
-      - S3_UPLOAD_ENABLED=true
-      - PODCAST_CONVERSION_ENABLED=true
-      
-      # bgutil-provider Configuration
-      - BGUTIL_PROVIDER_URL=http://bgutil-provider:4416
-      
-      # AWS Configuration
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      
-      # S3 Configuration
-      - S3_AUDIO_BUCKET=${S3_AUDIO_BUCKET}
-      - S3_VIDEO_BUCKET=${S3_VIDEO_BUCKET}
-      
-      # DynamoDB Configuration
-      - DYNAMODB_PODCAST_EPISODES_TABLE=${DYNAMODB_PODCAST_EPISODES_TABLE}
-      
-      # SQS Configuration
-      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
-      - VIDEO_TRIMMING_QUEUE_URL=${VIDEO_TRIMMING_QUEUE_URL:-https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming}
-      
-      # YouTube API (optional)
-      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
-      
-      # Processing Configuration
-      - MAX_CONCURRENT_JOBS=2
-      - POLLING_INTERVAL_MS=30000
-      - DEFAULT_VIDEO_QUALITY=720p
-      - PREFERRED_AUDIO_FORMAT=mp3
-      
-      # Logging
-      - LOG_LEVEL=info
-      - YTDLP_VERBOSE_WARNINGS=false
-      
-      
+    env_file:
+      - .env
     volumes:
       - video-episode-downloader-data:/app/data
     depends_on:

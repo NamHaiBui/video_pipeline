@@ -22,6 +22,15 @@ export interface Config {
   // Environment
   nodeEnv: string;
   logLevel: string;
+
+  // Concurrency & Retry
+  semaphoreMaxConcurrency?: number;
+  s3UploadConcurrency?: number;
+  httpConcurrency?: number;
+  diskConcurrency?: number;
+  dbMaxInflight?: number;
+  retryAttempts?: number;
+  retryBaseDelayMs?: number;
 }
 
 const config: Config = {
@@ -38,9 +47,15 @@ const config: Config = {
   ffmpegPath: process.env.FFMPEG_PATH,
   yt_dlpPath: process.env.YT_DLP_PATH || 'yt-dlp',
   
-  
   nodeEnv: process.env.NODE_ENV || 'development',
-  logLevel: process.env.LOG_LEVEL || 'info'
+  logLevel: process.env.LOG_LEVEL || 'info',
+  semaphoreMaxConcurrency: parseInt(process.env.SEMAPHORE_MAX_CONCURRENCY || '', 10) || undefined,
+  s3UploadConcurrency: parseInt(process.env.S3_UPLOAD_CONCURRENCY || '', 10) || undefined,
+  httpConcurrency: parseInt(process.env.HTTP_CONCURRENCY || '', 10) || undefined,
+  diskConcurrency: parseInt(process.env.DISK_CONCURRENCY || '', 10) || undefined,
+  dbMaxInflight: parseInt(process.env.DB_MAX_INFLIGHT || '', 10) || undefined,
+  retryAttempts: parseInt(process.env.RETRY_ATTEMPTS || '', 10) || undefined,
+  retryBaseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS || '', 10) || undefined,
 };
 
 export default config;

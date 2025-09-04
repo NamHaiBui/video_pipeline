@@ -21,11 +21,35 @@ import {
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/utils/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
 import { createS3ServiceFromEnv} from './lib/s3Service.js';
-import { createSQSServiceFromEnv} from './lib/sqsService.js';
+import { createSQSServiceFromEnv} from './lib/sqsService_new.js';
 import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
 import { logger } from './lib/utils/logger.js';
-import { create_slug} from './lib/utils/utils.js';
+import { create_slug, inWhiteList} from './lib/utils/utils.js';
 import { GuestExtractionService, GuestExtractionResult } from './lib/guestExtractionService.js';
+import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
+
+/**
+ * Wrapper function to safely execute yt-dlp operations with server protection
+ * This ensures that yt-dlp errors are properly caught and don't crash the server
+ */
+async function safeYtdlpOperation<T>(
+  operation: () => Promise<T>, 
+  operationName: string, 
+  jobId?: string
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error: any) {
+    const errorMessage = error?.message || String(error);
+    const logPrefix = jobId ? `Job ${jobId}` : 'Operation';
+    
+    logger.error(`${logPrefix}: yt-dlp operation '${operationName}' failed - server protected`, error);
+    console.error(`${logPrefix}: Safe yt-dlp wrapper caught error in '${operationName}':`, errorMessage);
+    
+    // Re-throw the error so calling code can handle it appropriately
+    throw error;
+  }
+}
 
 import dotenv from 'dotenv';
 
@@ -62,6 +86,18 @@ const guestExtractionService = GuestExtractionService.createFromEnv(isRDSEnabled
 
 const isPodcastConversionEnabled = process.env.PODCAST_CONVERSION_ENABLED !== 'false';
 
+// ECS Task Protection Configuration
+const ECS_CLUSTER_NAME = process.env.ECS_CLUSTER_NAME;
+const ECS_TASK_ARN = process.env.ECS_TASK_ARN;
+const isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
+
+let ecsClient: ECSClient | null = null;
+let taskProtectionTimeout: NodeJS.Timeout | null = null;
+
+if (isECSDeployment) {
+  ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+}
+
 if (isS3Enabled) {
   logger.info('S3 upload service initialized successfully');
 } else {
@@ -86,8 +122,117 @@ if (isRDSEnabled) {
 app.use(cors());
 app.use(express.json());
 
+// Global flag to control shutdown behavior
+let allowShutdown = false;
+
+// Function to enable shutdown (for self-invocation)
+export function enableShutdown(): void {
+  allowShutdown = true;
+  console.log('🔓 Shutdown enabled - server can now be terminated');
+}
+
+// Function to trigger self-shutdown
+export function initiateShutdown(reason: string = 'Manual shutdown'): void {
+  console.log(`🔄 Initiating self-shutdown: ${reason}`);
+  allowShutdown = true;
+  process.kill(process.pid, 'SIGTERM');
+}
+
 // In-memory storage for download jobs
 const downloadJobs = new Map<string, DownloadJob>();
+
+/**
+ * Enable ECS task protection to prevent scale-in during job processing
+ */
+async function enableTaskProtection(durationMinutes: number = 60): Promise<void> {
+  if (!isECSDeployment || !ecsClient) {
+    return;
+  }
+
+  try {
+    const command = new UpdateTaskProtectionCommand({
+      cluster: ECS_CLUSTER_NAME,
+      tasks: [ECS_TASK_ARN!],
+      protectionEnabled: true,
+      expiresInMinutes: durationMinutes
+    });
+
+    await ecsClient.send(command);
+    logger.info(`ECS task protection enabled for ${durationMinutes} minutes`);
+    console.log(`🛡️ ECS task protection enabled for ${durationMinutes} minutes`);
+  } catch (error: any) {
+    logger.error('Failed to enable ECS task protection:', error);
+    console.error('❌ Failed to enable ECS task protection:', error.message);
+  }
+}
+
+/**
+ * Disable ECS task protection when no jobs are running
+ */
+async function disableTaskProtection(): Promise<void> {
+  if (!isECSDeployment || !ecsClient) {
+    return;
+  }
+
+  try {
+    const command = new UpdateTaskProtectionCommand({
+      cluster: ECS_CLUSTER_NAME,
+      tasks: [ECS_TASK_ARN!],
+      protectionEnabled: false
+    });
+
+    await ecsClient.send(command);
+    logger.info('ECS task protection disabled');
+    console.log('🛡️ ECS task protection disabled');
+  } catch (error: any) {
+    logger.error('Failed to disable ECS task protection:', error);
+    console.error('❌ Failed to disable ECS task protection:', error.message);
+  }
+}
+
+/**
+ * Check if there are any active jobs and manage task protection accordingly
+ * Always maintains protection when jobs are active with automatic renewal
+ */
+async function manageTaskProtection(): Promise<void> {
+  if (!isECSDeployment) {
+    return;
+  }
+
+  const activeJobs = Array.from(downloadJobs.values()).filter(
+    job => job.status === 'pending' || 
+           job.status === 'downloading_metadata' || 
+           job.status === 'extracting_guests' ||
+           job.status === 'downloading' || 
+           job.status === 'merging'
+  );
+
+  if (activeJobs.length > 0) {
+    // Always maintain protection when jobs are active - extend for another hour
+    await enableTaskProtection(60);
+    
+    // Clear existing timeout and set a new one to check again in 30 minutes
+    // This ensures protection is always active while jobs are running
+    if (taskProtectionTimeout) {
+      clearTimeout(taskProtectionTimeout);
+    }
+    taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // 30 minutes
+    
+    logger.info(`Task protection maintained - ${activeJobs.length} active jobs detected`);
+    console.log(`🛡️ Task protection extended for ${activeJobs.length} active jobs`);
+  } else {
+    // No active jobs, disable protection to allow scale-in
+    await disableTaskProtection();
+    
+    if (taskProtectionTimeout) {
+      clearTimeout(taskProtectionTimeout);
+      taskProtectionTimeout = null;
+    }
+    
+    logger.info('Task protection disabled - no active jobs');
+    console.log('🛡️ Task protection disabled - no active jobs');
+  }
+}
 
 // Serve static files from downloads directory
 const downloadsDir = path.resolve(process.cwd(), 'downloads');
@@ -247,6 +392,15 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     downloadJobs.set(jobId, job);
   }
 
+  // Enable ECS task protection when starting a job and set up continuous monitoring
+  await enableTaskProtection(120); // Start with 2 hours protection
+  
+  // Start continuous protection management immediately
+  if (!taskProtectionTimeout) {
+    taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // Check in 30 minutes
+    logger.info('Started continuous task protection monitoring');
+  }
+
   try {
     // 1. Fetch Metadata
     job.status = 'downloading_metadata';
@@ -266,8 +420,37 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         console.warn(`Job ${jobId} was deleted during metadata fetch.`);
         return;
       }
-      // Fetch manifest URL, download it and upload to S3
-
+      logger.info(metadata.title)
+      logger.info(metadata.channel_id)
+      
+      // Check if video meets duration requirements
+      if (metadata.duration) {
+        const durationMinutes = metadata.duration / 60;
+        logger.info(`Video duration: ${durationMinutes.toFixed(1)} minutes`);
+        
+        // Skip videos that are too short (less than 20 minutes) unless whitelisted
+        if (metadata.duration < 20 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
+          job.status = 'completed';
+          job.error = `Video duration is too short (${durationMinutes.toFixed(1)} minutes, minimum 20 minutes required)`;
+          job.completedAt = new Date();
+          await persistJobUpdate(jobId, job);
+          return;
+        }
+        
+        // For videos between 20-30 minutes, must be whitelisted
+        if (metadata.duration >= 20 * 60 && metadata.duration < 30 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
+          job.status = 'completed';
+          job.error = `Video duration is ${durationMinutes.toFixed(1)} minutes (between 20-30 min), but not whitelisted`;
+          job.completedAt = new Date();
+          await persistJobUpdate(jobId, job);
+          return;
+        }
+        
+        // Videos 30+ minutes or whitelisted videos 20+ minutes can proceed
+        logger.info(`Video meets duration requirements, proceeding with download`);
+      } else {
+        logger.warn(`Video duration not available, proceeding with download`);
+      }
       job.metadata = metadata;
       await persistJobUpdate(jobId, job);      
       console.log(`Job ${jobId}: Metadata fetched successfully.`);
@@ -314,7 +497,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
       return; 
     }
-
+    
     // 2. Start Video Download with Merge
     job = downloadJobs.get(jobId);
     if (!job || job.status === 'error') { 
@@ -351,7 +534,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
             channelId: sqsJobMessage.channelId || channelId,
             originalUri: sqsJobMessage.originalUri || url,
             publishedDate: sqsJobMessage.publishedDate || new Date().toISOString(),
-            contentType: 'Video', // Always Video for new structure
+            contentType: 'video',
             hostName: sqsJobMessage.hostName || metadata?.uploader || '',
             hostDescription: sqsJobMessage.hostDescription || '',
             genre: sqsJobMessage.genre || '',
@@ -446,36 +629,65 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         
         // Clean up metadata file after successful completion
         await cleanupMetadataFile(jobId);
+        
+        // Check and manage task protection after job completion
+        await manageTaskProtection();
       
       }
 
     } catch (downloadError: any) {
       console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
+      logger.error(`yt-dlp operation failed for job ${jobId} - server protected, abandoning job`, downloadError);
+      
       const errorJobState = downloadJobs.get(jobId);
       if (errorJobState) {
         errorJobState.status = 'error';
-        errorJobState.error = `Download and merge failed: ${downloadError?.message || String(downloadError)}`;
+        // Include more specific error categorization for yt-dlp failures
+        const errorMessage = downloadError?.message || String(downloadError);
+        if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
+          errorJobState.error = `yt-dlp error (job abandoned): ${errorMessage}`;
+        } else {
+          errorJobState.error = `Download and merge failed: ${errorMessage}`;
+        }
         errorJobState.completedAt = new Date();
         await persistJobUpdate(jobId, errorJobState);
       }
       
-      // Clean up metadata file even on error
       await cleanupMetadataFile(jobId);
+      
+      // Check and manage task protection after job error
+      await manageTaskProtection();
     }
 
   } catch (error: any) {
     console.error(`Overall error in processDownload for job ${jobId}:`, error);
+    logger.error(`Critical failure in processDownload for job ${jobId} - server protected, abandoning job`, error);
+    
     const criticalFailureJob = downloadJobs.get(jobId);
     if (criticalFailureJob) {
       criticalFailureJob.status = 'error';
-      criticalFailureJob.error = (criticalFailureJob.error ? criticalFailureJob.error + '; ' : '') + 
-                                 `Critical error: ${error?.message || String(error)}`;
+      
+      // Categorize the error for better diagnostics
+      const errorMessage = error?.message || String(error);
+      let categorizedError = '';
+      if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
+        categorizedError = `yt-dlp critical error (job abandoned): ${errorMessage}`;
+      } else if (errorMessage.includes('metadata') || errorMessage.includes('getVideoMetadata')) {
+        categorizedError = `Metadata extraction error (job abandoned): ${errorMessage}`;
+      } else {
+        categorizedError = `Critical error (job abandoned): ${errorMessage}`;
+      }
+      
+      criticalFailureJob.error = (criticalFailureJob.error ? criticalFailureJob.error + '; ' : '') + categorizedError;
       criticalFailureJob.completedAt = new Date();
       await persistJobUpdate(jobId, criticalFailureJob);
     }
     
     // Clean up metadata file on critical failure
     await cleanupMetadataFile(jobId);
+    
+    // Check and manage task protection after critical failure
+    await manageTaskProtection();
   }
 }
 
@@ -487,6 +699,9 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
   if (!isRDSEnabled) {
     throw new Error('RDS is not enabled - cannot process existing episode');
   }
+
+  // Enable ECS task protection for existing episode processing
+  await enableTaskProtection(60); // 1 hour protection for existing episodes
 
   try {
     // 1. Get existing episode data from RDS
@@ -541,23 +756,38 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     });
 
     logger.info(`Updated episode ${episodeId} with episodeUri: ${episodeUri}`);
+    
+    // Check and manage task protection after successful completion
+    await manageTaskProtection();
   } catch (error: any) {
     logger.error(`Failed to download video for existing episode ${episodeId}: ${error.message}`, error);
+    logger.error(`yt-dlp operation failed for existing episode ${episodeId} - server protected, abandoning job`, error);
     
     // Update episode with error status if possible
     try {
       if (isRDSEnabled) {
         const currentEpisode = await rdsService.getEpisode(episodeId);
+        const errorMessage = error?.message || String(error);
+        let categorizedError = '';
+        if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
+          categorizedError = `yt-dlp error: ${errorMessage}`;
+        } else {
+          categorizedError = errorMessage;
+        }
+        
         await rdsService.updateEpisode(episodeId, {
           additionalData: { 
             ...currentEpisode?.additionalData, 
-            videoDownloadError: error.message 
+            videoDownloadError: categorizedError
           }
         });
       }
     } catch (updateError: any) {
       logger.error(`Failed to update episode ${episodeId} with error status: ${updateError.message}`);
     }
+    
+    // Check and manage task protection after error
+    await manageTaskProtection();
     
     throw error;
   }
@@ -625,6 +855,14 @@ app.post('/api/download-video-existing', async (req: Request, res: Response) => 
  * Health check endpoint
  */
 app.get('/health', (req: Request, res: Response) => {
+  const activeJobs = Array.from(downloadJobs.values()).filter(
+    job => job.status === 'pending' || 
+           job.status === 'downloading_metadata' || 
+           job.status === 'extracting_guests' ||
+           job.status === 'downloading' || 
+           job.status === 'merging'
+  );
+
   res.json({ 
     status: 'healthy', 
     service: 'podcast-pipeline',
@@ -632,6 +870,17 @@ app.get('/health', (req: Request, res: Response) => {
     s3Enabled: isS3Enabled,
     sqsEnabled: isSQSEnabled,
     rdsEnabled: isRDSEnabled,
+    ecsDeployment: isECSDeployment,
+    activeJobs: activeJobs.length,
+    taskProtectionActive: isECSDeployment && activeJobs.length > 0,
+    taskProtectionMonitoring: isECSDeployment && taskProtectionTimeout !== null,
+    shutdownProtected: !allowShutdown,
+    ytdlpErrorProtection: 'enabled', // Server protected from yt-dlp failures
+    errorHandling: {
+      ytdlpProtected: true,
+      jobIsolation: true,
+      serverStability: 'individual job failures do not crash server'
+    },
     // guestExtractionEnabled: false,
     podcastConversionEnabled: isPodcastConversionEnabled
   });
@@ -687,6 +936,76 @@ app.get('/api/update-status', (req: Request, res: Response) => {
   }
 });
 
+// Enable shutdown endpoint (for administrative purposes)
+app.post('/api/enable-shutdown', (req: Request, res: Response) => {
+  try {
+    const { authorization } = req.body;
+    
+    // Simple authorization check - in production, use proper authentication
+    const expectedAuth = process.env.SHUTDOWN_AUTH_TOKEN || 'admin-shutdown-token';
+    
+    if (authorization !== expectedAuth) {
+      res.status(401).json({
+        success: false,
+        message: 'Unauthorized - invalid authorization token'
+      });
+      return;
+    }
+    
+    enableShutdown();
+    res.json({
+      success: true,
+      message: 'Shutdown enabled - server can now be terminated',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: `Failed to enable shutdown: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Trigger shutdown endpoint (for administrative purposes)
+app.post('/api/shutdown', (req: Request, res: Response) => {
+  try {
+    const { authorization, reason } = req.body;
+    
+    // Simple authorization check - in production, use proper authentication
+    const expectedAuth = process.env.SHUTDOWN_AUTH_TOKEN || 'admin-shutdown-token';
+    
+    if (authorization !== expectedAuth) {
+      res.status(401).json({
+        success: false,
+        message: 'Unauthorized - invalid authorization token'
+      });
+      return;
+    }
+    
+    const shutdownReason = reason || 'Administrative shutdown via API';
+    
+    // Send response before shutting down
+    res.json({
+      success: true,
+      message: `Server shutdown initiated: ${shutdownReason}`,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Give a moment for the response to be sent, then shutdown
+    setTimeout(() => {
+      initiateShutdown(shutdownReason);
+    }, 1000);
+    
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: `Failed to initiate shutdown: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // Serve a simple API documentation page
 app.get('/', (req: Request, res: Response) => {
   res.json({
@@ -699,7 +1018,9 @@ app.get('/', (req: Request, res: Response) => {
       'GET /api/jobs': 'Get all podcast processing jobs',
       'DELETE /api/job/:jobId': 'Delete a podcast processing job',
       'GET /health': 'Health check',
-      'GET /downloads/*': 'Access downloaded podcast files'
+      'GET /downloads/*': 'Access downloaded podcast files',
+      'POST /api/enable-shutdown': 'Enable server shutdown (requires auth token)',
+      'POST /api/shutdown': 'Shutdown server (requires auth token)'
     },
     usage: {
       'Start Podcast Processing': 'POST /api/download with { "url": "https://youtube.com/watch?v=..." }',
@@ -708,6 +1029,8 @@ app.get('/', (req: Request, res: Response) => {
       'List All Jobs': 'GET /api/jobs',
       'Update yt-dlp': 'POST /api/update-ytdlp with { "nightly": true/false, "force": true/false }',
       'Update Status': 'GET /api/update-status',
+      'Enable Shutdown': 'POST /api/enable-shutdown with { "authorization": "your-auth-token" }',
+      'Shutdown Server': 'POST /api/shutdown with { "authorization": "your-auth-token", "reason": "optional reason" }',
       'SQS Message Format (New)': '{ "jobId": "uuid" (optional), "url": "https://youtube.com/...", "channelId": "channel-id" (optional) }',
       'SQS Message Format (Existing)': '{ "id": "episodeId", "url": "https://youtube.com/..." }'
     },
@@ -717,6 +1040,10 @@ app.get('/', (req: Request, res: Response) => {
       'S3 Upload': isS3Enabled ? 'Enabled' : 'Disabled',
       'SQS Queue': isSQSEnabled ? 'Enabled' : 'Disabled',
       'RDS Storage': isRDSEnabled ? 'Enabled (PostgreSQL)' : 'Disabled',
+      'ECS Task Protection': isECSDeployment ? 'Enabled' : 'Disabled',
+      'Shutdown Protection': allowShutdown ? 'Disabled (can shutdown)' : 'Enabled (protected)',
+      'yt-dlp Error Protection': 'Enabled (server protected from tool failures)',
+      'Job Isolation': 'Enabled (individual job failures do not crash server)',
       'Video Trimming Queue': isSQSEnabled ? 'Ready' : 'Disabled'
     }
   });
@@ -767,6 +1094,13 @@ async function startServer(): Promise<void> {
       console.log(`🔄 Manual Update: POST http://localhost:${PORT}/api/update-ytdlp`);
       console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
       console.log(`🎧 Podcast Conversion: ${isPodcastConversionEnabled ? 'Enabled' : 'Disabled'}`);
+      console.log(`🛡️ ECS Task Protection: ${isECSDeployment ? 'Enabled' : 'Disabled'}`);
+      console.log(`🔒 Shutdown Protection: Enabled (use API endpoints to shutdown)`);
+      
+      if (isECSDeployment) {
+        console.log(`🔗 ECS Cluster: ${ECS_CLUSTER_NAME}`);
+        console.log(`📋 Task ARN: ${ECS_TASK_ARN}`);
+      };
       
       // Start SQS polling if enabled
       if (enableSQS) {
@@ -795,17 +1129,39 @@ async function startServer(): Promise<void> {
       console.log('✨ Server startup completed successfully');
     });
     
-    // Setup graceful shutdown
+    // Setup graceful shutdown with protection against external signals
     process.on('SIGINT', async () => {
+      if (!allowShutdown) {
+        console.log('🛡️ SIGINT received but shutdown is protected - ignoring external signal');
+        console.log('💡 Use the shutdown API endpoint or internal shutdown functions to terminate');
+        return;
+      }
+      
       console.log('SIGINT received, shutting down server...');
+      if (taskProtectionTimeout) {
+        clearTimeout(taskProtectionTimeout);
+      }
+      await disableTaskProtection();
       await rdsService.closeClient(); // Close RDS connection
       server.close();
+      process.exit(0);
     });
     
     process.on('SIGTERM', async () => {
+      if (!allowShutdown) {
+        console.log('🛡️ SIGTERM received but shutdown is protected - ignoring external signal');
+        console.log('💡 Use the shutdown API endpoint or internal shutdown functions to terminate');
+        return;
+      }
+      
       console.log('SIGTERM received, shutting down server...');
+      if (taskProtectionTimeout) {
+        clearTimeout(taskProtectionTimeout);
+      }
+      await disableTaskProtection();
       await rdsService.closeClient(); // Close RDS connection
       server.close();
+      process.exit(0);
     });
     
   } catch (error: any) {

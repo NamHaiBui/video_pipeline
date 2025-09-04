@@ -11,7 +11,6 @@
     "dev": "tsx src/server.ts",
     "server": "tsx src/server.ts",
     "server:build": "npm run build && node dist/server.js",
-    "server:sqs": "ENABLE_SQS_POLLING=true tsx src/server.ts",
     "setup": "tsx src/lib/setup_binaries.ts",
     "postinstall": "tsx src/lib/setup_binaries.ts",
     "update-ytdlp": "tsx src/scripts/update_ytdlp.ts",
@@ -20,13 +19,11 @@
     "update-ytdlp:skip-check": "tsx src/scripts/update_ytdlp.ts --skip-version-check",
     "test:metadata-only": "tsx src/scripts/test-metadata-only.ts",
     "test:slug-filename": "tsx src/scripts/test-slug-filename.ts",
-    "test:slug-integration": "tsx src/scripts/test-slug-integration.ts",
-    "test:complete-slug": "tsx src/scripts/test-complete-slug.ts",
-    "test:video-slug": "tsx src/scripts/test-video-slug.ts",
-    "test:trimming-queue": "tsx scripts/test-video-trimming-queue.ts",
-    "test:guest-extraction": "tsx scripts/test-guest-extraction.ts",
-    "diagnose:ytdlp-warnings": "tsx src/scripts/diagnose-ytdlp-warnings.ts",
-    "migrate:rds": "tsx src/scripts/migrate-to-rds.ts"
+  "test:slug-integration": "tsx src/scripts/test-slug-integration.ts",
+  "test:concurrency": "tsx scripts/test-concurrency.ts",
+  "test:retry": "tsx scripts/test-retry.ts",
+  "test:ecs-protection": "tsx scripts/test-ecs-protection.ts",
+  "backfill:master": "tsx scripts/backfill-master-m3u8.ts"
   },
   "keywords": [
     "podcast",

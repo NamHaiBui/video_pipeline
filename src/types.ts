@@ -263,7 +263,7 @@ export interface SQSJobMessage {
   channelId?: string;
   originalUri?: string; // The video URL for new entries
   publishedDate?: string;
-  contentType?: 'Video';
+  contentType?: 'video';
   hostName?: string;
   hostDescription?: string;
   languageCode?: string;
@@ -408,7 +408,7 @@ export interface RDSEpisodeData {
   summaryTranscriptUri?: string;
   
   /** Content type: Audio or Video */
-  contentType: 'Audio' | 'Video';
+  contentType: 'audio' | 'video';
   /** Processing status information (as JSON) */
   processingInfo: EpisodeProcessingInfo;
   /** Additional data as JSON for future use */

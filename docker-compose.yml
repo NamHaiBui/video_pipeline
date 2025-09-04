@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest

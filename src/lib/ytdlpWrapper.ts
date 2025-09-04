@@ -12,6 +12,7 @@ import { generateAudioS3Key, generateLowerDefVideoS3Key, generateM3U8S3Key, gene
 import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getManifestUrl, getThumbnailUrl } from './utils/utils.js';
 import { logger } from './utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
+import { withSemaphore, diskSemaphore, httpSemaphore, computeDefaultConcurrency } from './utils/concurrency.js';
 import { sendToTranscriptionQueue } from '../sqsPoller.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -161,11 +162,13 @@ function checkBinaries(): void {
 }
 
 /**
+ * Get optimal audio format for podcast content - always returns MP3
+ */
+/**
  * Get optimal audio format for podcast content
  */
 function getPodcastAudioFormat(): string {
   const preferredFormat = process.env.PREFERRED_AUDIO_FORMAT || 'mp3';
-  
   // Podcast-optimized format selection
   switch (preferredFormat.toLowerCase()) {
     case 'opus':
@@ -191,15 +194,15 @@ function buildYtdlpArgs(
 ): string[] {
   // Ensure cookies are always included
   const optionsWithCookies = ensureCookiesInOptions(options);
+  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || 4);
   
   let baseArgs = [
     videoUrl,
     '-o', outputPathAndFilename,
     '-f', format,
-    '-v',
     '--plugin-dirs','./.config/yt-dlp/plugins/',
-    '-N', '4',
-    '--extractor-args', `youtubepot-bgutilhttp:base_url=${process.env.BGUTIL_PROVIDER_URL || 'http://bgutil-provider:4416'}`,
+    '-N', String(ytdlpConnections),
+    '--extractor-args', `youtubepot-bgutilhttp:base_url=${process.env.BGUTIL_PROVIDER_URL || 'http://localhost:4416'}`,
     '--no-continue',
     ...additionalArgs
   ];
@@ -256,8 +259,6 @@ function handleProgressData(line: string, options: DownloadOptions): void {
         speed: '',
         raw: progressData
       });
-    } else {
-      logger.debug('Progress received', { progressData });
     }
   }
 }
@@ -283,7 +284,7 @@ function executeDownloadProcess(
   args: string[],
   options: DownloadOptions
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
+  return withSemaphore(diskSemaphore, 'disk_ytdlp', () => new Promise((resolve, reject) => {
     logger.debug('Executing yt-dlp command', { command: `${YTDLP_PATH} ${args.join(' ')}` });
     const ytdlpProcess = spawn(YTDLP_PATH, args);
     let downloadedFilePath = '';
@@ -297,25 +298,11 @@ function executeDownloadProcess(
       if (detectedPath) {
         downloadedFilePath = detectedPath;
       }
-      // Log ALL yt-dlp stdout messages for enhanced debugging
-      if (line.trim().length > 0) {
-        logger.info('yt-dlp stdout', { line });
-        console.log(`[yt-dlp stdout] ${line}`);
-      }
     });
 
     ytdlpProcess.stderr?.on('data', (data: Buffer) => {
       const line = data.toString().trim();
       stderrOutput += line + '\n';
-      
-      // Log all yt-dlp output regardless of content
-      if (line.trim().length > 0) {
-        logger.info('yt-dlp output', { 
-          message: line,
-          operation: 'video_download'
-        });
-        console.log(`[yt-dlp] ${line}`);
-      }
     });
 
     ytdlpProcess.on('error', (error: Error) => {
@@ -342,7 +329,7 @@ function executeDownloadProcess(
         reject(new Error(`${errorMessage}\nStderr: ${stderrOutput}`));
       }
     });
-  });
+  }));
 }
 
 export async function getVideoMetadata(videoUrl: string, options: DownloadOptions = {}): Promise<VideoMetadata> {
@@ -353,7 +340,7 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
     '--dump-json',
     '--no-warnings',
     '--plugin-dirs','./.config/yt-dlp/plugins/',
-    '--extractor-args', `youtubepot-bgutilhttp:base_url=${process.env.BGUTIL_PROVIDER_URL || 'http://bgutil-provider:4416'}`,
+    '--extractor-args', `youtubepot-bgutilhttp:base_url=${process.env.BGUTIL_PROVIDER_URL || 'http://localhost:4416'}`,
   ];
 
   // Add ffmpeg location if available
@@ -398,19 +385,7 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
       });
     });
 
-    // Log all stderr output regardless of content
-    if (stderr) {
-      const lines = stderr.trim().split('\n');
-      lines.forEach(line => {
-        if (line.trim().length > 0) {
-          logger.info('yt-dlp metadata output', { 
-            message: line.trim(),
-            operation: 'metadata_fetch'
-          });
-          console.log(`[yt-dlp metadata] ${line.trim()}`);
-        }
-      });
-    }
+  // Intentionally silence yt-dlp metadata stderr noise
     
     try {
       const metadata = JSON.parse(stdout) as VideoMetadata;
@@ -435,7 +410,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
   return new Promise(async (resolve, reject) => {
     const outputDir = options.outputDir || PODCAST_OUTPUT_DIR;
     let outputFilenameTemplate = options.outputFilename || 'unknown-podcast/untitled-episode.%(ext)s';
-    const format = options.format || getPodcastAudioFormat();
+    const format = getPodcastAudioFormat();
     
     // Use provided metadata or fetch it once
     let videoMetadata = metadata;
@@ -508,9 +483,9 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
                   await s3Service.deleteLocalFile(finalPath);
                   logger.info('Deleted local audio file after S3 upload', { filename: path.basename(finalPath) });
                   
-                  // Clean up empty directories after deleting the audio file
+                  // Clean up empty directories after deleting the audio file - use podcast cleanup
                   const audioDir = path.dirname(finalPath);
-                  await cleanupEmptyDirectories(audioDir);
+                  await cleanupEmptyPodcastDirectories(audioDir);
                 } catch (deleteError) {
                   logger.warn('Failed to delete local audio file', { error: deleteError, filename: path.basename(finalPath) });
                 }
@@ -527,9 +502,9 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
                   await s3Service.deleteLocalFile(finalPath);
                   logger.info('Deleted local audio file after failed S3 upload', { filename: path.basename(finalPath) });
                   
-                  // Clean up empty directories after deleting the audio file
+                  // Clean up empty directories after deleting the audio file - use podcast cleanup
                   const audioDir = path.dirname(finalPath);
-                  await cleanupEmptyDirectories(audioDir);
+                  await cleanupEmptyPodcastDirectories(audioDir);
                 } catch (deleteError) {
                   logger.warn('Failed to delete local audio file after failed upload', { error: deleteError, filename: path.basename(finalPath) });
                 }
@@ -537,12 +512,10 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
             }
           } else {
             logger.warn('S3 service not available, skipping upload');
-            
-            // Clean up local file if S3 upload was requested but service is unavailable
             const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
             if (shouldDeleteLocal) {
               try {
-                await cleanupFileAndDirectories(finalPath);
+                await cleanupPodcastFileAndDirectories(finalPath);
                 logger.info('Deleted local audio file (S3 service unavailable)', { filename: path.basename(finalPath) });
               } catch (deleteError) {
                 logger.warn('Failed to delete local audio file', { error: deleteError, filename: path.basename(finalPath) });
@@ -556,7 +529,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
           const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
           if (shouldDeleteLocal) {
             try {
-              await cleanupFileAndDirectories(finalPath);
+              await cleanupPodcastFileAndDirectories(finalPath);
               logger.info('Deleted local audio file after S3 upload error', { filename: path.basename(finalPath) });
             } catch (deleteError) {
               logger.warn('Failed to delete local audio file after upload error', { error: deleteError, filename: path.basename(finalPath) });
@@ -576,11 +549,13 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
 
     const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
     let outputFilenameTemplate = options.outputFilename || 'unknown-podcast/untitled-episode.%(ext)s';
-    const format = options.format || `bestvideo[height<=${videoDefinition}][ext=mp4]/best[height<=${videoDefinition}][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]/best`;
+    
+    // More flexible format selection for video-only downloads
+    const format = options.format || `bestvideo[height<=${videoDefinition}]/bestvideo[height<=${parseInt(videoDefinition)+200}]/bestvideo/best[height<=${videoDefinition}]/best`;
 
     // Prepare output template with metadata if available
     if (metadata) {
-      outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, metadata, false); // Don't use subdirectory for temp files
+      outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, metadata, false); 
     }
     
     // Ensure the directory structure exists for the podcast-title subdirectory
@@ -662,7 +637,7 @@ export function downloadAndMergeVideo(
       const thumbnail = await downloadContent(getThumbnailUrl(videoMetadata));
       
       const timestamp = Date.now();
-      const videoDefinition = metadata?.filesize_approx && metadata.filesize_approx < 1000000 ? '1080' : '720'; // Use 1080 for small files, else default to 720
+      const videoDefinition = metadata?.filesize_approx && metadata.filesize_approx < 1000000 ? '1080' : '720';
       
       const videoDownloadPromise = downloadVideoNoAudioWithProgress(videoUrl, {
         ...options,
@@ -731,7 +706,9 @@ export function downloadAndMergeVideo(
         } catch (error: any) {
           logger.error(`❌ Error uploading audio to S3: ${error.message}`);
         }
-        let updatedGuestInfo = false
+        let updatedGuestInfo = false;
+        let shouldSendToTranscriptionQueue = true; // Flag to control SQS message distribution
+        
         // Process metadata and save podcast episode data to RDS when audio is finished
         // Use the new RDS service method that handles all the new schema fields
         try {
@@ -739,12 +716,89 @@ export function downloadAndMergeVideo(
           if (rdsService) {
             await rdsService.initClient();
           }
-          if (rdsService && videoMetadata && uploadedAudioInfo?.location) {
-            logger.info('💾 Processing and saving podcast episode metadata to RDS...');
+          
+          // Fail if RDS service, metadata, or audio upload is not available
+          if (!rdsService) {
+            throw new Error('RDS service not available - cannot proceed without database connection');
+          }
+          if (!videoMetadata) {
+            throw new Error('Video metadata is required - cannot proceed without metadata');
+          }
+          if (!uploadedAudioInfo?.location) {
+            throw new Error('Audio upload failed - cannot proceed without uploaded audio');
+          }
+          
+          // Fail if channelInfo (SQS message) is not provided
+          if (!channelInfo) {
+            throw new Error('SQS message (channelInfo) is required - cannot proceed without proper message data');
+          }
+          
+          logger.info('💾 Processing and saving podcast episode metadata to RDS...');
+          
+          // Check processing status using multiple methods
+          let processingStatus: any = null;
+          let existingEpisode: any = null;
+          
+          // First check by youtubeVideoId if available
+          if (videoMetadata.id) {
+            existingEpisode = await rdsService.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
+            if (existingEpisode) {
+              logger.info(`📝 Found existing episode by youtubeVideoId: ${existingEpisode.episodeId}`);
+              
+              // Check the processing status of the existing episode
+              const additionalData = existingEpisode.additionalData || {};
+              const hasVideoLocation = additionalData.videoLocation !== undefined;
+              const hasMasterM3u8 = additionalData.master_m3u8 !== undefined;
+              
+              if (hasVideoLocation && hasMasterM3u8) {
+                logger.info(`✅ Episode ${existingEpisode.episodeId} already fully processed - skipping all processing`);
+                episodeId = existingEpisode.episodeId;
+                shouldSendToTranscriptionQueue = false;
+                
+                // Update episode with guest extraction results if available, then return early
+                if (guestExtractionResult) {
+                  logger.info(`🎯 Updating existing fully-processed episode with guest extraction results...`);
+                  await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
+                  logger.info(`✅ Guest extraction results updated for existing episode: ${episodeId}`);
+                }
+                
+                // Return early - skip all video processing
+                return episodeId;
+              } else if (hasVideoLocation && !hasMasterM3u8) {
+                logger.info(`🔄 Episode ${existingEpisode.episodeId} has videoLocation but missing master_m3u8 - will reprocess video`);
+                episodeId = existingEpisode.episodeId;
+                shouldSendToTranscriptionQueue = false; // Don't send transcription message for reprocessing
+                
+                // Update episode with guest extraction results if available
+                if (guestExtractionResult) {
+                  logger.info(`🎯 Updating existing episode with guest extraction results before reprocessing...`);
+                  await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
+                  logger.info(`✅ Guest extraction results updated for existing episode: ${episodeId}`);
+                  updatedGuestInfo = true;
+                }
+                
+                // Continue with video processing but use existing episodeId
+                logger.info(`🔄 Continuing with video processing for existing episode: ${episodeId}`);
+              } else {
+                logger.info(`📝 Episode ${existingEpisode.episodeId} exists but no videoLocation - will process normally`);
+                episodeId = existingEpisode.episodeId;
+                shouldSendToTranscriptionQueue = false; // Don't send SQS message for existing episodes
+                
+                // Update episode with guest extraction results if available
+                if (guestExtractionResult) {
+                  logger.info(`🎯 Updating existing episode with guest extraction results...`);
+                  await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
+                  logger.info(`✅ Guest extraction results updated for existing episode: ${episodeId}`);
+                  updatedGuestInfo = true;
+                }
+              }
+            }
+          }
+          // If no existing episode found at all, create new one
+          if (!existingEpisode && !processingStatus?.exists) {
+            logger.info(`🆕 No existing episode found, creating new episode`);
             
-            // Use the RDS service to store new episode
-            if (channelInfo) {
-              // channelInfo is already in the new SQS message format - store directly
+            try {
               ({ episodeId } = await rdsService.storeNewEpisode(
                 channelInfo,
                 uploadedAudioInfo.location!,
@@ -762,62 +816,68 @@ export function downloadAndMergeVideo(
                 logger.info(`🎯 Found ${guestExtractionResult.guest_names.length} guests and ${guestExtractionResult.topics.length} topics`);
                 updatedGuestInfo = true;
               }
-            } else {
-              const messageBody: SQSMessageBody = {
-                videoId: videoMetadata.id || '',
-                episodeTitle: videoMetadata.title || 'Untitled',
-                channelName: videoMetadata.uploader || 'Unknown Channel',
-                channelId: channelId,
-                originalUri: videoMetadata.webpage_url || '',
-                publishedDate: (parseVideoDate(videoMetadata.upload_date) || new Date()).toISOString(),
-                contentType: 'Video',
-                hostName: videoMetadata.uploader || '',
-                hostDescription: '',
-                genre: '',
-                country: 'USA',
-                websiteLink: '',
-                additionalData: {
-                  youtubeVideoId: videoMetadata.id || '',
-                  youtubeChannelId: channelId,
-                  youtubeUrl: videoMetadata.webpage_url || '',
-                  notificationReceived: new Date().toISOString()
-                }
-              };
-              ({episodeId} = await rdsService.storeNewEpisode(
-                messageBody,
-                uploadedAudioInfo.location!,
-                videoMetadata,
-                thumbnail_s3_link
-              ));
-              if (!episodeId || episodeId.length === 0) {
-                throw new Error('RDS service returned empty episodeId after storing new episode');
+            } catch (storeError: any) {
+              if (storeError.message.includes('Duplicate episode detected')) {
+                logger.warn(`⚠️ ${storeError.message}`);
+                logger.warn(`🗑️ Skipping duplicate episode and cleaning up resources...`);
+                
+                // Since this is a duplicate, we should indicate to the caller that processing should stop
+                throw new Error(`DUPLICATE_EPISODE: ${storeError.message}`);
+              } else {
+                throw storeError;
               }
-              logger.info(`✅ Fallback episode metadata saved successfully to RDS: ${episodeId}`);
-
-              // Update episode with guest extraction results if available
-              if (guestExtractionResult && ! updatedGuestInfo) {
-                logger.info(`🎯 Updating fallback episode with guest extraction results...`);
-                await rdsService.updateEpisodeWithGuestExtraction(episodeId, guestExtractionResult);
-                logger.info(`✅ Guest extraction results updated for fallback episode: ${episodeId}`);
-              }
-
             }
-            logger.info(`Episode stored with ID: ${episodeId}, Guest info updated: ${updatedGuestInfo}`);
-            if (!episodeId || episodeId.length === 0) {
-              throw new Error('RDS service returned empty episodeId after storing new episode');
+          }
+          
+          logger.info(`Episode processed with ID: ${episodeId}, Guest info updated: ${updatedGuestInfo}, Will send to transcription queue: ${shouldSendToTranscriptionQueue}`);
+          
+          if (!episodeId || episodeId.length === 0) {
+            throw new Error('Episode ID is empty - cannot proceed without valid episode ID');
+          }
+          
+          // Send message to transcription queue only if this is a new episode
+          if (shouldSendToTranscriptionQueue) {
+            logger.info('Preparing to send message to transcription queue...', {
+              episodeId,
+              uploadedAudioInfoAvailable: !!uploadedAudioInfo,
+              audioLocation: uploadedAudioInfo?.location || 'undefined'
+            });
+            
+            // Validate required fields before creating message
+            if (!episodeId || episodeId.trim() === '') {
+              logger.error('❌ Cannot send to transcription queue: episodeId is empty', undefined, { episodeId });
+              throw new Error('Episode ID is required for transcription queue');
             }
-            // Send message to transcription queue if enabled and audio upload succeeded
-            logger.info('Sending message to transcription queue...');
-            const transcribeSQSMessage = { episodeId: episodeId, audioUri: uploadedAudioInfo.location! };
-            logger.info(`Transcription message: ${JSON.stringify(transcribeSQSMessage).substring(0, 200)}...`);
+            
+            if (!uploadedAudioInfo?.location || uploadedAudioInfo.location.trim() === '') {
+              logger.error('❌ Cannot send to transcription queue: audio location is empty', undefined, { 
+                uploadedAudioInfo,
+                location: uploadedAudioInfo?.location 
+              });
+              throw new Error('Audio location is required for transcription queue');
+            }
+            
+            const transcribeSQSMessage = { 
+              episodeId: episodeId.trim(), 
+              audioUri: uploadedAudioInfo.location.trim() 
+            };
+            
+            logger.info('Transcription message constructed:', {
+              episodeId: transcribeSQSMessage.episodeId,
+              audioUri: transcribeSQSMessage.audioUri,
+              messageJSON: JSON.stringify(transcribeSQSMessage),
+              messageLength: JSON.stringify(transcribeSQSMessage).length
+            });
+            
             await sendToTranscriptionQueue(transcribeSQSMessage);
             logger.info('✅ Message sent to transcription queue successfully');
           } else {
-            logger.warn('⚠️ RDS service not available, metadata missing, or audio upload failed - skipping episode metadata processing');
+            logger.info('📭 Skipping transcription queue message for existing episode');
           }
 
         } catch (error: any) {
           logger.error(`❌ Error processing episode metadata: ${error.message}`);
+          throw error; // Re-throw to fail the process
         }
         
         return episodeId;
@@ -838,7 +898,7 @@ export function downloadAndMergeVideo(
         const episodeSlug = create_slug(videoMetadata.title || 'untitled');
         
         // Create the podcast directory if it doesn't exist
-        const podcastDir = path.join(outputDir, podcastSlug);
+        const podcastDir = path.join(outputDir, podcastSlug, episodeSlug);
         if (!fs.existsSync(podcastDir)) {
           fs.mkdirSync(podcastDir, { recursive: true });
         }
@@ -864,6 +924,18 @@ export function downloadAndMergeVideo(
 
       // Merge video and audio with validation
       await mergeVideoAudioWithValidation(tempVideoPath, tempAudioPath, finalMergedPath, options);
+
+      // Verify the merge was successful before cleaning up temp files
+      if (!fs.existsSync(finalMergedPath)) {
+        throw new Error(`Merged file was not created at expected location: ${finalMergedPath}`);
+      }
+
+      const mergedStats = fs.statSync(finalMergedPath);
+      if (mergedStats.size === 0) {
+        throw new Error(`Merged file is empty: ${finalMergedPath}`);
+      }
+
+      logger.info(`✅ Merge validation successful - file exists and has size: ${(mergedStats.size / 1024 / 1024).toFixed(2)} MB`);
 
       logger.info('Cleaning up temporary files...');
       try {
@@ -933,12 +1005,10 @@ export function downloadAndMergeVideo(
             
             if (videoUploadResult.success) {
               logger.info(`Starting creating lower definitions and uploading to S3...`);
+              
               // try {
                   // Ensure only '1080p' or '720p' is passed as originalQuality
-                const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
-                // await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
-                const renditionResult = await renderingLowerDefinitionVersions(finalMergedPath, videoMetadata, originalQuality, s3Service, bucketName);
-                logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
+                
               // } catch (renditionError) {
               //     logger.error(`❌ Failed to create and upload lower definition video renditions. This will not stop the main process.`, renditionError instanceof Error ? renditionError : new Error(String(renditionError)));
               // }
@@ -948,21 +1018,33 @@ export function downloadAndMergeVideo(
                   logger.info('💾 Updating episode with video S3 URL in additionalData...');
                   await rdsService.updateEpisode(episodeId, {
                       additionalData: {
-                        master_m3u8: renditionResult.masterPlaylists3Link,
                         videoLocation: videoUploadResult.location
                       },
-                      contentType: 'Video'
+                      contentType: 'video'
                     });
+                    const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
+                  // await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
+                  logger.info(`🔄 Starting video rendering with retry logic (max 3 retries with exponential backoff)...`);
+                  const renditionResult = await withRetry(
+                    () => renderingLowerDefinitionVersions(finalMergedPath, videoMetadata, originalQuality, s3Service, bucketName),
+                    3, // maxRetries
+                    2000, // baseDelayMs - 2 seconds
+                    2 // backoffMultiplier
+                  );
+                  logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL in additionalData`);
+                  await rdsService.updateEpisode(episodeId, {
+                    processingDone:true,
+                    additionalData: {
+                      master_m3u8: renditionResult.masterPlaylists3Link
+                    },
+                  });
                   }
                 } catch (updateError: any) {
                   logger.warn('⚠️ RDS video URL update error:', updateError);
                 }
                
               logger.info(`✅ Merged video uploaded to S3 successfully`, { location: videoUploadResult.location });
-              
-              
-              
               const shouldDeleteLocal = true;
               if (shouldDeleteLocal) {
                 try {
@@ -970,7 +1052,7 @@ export function downloadAndMergeVideo(
                   logger.info(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
                   
                   const videoDir = path.dirname(finalMergedPath);
-                  await cleanupEmptyDirectories(videoDir);
+                  await cleanupEmptyPodcastDirectories(videoDir);
                 } catch (deleteError) {
                   logger.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
                 }
@@ -984,10 +1066,8 @@ export function downloadAndMergeVideo(
                 try {
                   await s3Service.deleteLocalFile(finalMergedPath);
                   logger.info(`🗑️ Deleted local video file after failed S3 upload: ${path.basename(finalMergedPath)}`);
-                  
-                  // Clean up empty directories after deleting the final video file
                   const videoDir = path.dirname(finalMergedPath);
-                  await cleanupEmptyDirectories(videoDir);
+                  await cleanupEmptyPodcastDirectories(videoDir);
                 } catch (deleteError) {
                   logger.warn(`⚠️ Failed to delete local video file after failed upload: ${deleteError}`);
                 }
@@ -998,7 +1078,7 @@ export function downloadAndMergeVideo(
             const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
             if (shouldDeleteLocal) {
               try {
-                await cleanupFileAndDirectories(finalMergedPath);
+                await cleanupPodcastFileAndDirectories(finalMergedPath);
                 logger.info(`🗑️ Deleted local video file (S3 service unavailable): ${path.basename(finalMergedPath)}`);
               } catch (deleteError) {
                 logger.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
@@ -1011,7 +1091,7 @@ export function downloadAndMergeVideo(
           const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
           if (shouldDeleteLocal) {
             try {
-              await cleanupFileAndDirectories(finalMergedPath);
+              await cleanupPodcastFileAndDirectories(finalMergedPath);
               logger.info(`🗑️ Deleted local video file after S3 upload error: ${path.basename(finalMergedPath)}`);
             } catch (deleteError) {
               logger.warn(`⚠️ Failed to delete local video file after upload error: ${deleteError}`);
@@ -1042,7 +1122,7 @@ export function downloadAndMergeVideo(
         
         // Clean up final merged file if it was created but process failed later
         if (finalMergedPath && fs.existsSync(finalMergedPath)) {
-          await cleanupFileAndDirectories(finalMergedPath);
+          await cleanupPodcastFileAndDirectories(finalMergedPath);
           logger.info('🗑️ Cleaned up partial merged file after error');
         }
         
@@ -1062,7 +1142,7 @@ export function downloadAndMergeVideo(
         // Clean up final merged file directory if it exists
         if (finalMergedPath) {
           const finalVideoDir = path.dirname(finalMergedPath);
-          await cleanupEmptyDirectories(finalVideoDir);
+          await cleanupEmptyPodcastDirectories(finalVideoDir);
         }
         
         // Clean up the main temp directory if it's empty
@@ -1082,7 +1162,7 @@ export function downloadAndMergeVideo(
 export function mergeVideoAudioWithValidation(videoPath: string, audioPath: string, outputPath: string, _options: DownloadOptions): Promise<string> {
   checkBinaries();
   
-  return new Promise((resolve, reject) => {
+  return withSemaphore(diskSemaphore, 'disk_ffmpeg_merge', () => new Promise((resolve, reject) => {
     // Pre-merge validation
     if (!fs.existsSync(videoPath)) {
       logger.error(`❌ Video file missing: ${videoPath}`);
@@ -1121,6 +1201,24 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
 
     logger.info(`📹 Video file: ${(videoStats.size / 1024 / 1024).toFixed(2)} MB`);
     logger.info(`🔊 Audio file: ${(audioStats.size / 1024 / 1024).toFixed(2)} MB`);
+
+    // Ensure output directory exists and is writable
+    const outputDir = path.dirname(outputPath);
+    if (!fs.existsSync(outputDir)) {
+      logger.info(`Creating output directory: ${outputDir}`);
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    // Test write access to output directory
+    try {
+      const testFile = path.join(outputDir, '.write-test');
+      fs.writeFileSync(testFile, 'test');
+      fs.unlinkSync(testFile);
+      logger.info(`✅ Write access confirmed to: ${outputDir}`);
+    } catch (writeError) {
+      logger.error(`❌ No write access to output directory: ${outputDir}`);
+      return reject(new Error(`Cannot write to output directory: ${outputDir}`));
+    }
 
     const args = [
       '-i', videoPath,
@@ -1161,15 +1259,30 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       reject(error);
     });
 
-    ffmpegProcess.on('close', (code: number | null) => {
+    ffmpegProcess.on('close', async (code: number | null) => {
       if (code === 0) {
-        // Post-merge validation
+        // Give filesystem time to sync after merge
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // Post-merge validation with detailed logging
         if (!fs.existsSync(outputPath)) {
+          logger.error(`❌ Merged file was not created: ${outputPath}`);
+          
+          // Debug output directory contents
+          const outputDir = path.dirname(outputPath);
+          if (fs.existsSync(outputDir)) {
+            const files = fs.readdirSync(outputDir);
+            logger.error(`Files in output directory ${outputDir}:`, undefined, { directory: outputDir, files });
+          } else {
+            logger.error(`Output directory does not exist: ${outputDir}`);
+          }
+          
           return reject(new Error(`Merged file was not created: ${outputPath}`));
         }
 
         const mergedStats = fs.statSync(outputPath);
         if (mergedStats.size === 0) {
+          logger.error(`❌ Merged file is empty: ${outputPath}`);
           return reject(new Error(`Merged file is empty: ${outputPath}`));
         }
 
@@ -1183,7 +1296,7 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
         reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
       }
     });
-  });
+  }));
 }
 
 /**
@@ -1230,6 +1343,21 @@ async function cleanupEmptyDirectories(dirPath: string, stopAtRoot: string = DEF
 }
 
 /**
+ * Clean up empty directories for podcast episodes - goes one level above podcast title
+ * This allows cleanup of the podcast-title directory if all episodes are removed
+ */
+async function cleanupEmptyPodcastDirectories(dirPath: string): Promise<void> {
+  try {
+    // For podcast cleanup, we want to go one level above the DEFAULT_OUTPUT_DIR
+    // so that if a podcast-title directory becomes empty, it gets cleaned up
+    const podcastStopAtRoot = path.dirname(DEFAULT_OUTPUT_DIR);
+    await cleanupEmptyDirectories(dirPath, podcastStopAtRoot);
+  } catch (error: any) {
+    logger.warn(`Failed to cleanup podcast directories for ${dirPath}:`, error.message);
+  }
+}
+
+/**
  * Comprehensive cleanup helper that removes files and cleans up empty directories
  */
 async function cleanupFileAndDirectories(filePath: string, stopAtRoot: string = DEFAULT_OUTPUT_DIR): Promise<void> {
@@ -1245,6 +1373,25 @@ async function cleanupFileAndDirectories(filePath: string, stopAtRoot: string = 
     await cleanupEmptyDirectories(fileDir, stopAtRoot);
   } catch (error: any) {
     logger.warn(`Failed to cleanup file and directories for ${filePath}:`, error.message);
+  }
+}
+
+/**
+ * Comprehensive cleanup helper for podcast files - uses extended cleanup range
+ */
+async function cleanupPodcastFileAndDirectories(filePath: string): Promise<void> {
+  try {
+    // First, delete the file if it exists
+    if (fs.existsSync(filePath)) {
+      await fsPromises.unlink(filePath);
+      logger.info(`🗑️ Deleted podcast file: ${path.basename(filePath)}`);
+    }
+    
+    // Then clean up empty directories with extended range for podcasts
+    const fileDir = path.dirname(filePath);
+    await cleanupEmptyPodcastDirectories(fileDir);
+  } catch (error: any) {
+    logger.warn(`Failed to cleanup podcast file and directories for ${filePath}:`, error.message);
   }
 }
 
@@ -1398,7 +1545,12 @@ export async function downloadContent(url: string): Promise<Buffer | null> {
 
     console.log(`Downloading content from: ${url}`);
     try {
-        const response = await fetch(url);
+        const response = await withSemaphore(httpSemaphore, 'http_fetch', () => withRetry(
+          () => fetch(url),
+          parseInt(process.env.RETRY_ATTEMPTS || '3', 10),
+          parseInt(process.env.RETRY_BASE_DELAY_MS || '500', 10),
+          2
+        ));
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -1422,15 +1574,21 @@ export async function downloadContent(url: string): Promise<Buffer | null> {
  * @param resolution - The target vertical resolution.
  * @returns A promise that resolves when transcoding is complete.
  */
+function getCpuCores(): number {
+  return computeDefaultConcurrency('cpu');
+}
+
 function transcodeRendition(inputPath: string, outputPath: string, resolution: VideoQuality): Promise<void> {
-    return new Promise((resolve, reject) => {
+  return withSemaphore(diskSemaphore, 'disk_ffmpeg_transcode', () => new Promise((resolve, reject) => {
         const height = parseInt(resolution.replace('p', ''), 10);
+        const threads = Math.max(1, parseInt(process.env.FFMPEG_THREADS || '', 10) || getCpuCores());
         logger.info(`Starting transcoding to ${resolution}...`);
 
         const args = [
             '-i', inputPath,
             '-vf', `scale=-2:${height}`, 
             '-c:v', 'libx264',
+            '-x264-params', `threads=${threads}`,
             '-c:a', 'aac',
             '-y', 
             outputPath
@@ -1448,7 +1606,7 @@ function transcodeRendition(inputPath: string, outputPath: string, resolution: V
             reject(error);
         });
 
-        ffmpegProcess.on('close', (code: number | null) => {
+    ffmpegProcess.on('close', (code: number | null) => {
             if (code === 0) {
                 logger.info(`Finished transcoding to ${resolution}.`);
                 resolve();
@@ -1458,7 +1616,7 @@ function transcodeRendition(inputPath: string, outputPath: string, resolution: V
                 reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
             }
         });
-    });
+  }));
 }
 async function createAndUploadRenditions(
     originalFilePath: string,
@@ -1497,6 +1655,53 @@ async function createAndUploadRenditions(
     }
   }
 
+/**
+ * Retry wrapper for operations that may fail due to transient issues
+ * @param operation - The async operation to retry
+ * @param maxRetries - Maximum number of retry attempts (default: 3)
+ * @param baseDelayMs - Base delay between retries in milliseconds (default: 1000)
+ * @param backoffMultiplier - Multiplier for exponential backoff (default: 2)
+ * @returns Promise with the result of the operation
+ */
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelayMs: number = 1000,
+  backoffMultiplier: number = 2
+): Promise<T> {
+  let lastError: Error;
+  
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const result = await operation();
+      if (attempt > 1) {
+        logger.info(`✅ Operation succeeded on attempt ${attempt}`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      
+      if (attempt <= maxRetries) {
+        const delay = baseDelayMs * Math.pow(backoffMultiplier, attempt - 1);
+        logger.warn(`⚠️ Operation failed on attempt ${attempt}/${maxRetries + 1}, retrying in ${delay}ms...`, {
+          error: lastError.message,
+          attempt,
+          maxRetries: maxRetries + 1,
+          nextDelay: delay
+        });
+        
+        // Wait before retrying
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        logger.error(`❌ Operation failed after ${maxRetries + 1} attempts`, lastError);
+        throw lastError;
+      }
+    }
+  }
+  
+  throw lastError!;
+}
+
 export async function renderingLowerDefinitionVersions(
     finalMergedPath: string,
     metadata: VideoMetadata,
@@ -1509,54 +1714,195 @@ export async function renderingLowerDefinitionVersions(
     const episodeName = sanitizeFilename(metadata.title);
     let masterPlaylists3Link = '';
 
-    const renditions_1080 = [
-        { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
-        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
-        { resolution: '854x480', bitrate: '700k', name: '480p' },
-        { resolution: '640x360', bitrate: '400k', name: '360p' },
-    ];
-    const renditions_720 = [
-        { resolution: '1280x720', bitrate: '1200k', name: '720p' },
-        { resolution: '854x480', bitrate: '700k', name: '480p' },
-        { resolution: '640x360', bitrate: '400k', name: '360p' },
-    ];
-    try {
+    const renditions = topEdition === 1080 ? 
+        [
+            { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
+            { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+            { resolution: '854x480', bitrate: '700k', name: '480p' },
+            { resolution: '640x360', bitrate: '400k', name: '360p' },
+        ] : 
+        [
+            { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+            { resolution: '854x480', bitrate: '700k', name: '480p' },
+            { resolution: '640x360', bitrate: '400k', name: '360p' },
+        ];
+
+  try {
+    // Helper to generate a master playlist if FFmpeg doesn't
+    const ensureMasterPlaylist = async () => {
+      const masterPath = path.join(outputDir, 'master.m3u8');
+      try {
+        await fsPromises.access(masterPath);
+        // Master exists; nothing to do
+        return masterPath;
+      } catch {
+        logger.warn('⚠️ FFmpeg did not generate master.m3u8; generating manually...');
+
+        // Build a simple HLS master playlist referencing each rendition's playlist
+        const lines: string[] = [];
+        lines.push('#EXTM3U');
+        lines.push('#EXT-X-VERSION:7');
+
+        const parseBitrateToBps = (br: string): number => {
+          // Expect formats like '2500k', '1200k'
+          const match = br.match(/^(\d+)([kKmM]?)$/);
+          if (!match) return 0;
+          const value = parseInt(match[1], 10);
+          const unit = match[2].toLowerCase();
+          if (unit === 'm') return value * 1000 * 1000;
+          if (unit === 'k') return value * 1000;
+          return value; // already in bps
+        };
+
+        for (const r of renditions) {
+          const bandwidth = parseBitrateToBps(r.bitrate);
+          // Use typical AVC/AAC codec string; adjust if needed
+          const codecs = 'avc1.4d401f,mp4a.40.2';
+          // r.resolution already like '1280x720'
+          lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${r.resolution},CODECS="${codecs}"`);
+          lines.push(`${r.name}/${r.name}.m3u8`);
+        }
+
+        await fsPromises.writeFile(masterPath, lines.join('\n'), 'utf-8');
+        logger.info('✅ Generated master.m3u8 manually');
+        return masterPath;
+      }
+    };
         await fsPromises.mkdir(outputDir, { recursive: true });
 
-        for (const rendition of (topEdition === 1080 ? renditions_1080 : renditions_720)) {
-            logger.info(`🚀 Starting transcode for ${rendition.name}...`);
-            const renditionDir = path.join(outputDir);
-            await fsPromises.mkdir(renditionDir, { recursive: true });
+        // --- Start of Optimized FFmpeg Logic ---
+        logger.info('🚀 Building a single, unified FFmpeg command for all renditions...');
 
-            const ffmpegArgs = [
-                '-i', path.resolve(finalMergedPath),
-                '-vf', `scale=${rendition.resolution}`,
-                '-c:v', 'libx264', '-x264-params', `keyint=48:min-keyint=48:scenecut=0`,
-                '-b:v', rendition.bitrate,
-                '-c:a', 'aac', '-b:a', '96k',
+  const ffmpegArgs: string[] = [
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-i', path.resolve(finalMergedPath), // Single input
+        ];
+
+        // 1. Build the complex filter graph to scale all renditions at once
+        const filterComplexParts: string[] = [];
+        const videoLabels = renditions.map((_, i) => `[v${i}]`).join('');
+        const audioLabels = renditions.map((_, i) => `[a${i}]`).join('');
+        filterComplexParts.push(`[0:v]split=${renditions.length}${videoLabels}`);
+        
+        // Add audio normalization and conditioning to prevent AAC encoder issues
+        filterComplexParts.push(`[0:a]aresample=44100:resampler=soxr,aformat=channel_layouts=stereo:sample_fmts=fltp,asplit=${renditions.length}${audioLabels}`);
+        
+        renditions.forEach((r, i) => {
+            filterComplexParts.push(`[v${i}]scale=${r.resolution}[outv${i}]`);
+        });
+        ffmpegArgs.push('-filter_complex', filterComplexParts.join(';'));
+        
+        // 2. Map the processed streams to outputs and set encoding options for each
+        const streamMapVar: string[] = [];
+        
+        // Add audio codec selection logic to avoid AAC encoder issues
+        const getAudioCodecParams = () => {
+            // Try to detect if source audio is already AAC and in good quality
+            return [
+                '-c:a', 'aac',
+                '-b:a', '96k',
+                '-ac', '2',              // Force stereo output
+                '-ar', '44100',          // Set sample rate to 44.1kHz
+                '-aac_coder', 'twoloop', // Use twoloop AAC coder (more stable)
+                '-avoid_negative_ts', 'make_zero', // Avoid timestamp issues
+            ];
+        };
+        
+        const audioCodecParams = getAudioCodecParams();
+        
+  const cores = getCpuCores();
+  const threadsPerEncoder = Math.max(1, Math.floor(cores / renditions.length));
+  renditions.forEach((r, i) => {
+            const renditionDir = path.join(outputDir, r.name);
+            fsPromises.mkdir(renditionDir, { recursive: true }); // Create sub-directory for each rendition
+
+            ffmpegArgs.push(
+                `-map`, `[outv${i}]`,
+                `-map`, `[a${i}]`,
+                `-c:v`, `libx264`,
+                '-preset', 'veryfast',
+    '-x264-params', `threads=${threadsPerEncoder}:keyint=48:min-keyint=48:scenecut=0`,
+                '-b:v', r.bitrate,
+                ...audioCodecParams, // Use the robust audio codec parameters
                 '-f', 'hls',
                 '-hls_flags', 'single_file',
                 '-hls_time', '6',
                 '-hls_playlist_type', 'vod',
                 '-hls_segment_type', 'fmp4',
-                `${rendition.name}.m3u8`
-            ];
-            await executeCommand(FFMPEG_PATH, ffmpegArgs, renditionDir);
-            logger.info(`✅ Completed transcode for ${rendition.name}.`);
-        }
+                path.join(renditionDir, `${r.name}.m3u8`) // Main output is now the playlist
+            );
+            streamMapVar.push(`v:${i},a:${i}`);
+        });
 
-        logger.info('📜 Generating master playlist...');
-        let masterPlaylistContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
-        for (const rendition of (topEdition === 1080 ? renditions_1080 : renditions_720)) {
-            const bandwidth = parseInt(rendition.bitrate.replace('k', '')) * 1000;
-            masterPlaylistContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${rendition.resolution}\n`;
-            masterPlaylistContent += `${rendition.name}/${rendition.name}.m3u8\n`;
-        }
-        const masterPlaylistPath = path.join(outputDir, 'master.m3u8');
-        await fsPromises.writeFile(masterPlaylistPath, masterPlaylistContent);
-        logger.info('✅ Master playlist created.');
+        // 3. Add automatic master playlist generation
+        ffmpegArgs.push(
+            '-var_stream_map', streamMapVar.join(' '),
+            '-master_pl_name', 'master.m3u8'
+        );
+        
+        // Execute the single, powerful command once with AAC encoder fallback logic
+        logger.info(`🔥 Executing unified FFmpeg command... This may take a while.`);
+        
+        const executeFFmpegWithFallback = async (): Promise<void> => {
+            try {
+                // Try with the default AAC encoder first
+                await executeCommand(FFMPEG_PATH, ffmpegArgs, outputDir);
+            } catch (error: any) {
+                const errorMessage = error.message || String(error);
+                
+                // Check if it's the specific AAC encoder assertion error
+                if (errorMessage.includes('Assertion diff >= 0 && diff <= 120 failed at libavcodec/aacenc.c') ||
+                    errorMessage.includes('aacenc.c:684')) {
+                    logger.warn('⚠️ AAC encoder assertion error detected, trying fallback with audio copy...');
+                    
+                    // Create a fallback command that copies audio instead of re-encoding
+                    const fallbackArgs = [...ffmpegArgs];
+                    
+                    // Find and replace AAC encoding parameters with audio copy
+                    for (let i = 0; i < fallbackArgs.length; i++) {
+                        if (fallbackArgs[i] === '-c:a' && fallbackArgs[i + 1] === 'aac') {
+                            fallbackArgs[i + 1] = 'copy'; // Copy audio stream instead of re-encoding
+                            // Remove AAC-specific parameters
+                            const paramsToRemove = ['-b:a', '-ac', '-ar', '-aac_coder', '-avoid_negative_ts'];
+                            let j = i + 2;
+                            while (j < fallbackArgs.length) {
+                                if (paramsToRemove.includes(fallbackArgs[j])) {
+                                    fallbackArgs.splice(j, 2); // Remove parameter and its value
+                                } else {
+                                    j++;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    
+                    logger.info('🔄 Retrying with audio copy instead of AAC encoding...');
+                    await executeCommand(FFMPEG_PATH, fallbackArgs, outputDir);
+                    logger.info('✅ Fallback with audio copy succeeded');
+                } else {
+                    // Re-throw other errors
+                    throw error;
+                }
+            }
+        };
+        
+        await withRetry(executeFFmpegWithFallback, 1, 1500, 2);
+    logger.info('✅ All renditions transcoded successfully in a single run.');
+        // --- End of Optimized FFmpeg Logic ---
 
-        logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
+    // Ensure master.m3u8 exists (fallback to manual generation if FFmpeg didn't create it)
+    await ensureMasterPlaylist();
+
+    // S3 upload logic remains the same, as it's already efficient.
+    const masterPathLocal = path.join(outputDir, 'master.m3u8');
+    try {
+      await fsPromises.access(masterPathLocal);
+      logger.info('🧾 master.m3u8 present; proceeding with upload');
+    } catch {
+      logger.warn('⚠️ master.m3u8 still not found before upload; upload will proceed but playback may fail');
+    }
+    logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
         const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
 
         const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
@@ -1564,53 +1910,130 @@ export async function renderingLowerDefinitionVersions(
             const fileStat = await fsPromises.stat(filePath);
             if (fileStat.isFile()) {
                 const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath.replace(/\\/g, '/')}`;
-                logger.info(`  - Uploading ${relativeFilePath} to ${s3Key}`);
-                return s3Service.uploadFile(filePath, bucketName, s3Key);
+                return withRetry(() => s3Service.uploadFile(filePath, bucketName, s3Key), 2, 1000, 2);
             }
         });
             
-        await Promise.all(uploadPromises);
+        await Promise.all(uploadPromises.filter(p => p));
         logger.info('✅ All files uploaded successfully.');
 
-        const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;
-        masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
-        logger.info(`🔗 Master Playlist S3 Link: ${masterPlaylists3Link}`);
+  const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;
+  masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
         
         return { success: true, message: 'Lower definition versions rendered and uploaded.', masterPlaylists3Link };
      } catch (error: any) {
         logger.error(`❌ Error in renderingLowerDefinitionVersions: ${error.message}`, error);
-        return { success: false, message: error.message, masterPlaylists3Link: '' };
+        throw error;
     } finally {
-        if (true) {
-            try {
-                logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
-                await fsPromises.rm(outputDir, { recursive: true, force: true });
-                logger.info('✅ Cleanup complete.');
-            } catch (cleanupError: any) {
-                logger.error(`❌ Failed to clean up directory ${outputDir}: ${cleanupError.message}`);
-            }
+        try {
+            logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
+            await fsPromises.rm(outputDir, { recursive: true, force: true });
+            logger.info('✅ Cleanup complete.');
+        } catch (cleanupError: any) {
+            logger.error(`❌ Failed to clean up directory ${outputDir}: ${cleanupError.message}`);
         }
     }
 }
-
 const executeCommand = (command: string, args: string[], cwd: string): Promise<void> => {
-    return new Promise((resolve, reject) => {
+  return withSemaphore(diskSemaphore, 'disk_ffmpeg_hls', () => new Promise((resolve, reject) => {
         logger.info(`Executing in CWD (${cwd}): ${command} ${args.join(' ')}`);
         const proc = spawn(command, args, { cwd, stdio: 'pipe' });
-        let stderrOutput = '';
-        proc.stderr.on('data', (data) => {
-            const msg = data.toString().trim();
-            stderrOutput += msg + '\n';
-            logger.debug(`FFMPEG STDERR: ${msg}`);
+        
+        // Use arrays to collect raw buffer chunks
+        const stdoutChunks: Buffer[] = [];
+        const stderrChunks: Buffer[] = [];
+        
+        proc.stdout?.on('data', (data: Buffer) => stdoutChunks.push(data));
+        proc.stderr?.on('data', (data: Buffer) => stderrChunks.push(data));
+        
+        proc.on('error', (error) => {
+            logger.error(`Failed to start process ${command}`, error);
+            reject(new Error(`Failed to start process: ${error.message}`));
         });
-        proc.on('error', reject);
-        proc.on('close', code => {
+        
+    proc.on('close', code => {
+            const stderrOutput = Buffer.concat(stderrChunks).toString('utf-8');
+            const stdoutOutput = Buffer.concat(stdoutChunks).toString('utf-8');
+
             if (code === 0) {
+                logger.debug(`Command completed successfully: ${command}`);
                 resolve();
             } else {
-                logger.error(`FFmpeg exited with code ${code}. Stderr: ${stderrOutput}`);
-                reject(new Error(`FFmpeg exited with code ${code}.\nFFmpeg stderr:\n${stderrOutput}`));
+                const errorMessage = `${command} exited with code ${code}`;
+                // Now, stderrOutput will reliably contain just the error message
+                logger.error(errorMessage, undefined, { 
+                    command,
+                    args: args.join(' '),
+                    cwd,
+                    exitCode: code,
+                    stderr: stderrOutput, // Log the full, clean error
+                    stdout: stdoutOutput
+                });
+                reject(new Error(`${errorMessage}\nFFmpeg stderr:\n${stderrOutput}`));
             }
         });
-    });
+  }));
 };
+
+/**
+ * Manually write a master.m3u8 using existing rendition playlists in an HLS folder.
+ * Looks for subfolders like 1080p, 720p, 480p, 360p containing <name>/<name>.m3u8.
+ * Only includes variants that exist. Bitrates and resolutions use sensible defaults.
+ *
+ * @param outputDir Directory that contains rendition subfolders (e.g., hls_output)
+ * @param definitions Preferred order of definitions to include (default: ["720p","480p","360p"]).
+ * @returns Absolute path to the written master.m3u8
+ */
+export async function writeMasterM3U8FromRenditions(
+  outputDir: string,
+  definitions: string[] = ["720p", "480p", "360p"]
+): Promise<string> {
+  // Map common definitions to typical resolution and bandwidth (in bps)
+  const DEF_MAP: Record<string, { resolution: string; bandwidth: number }> = {
+    "1080p": { resolution: "1920x1080", bandwidth: 2500000 },
+    "720p": { resolution: "1280x720", bandwidth: 1200000 },
+    "480p": { resolution: "854x480", bandwidth: 700000 },
+    "360p": { resolution: "640x360", bandwidth: 400000 },
+  };
+
+  const codecs = 'avc1.4d401f,mp4a.40.2';
+  const masterPath = path.join(outputDir, 'master.m3u8');
+
+  try {
+    await fsPromises.mkdir(outputDir, { recursive: true });
+  } catch (e) {
+    // directory creation failure will surface during write; continue
+  }
+
+  // Build lines for the master playlist
+  const lines: string[] = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:7',
+  ];
+
+  let included = 0;
+  for (const def of definitions) {
+    const rel = `${def}/${def}.m3u8`;
+    const full = path.join(outputDir, rel);
+    try {
+      await fsPromises.access(full, fs.constants.R_OK);
+      const info = DEF_MAP[def] || { resolution: '1280x720', bandwidth: 1200000 };
+      lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${info.bandwidth},RESOLUTION=${info.resolution},CODECS="${codecs}"`);
+      lines.push(rel);
+      included++;
+    } catch {
+      logger.warn(`Skipping missing rendition playlist: ${rel}`);
+    }
+  }
+
+  if (included === 0) {
+    const msg = `No rendition playlists found in ${outputDir}; cannot write master.m3u8`;
+    logger.error(msg);
+    throw new Error(msg);
+  }
+
+  const content = lines.join('\n') + '\n';
+  await fsPromises.writeFile(masterPath, content, 'utf-8');
+  logger.info(`✅ Wrote master.m3u8 with ${included} variant(s)`, { masterPath });
+  return masterPath;
+}

@@ -5,16 +5,19 @@ This document describes the CPU optimization settings and environment variables 
 ## CPU-Aware Configurations
 
 ### yt-dlp Parallel Connections
+ 
 - **Environment Variable**: `YTDLP_CONNECTIONS`
 - **Default**: Number of CPU cores available
 - **Description**: Controls the number of parallel connections yt-dlp uses for downloading. Automatically scales with CPU capacity.
 
 ### FFmpeg Threading
+ 
 - **Environment Variable**: `FFMPEG_THREADS`
 - **Default**: Number of CPU cores available
 - **Description**: Sets the number of threads FFmpeg uses for video processing operations.
 
 ### Global Concurrency Controls
+ 
 - **Environment Variable**: `MAX_CONCURRENT_JOBS`
 - **Default**: Number of CPU cores available
 - **Description**: Maximum number of jobs that can run simultaneously.
@@ -24,6 +27,7 @@ This document describes the CPU optimization settings and environment variables 
 - **Description**: Global override for all semaphore concurrency limits.
 
 ### Subsystem-Specific Concurrency
+ 
 - **Environment Variable**: `S3_UPLOAD_CONCURRENCY`
 - **Default**: CPU cores × 2 (I/O multiplier)
 - **Description**: Concurrent S3 upload operations.
@@ -45,6 +49,7 @@ This document describes the CPU optimization settings and environment variables 
 - **Description**: Maximum concurrent database operations.
 
 ### S3 Upload/Download Optimization
+ 
 - **Environment Variable**: `S3_UPLOAD_PART_SIZE_MB`
 - **Default**: 32 MB (increased from 16 MB)
 - **Description**: Size of each multipart upload chunk.
@@ -61,18 +66,20 @@ This document describes the CPU optimization settings and environment variables 
 
 The system automatically optimizes thread allocation for video rendering:
 
-1. **Single Job Scenario**: Each encoder gets more threads (up to half of available CPU cores)
-2. **Multiple Jobs**: Threads are balanced across all renditions
+1. **Single Job Scenario**: Threads are distributed to utilize all available CPU cores across active encoders; if only one encoder runs, it can use all cores
+2. **Multiple Jobs**: Threads are balanced across all renditions to maintain high utilization
 3. **Minimum Threads**: Each encoder gets at least 2 threads for stability
 
 ## Auto-Detection Features
 
 ### CPU Detection
+ 
 - Automatically detects container CPU limits (cgroups v2)
 - Falls back to physical CPU count if no limits detected
 - Ensures optimal resource utilization in containerized environments
 
 ### Operation Type Scaling
+ 
 - **CPU-bound operations**: Scale 1:1 with CPU cores
 - **I/O-bound operations**: Scale 2:1 with CPU cores for better throughput
 
@@ -86,6 +93,7 @@ The system automatically optimizes thread allocation for video rendering:
 ## Monitoring
 
 All operations provide metrics for monitoring:
+ 
 - Job queue depth
 - Operations in flight
 - Success/failure counters

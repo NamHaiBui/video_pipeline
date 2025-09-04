@@ -106,6 +106,32 @@ export function computeDefaultConcurrency(kind: 'cpu' | 'io'): number {
   return Math.max(4, cores * 2);
 }
 
+/**
+ * Log current CPU utilization configuration for debugging and monitoring
+ */
+export function logCpuConfiguration(): void {
+  const quotaCpus = detectCpuQuota();
+  const physicalCores = defaultCpuCount();
+  const effectiveCores = quotaCpus ?? physicalCores;
+  const cpuConcurrency = computeDefaultConcurrency('cpu');
+  const ioConcurrency = computeDefaultConcurrency('io');
+
+  console.log('🖥️ CPU Utilization Configuration:');
+  console.log(`  Physical CPU cores: ${physicalCores}`);
+  if (quotaCpus) {
+    console.log(`  Container CPU limit: ${quotaCpus} cores (cgroups detected)`);
+  }
+  console.log(`  Effective CPU cores: ${effectiveCores}`);
+  console.log(`  CPU-bound concurrency: ${cpuConcurrency}`);
+  console.log(`  I/O-bound concurrency: ${ioConcurrency}`);
+  
+  console.log('📊 Active Semaphore Limits:');
+  console.log(`  S3 operations: ${s3Concurrency}`);
+  console.log(`  HTTP operations: ${httpConcurrency}`);
+  console.log(`  Disk operations: ${diskConcurrency}`);
+  console.log(`  Database operations: ${dbInflight}`);
+}
+
 export function getConcurrencyFromEnv(envVar: string, fallback: number): number {
   const globalDefault = parseInt(process.env.SEMAPHORE_MAX_CONCURRENCY || '', 10);
   const specific = parseInt(process.env[envVar as any] || '', 10);

@@ -194,7 +194,9 @@ function buildYtdlpArgs(
 ): string[] {
   // Ensure cookies are always included
   const optionsWithCookies = ensureCookiesInOptions(options);
-  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || 4);
+  // Make yt-dlp connections CPU-aware: use all available CPU cores for maximum throughput
+  const maxCpuConnections = computeDefaultConcurrency('cpu');
+  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || maxCpuConnections);
   
   let baseArgs = [
     videoUrl,
@@ -1227,6 +1229,8 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       '-y',
       '-avoid_negative_ts', 'make_zero',
       '-fflags', '+genpts',
+      // Add threading for any processing operations
+      '-threads', String(getCpuCores()),
       outputPath
     ];
 
@@ -1812,7 +1816,11 @@ export async function renderingLowerDefinitionVersions(
         const audioCodecParams = getAudioCodecParams();
         
   const cores = getCpuCores();
-  const threadsPerEncoder = Math.max(1, Math.floor(cores / renditions.length));
+  // Optimize thread allocation: ensure each encoder gets sufficient threads while maximizing parallelism
+  // For single job scenarios, give more threads per encoder; for multiple jobs, balance across renditions
+  const minThreadsPerEncoder = 2;
+  const maxThreadsPerEncoder = Math.max(minThreadsPerEncoder, Math.floor(cores / 2)); // Use up to half cores per encoder
+  const threadsPerEncoder = Math.max(minThreadsPerEncoder, Math.min(maxThreadsPerEncoder, Math.floor(cores / renditions.length)));
   renditions.forEach((r, i) => {
             const renditionDir = path.join(outputDir, r.name);
             fsPromises.mkdir(renditionDir, { recursive: true }); // Create sub-directory for each rendition

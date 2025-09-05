@@ -154,10 +154,23 @@ function defaultCpuCount(): number {
 }
 
 export function computeDefaultConcurrency(kind: 'cpu' | 'io'): number {
-  // Prefer cpuset limits if present (more precise), then quota, else physical cores
+  // Allow explicit override via env for environments where cgroups don't expose limits (e.g., some Fargate configs)
+  const envOverride = [
+    process.env.EFFECTIVE_CPU_CORES,
+    process.env.CPU_LIMIT_CORES,
+    process.env.MAX_CPU_CORES,
+  ]
+    .map(v => parseInt(v || '', 10))
+    .find(v => Number.isFinite(v) && v! > 0);
+  if (envOverride) {
+    const cores = Math.max(1, envOverride);
+    return kind === 'cpu' ? cores : Math.max(4, cores * 2);
+  }
+  // Consider both cpuset and quota; when both are present, take the stricter (min)
   const cpusetCpus = detectCpusetCount();
   const quotaCpus = detectCpuQuota();
-  const cores = cpusetCpus ?? quotaCpus ?? defaultCpuCount();
+  const limits = [cpusetCpus, quotaCpus].filter((n): n is number => typeof n === 'number' && n > 0);
+  const cores = (limits.length > 0 ? Math.min(...limits) : defaultCpuCount());
   if (kind === 'cpu') return Math.max(1, cores);
   // For I/O, allow higher fan-out
   return Math.max(4, cores * 2);
@@ -170,12 +183,23 @@ export function logCpuConfiguration(): void {
   const cpusetCpus = detectCpusetCount();
   const quotaCpus = detectCpuQuota();
   const physicalCores = defaultCpuCount();
-  const effectiveCores = cpusetCpus ?? quotaCpus ?? physicalCores;
+  const envOverride = [
+    process.env.EFFECTIVE_CPU_CORES,
+    process.env.CPU_LIMIT_CORES,
+    process.env.MAX_CPU_CORES,
+  ]
+    .map(v => parseInt(v || '', 10))
+    .find(v => Number.isFinite(v) && v! > 0);
+  const limits = [cpusetCpus, quotaCpus].filter((n): n is number => typeof n === 'number' && n > 0);
+  const effectiveCores = envOverride || (limits.length > 0 ? Math.min(...limits) : physicalCores);
   const cpuConcurrency = computeDefaultConcurrency('cpu');
   const ioConcurrency = computeDefaultConcurrency('io');
 
   console.log('🖥️ CPU Utilization Configuration:');
   console.log(`  Physical CPU cores: ${physicalCores}`);
+  if (envOverride) {
+    console.log(`  CPU override: ${envOverride} cores (EFFECTIVE_CPU_CORES/CPU_LIMIT_CORES/MAX_CPU_CORES)`);
+  }
   if (cpusetCpus) {
     console.log(`  CPUSet limit: ${cpusetCpus} cores`);
   }

@@ -197,7 +197,8 @@ function buildYtdlpArgs(
   const optionsWithCookies = ensureCookiesInOptions(options);
   // Make yt-dlp connections CPU-aware: use all available CPU cores for maximum throughput
   const maxCpuConnections = computeDefaultConcurrency('cpu');
-  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 4) || maxCpuConnections);
+  // Respect explicit env override; parse in base-10. Fallback to auto (CPU-aware)
+  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || maxCpuConnections);
   if (process.env.LOG_LEVEL !== 'silent') {
     logger.info('yt-dlp connection tuning', { ytdlpConnections, maxCpuConnections });
   }

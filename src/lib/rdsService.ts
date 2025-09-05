@@ -859,9 +859,13 @@ export class RDSService {
 
       const query = `
         SELECT 
-          "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", 
-          "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt", 
-          "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics"
+          "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri",
+          "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt",
+          "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics",
+          "contentType", "country", "genre", "durationMillis", "rssUrl",
+          "processingDone", "isSynced",
+          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
+          "hostName", "hostDescription", "processingInfo"
         FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
@@ -905,6 +909,22 @@ export class RDSService {
         guestDescriptions: Array.isArray(row.guestDescriptions) ? row.guestDescriptions : (row.guestDescriptions ? [row.guestDescriptions] : []),
         topics: Array.isArray(row.topics) ? row.topics : (row.topics ? [row.topics] : []),
         additionalData: row.additionalData || {},
+        // Newly included fields for validation consistency
+        contentType: row.contentType,
+        country: row.country,
+        genre: row.genre,
+        durationMillis: row.durationMillis,
+        rssUrl: row.rssUrl,
+        processingDone: row.processingDone,
+        isSynced: row.isSynced,
+        transcriptUri: row.transcriptUri,
+        processedTranscriptUri: row.processedTranscriptUri,
+        summaryAudioUri: row.summaryAudioUri,
+        summaryDurationMillis: row.summaryDurationMillis,
+        summaryTranscriptUri: row.summaryTranscriptUri,
+        hostName: row.hostName,
+        hostDescription: row.hostDescription,
+        processingInfo: row.processingInfo,
       };
       
       logger.info(`Episode fetched successfully: ${episodeId}`);

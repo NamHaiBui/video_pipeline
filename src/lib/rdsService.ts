@@ -862,9 +862,10 @@ export class RDSService {
           "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri",
           "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt",
           "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics",
-          "contentType", "country", "genre", "durationMillis", "rssUrl", "processingDone", "isSynced",
+          "contentType", "country", "genre", "durationMillis", "rssUrl",
+          "processingDone", "isSynced",
           "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
-          "hostName", "hostDescription"
+          "hostName", "hostDescription", "processingInfo"
         FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
@@ -910,6 +911,7 @@ export class RDSService {
         guestDescriptions: Array.isArray(row.guestDescriptions) ? row.guestDescriptions : (row.guestDescriptions ? [row.guestDescriptions] : []),
         topics: Array.isArray(row.topics) ? row.topics : (row.topics ? [row.topics] : []),
         additionalData: row.additionalData || {},
+        // Newly included fields for validation consistency
         contentType: row.contentType,
         country: row.country,
         genre: row.genre,
@@ -922,6 +924,7 @@ export class RDSService {
         summaryAudioUri: row.summaryAudioUri,
         summaryDurationMillis: row.summaryDurationMillis,
         summaryTranscriptUri: row.summaryTranscriptUri,
+        processingInfo: row.processingInfo,
       };
       
       logger.info(`Episode fetched successfully: ${episodeId}`);

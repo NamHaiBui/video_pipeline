@@ -23,7 +23,7 @@ import {
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/utils/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
 import { createS3ServiceFromEnv} from './lib/s3Service.js';
-import { getS3ArtifactBucket } from './lib/s3KeyUtils.js';
+import { getS3ArtifactBucket, generateVideoS3Key } from './lib/s3KeyUtils.js';
 import { createSQSServiceFromEnv} from './lib/sqsService_new.js';
 import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
 import { logger } from './lib/utils/logger.js';
@@ -742,11 +742,11 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     const episodeSlug = create_slug(existingEpisode.episodeTitle || metadata.title || 'untitled');
     const outputFilename = `${podcastSlug}/${episodeSlug}.mp4`;
 
+    // Download the merged MP4 locally first; we'll upload to S3 next and then run HLS
     const videoPath = await downloadVideoWithAudioSimple(videoUrl, {
       outputDir: downloadsDir,
       outputFilename: outputFilename,
       s3Upload: { 
-        // Keep local to render lower renditions for existing-episode flow
         enabled: false,
         deleteLocalAfterUpload: false 
       },
@@ -756,26 +756,58 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     }, metadata);
 
     logger.info(`Video+audio download completed: ${videoPath}`);
-    // 4. Render lower renditions (HLS) and upload to S3, then update RDS
-  const metaForHls = metadata || await getVideoMetadata(videoUrl);
 
-    const bucketName = process.env.S3_ARTIFACT_BUCKET || 'spice-episode-artifacts';
+    // 4. Upload MP4 to S3 and update RDS with videoLocation before HLS
     const s3 = createS3ServiceFromEnv();
+    const bucketName = process.env.S3_ARTIFACT_BUCKET || getS3ArtifactBucket();
     if (s3) {
+      try {
+        let videoKey: string;
+        if (metadata) {
+          const videoExtension = path.extname(videoPath) || '.mp4';
+          videoKey = generateVideoS3Key(metadata, videoExtension, '1080p');
+        } else {
+          const filename = path.basename(videoPath);
+          videoKey = `videos/${filename}`;
+        }
+        const uploadResult = await s3.uploadFile(videoPath, bucketName, videoKey);
+        if (uploadResult.success) {
+          if (isRDSEnabled) {
+            await rdsService.updateEpisode(episodeId, {
+              additionalData: { videoLocation: uploadResult.location },
+              contentType: 'video'
+            });
+            logger.info(`Updated episode ${episodeId} with videoLocation before HLS`);
+          }
+        } else {
+          logger.error('Failed to upload MP4 to S3 before HLS', undefined, { error: uploadResult.error });
+        }
+      } catch (e: any) {
+        logger.warn('MP4 S3 upload failed; skipping HLS for existing-episode path', e?.message || e);
+      }
+    } else {
+      logger.warn('S3 service unavailable; skipping video upload and HLS for existing episode.');
+    }
+
+    // 5. Render lower renditions (HLS) and upload to S3, then update RDS
+    const metaForHls = metadata || await getVideoMetadata(videoUrl);
+
+  if (s3) {
       const originalQuality: 1080 | 720 = 1080;
       const { masterPlaylists3Link } = await renderingLowerDefinitionVersions(
         videoPath,
         metaForHls,
         originalQuality,
         s3,
-        bucketName
+    bucketName
       );
 
-      // Update RDS: set additionalData.master_m3u8 and episodeUri (public URL for video if uploaded later)
+  // Update RDS: set additionalData.master_m3u8 and mark processingDone
       await rdsService.updateEpisode(episodeId, {
         additionalData: {
           master_m3u8: masterPlaylists3Link
         },
+        processingDone: true,
         contentType: 'video'
       });
       logger.info(`Updated episode ${episodeId} with master_m3u8: ${masterPlaylists3Link}`);

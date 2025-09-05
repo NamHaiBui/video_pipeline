@@ -988,29 +988,8 @@ export function downloadAndMergeVideo(
       
       logger.info(`Video download and merge completed successfully: ${finalMergedPath}`);
 
-      // Run HLS (lower renditions) unconditionally after merge. Upload to S3 only if available.
-      let hlsMasterLink: string = '';
-      try {
-        const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
-        const hlsS3 = createS3ServiceFromEnv();
-        const hlsBucket = hlsS3 ? getS3ArtifactBucket() : undefined;
-        logger.info('🎬 Rendering HLS renditions after merge (unconditional)...');
-        const metaForHls = videoMetadata || await getVideoMetadata(videoUrl);
-        const renditionResult = await withRetry(
-          () => renderingLowerDefinitionVersions(finalMergedPath, metaForHls, originalQuality, hlsS3, hlsBucket),
-          3,
-          2000,
-          2
-        );
-        hlsMasterLink = renditionResult.masterPlaylists3Link || '';
-        if (hlsMasterLink) {
-          logger.info('✅ HLS renditions ready' , { master: hlsMasterLink });
-        } else {
-          logger.info('✅ HLS renditions generated locally (no S3 upload)');
-        }
-      } catch (renditionError: any) {
-        logger.error('❌ HLS rendering failed (continuing):', renditionError?.message || renditionError);
-      }
+  // Defer HLS: will run after S3 upload and RDS update of video URL
+  let hlsMasterLink: string = '';
 
       if (options.s3Upload?.enabled) {
         try {
@@ -1048,21 +1027,37 @@ export function downloadAndMergeVideo(
                 if (rdsService) {
                   logger.info('💾 Updating episode with video S3 URL in additionalData...');
                   await rdsService.updateEpisode(episodeId, {
-                      additionalData: {
-                        videoLocation: videoUploadResult.location
-                      },
-                      contentType: 'video'
-                    });
-                    const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
-                  // Also add master_m3u8 if available from earlier HLS run
+                    additionalData: {
+                      videoLocation: videoUploadResult.location
+                    },
+                    contentType: 'video'
+                  });
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL in additionalData`);
-                  if (hlsMasterLink) {
-                    await rdsService.updateEpisode(episodeId, {
-                      processingDone: true,
-                      additionalData: {
-                        master_m3u8: hlsMasterLink
-                      },
-                    });
+
+                  // Now run HLS (must be after successful upload), upload HLS to S3, then update RDS with master_m3u8 + processingDone
+                  try {
+                    const metaForHls = videoMetadata || await getVideoMetadata(videoUrl);
+                    const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
+                    const bucketName = getS3ArtifactBucket();
+                    const renditionResult = await withRetry(
+                      () => renderingLowerDefinitionVersions(finalMergedPath, metaForHls, originalQuality, s3Service, bucketName),
+                      3,
+                      2000,
+                      2
+                    );
+                    hlsMasterLink = renditionResult.masterPlaylists3Link || '';
+                    if (hlsMasterLink) {
+                      await rdsService.updateEpisode(episodeId, {
+                        additionalData: { master_m3u8: hlsMasterLink },
+                        processingDone: true,
+                        contentType: 'video'
+                      });
+                      logger.info('✅ HLS renditions uploaded and RDS updated', { master: hlsMasterLink });
+                    } else {
+                      logger.warn('⚠️ HLS master link missing after upload; skipping RDS update for master_m3u8');
+                    }
+                  } catch (renditionError: any) {
+                    logger.error('❌ HLS rendering/upload failed (post-upload phase):', renditionError?.message || renditionError);
                   }
 
                   // Independent validation: RDS + S3 existence checks
@@ -1082,7 +1077,7 @@ export function downloadAndMergeVideo(
                   } catch (vErr: any) {
                     logger.warn('Validation error (non-fatal):', vErr?.message || vErr);
                   }
-                  }
+                }
                 } catch (updateError: any) {
                   logger.warn('⚠️ RDS video URL update error:', updateError);
                 }
@@ -1117,16 +1112,8 @@ export function downloadAndMergeVideo(
               }
             }
           } else {
-            logger.warn('⚠️ S3 service not available, skipping upload');
-            const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
-            if (shouldDeleteLocal) {
-              try {
-                await cleanupPodcastFileAndDirectories(finalMergedPath);
-                logger.info(`🗑️ Deleted local video file (S3 service unavailable): ${path.basename(finalMergedPath)}`);
-              } catch (deleteError) {
-                logger.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
-              }
-            }
+            logger.warn('⚠️ S3 service not available; per policy, skipping HLS and aborting further processing');
+            // Optionally keep or delete local; keep by default since HLS will not proceed
           }
         } catch (error: any) {
           logger.error('❌ Error during S3 video upload:', error.message);

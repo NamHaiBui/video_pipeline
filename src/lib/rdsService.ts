@@ -85,7 +85,7 @@ export interface EpisodeRecord {
   summaryDurationMillis?: number;
   summaryTranscriptUri?: string; // S3 URL
   
-  contentType: 'audio' | 'video';
+  contentType: 'video';
   processingInfo: EpisodeProcessingInfo; // JSON
   additionalData: Record<string, any>; // JSON for future purposes
   processingDone: boolean;
@@ -654,7 +654,7 @@ export class RDSService {
         genre: messageBody.genre,
         durationMillis: metadata?.duration ? metadata.duration * 1000 : 0,
         rssUrl: undefined, 
-        contentType: messageBody.contentType || 'video',
+        contentType: 'video',
         processingDone: false,
         isSynced: false,
         processingInfo: {
@@ -852,9 +852,12 @@ export class RDSService {
 
       const query = `
         SELECT 
-          "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", 
-          "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt", 
-          "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics"
+          "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri",
+          "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt",
+          "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics",
+          "contentType", "country", "genre", "durationMillis", "rssUrl", "processingDone", "isSynced",
+          "transcriptUri", "processedTranscriptUri", "summaryAudioUri", "summaryDurationMillis", "summaryTranscriptUri",
+          "hostName", "hostDescription"
         FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
@@ -893,11 +896,25 @@ export class RDSService {
         publishedDate: row.publishedDate,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
+        hostName: row.hostName,
+        hostDescription: row.hostDescription,
         guestImageUrl: guestImageUrl,
         guests: Array.isArray(row.guests) ? row.guests : (row.guests ? [row.guests] : []),
         guestDescriptions: Array.isArray(row.guestDescriptions) ? row.guestDescriptions : (row.guestDescriptions ? [row.guestDescriptions] : []),
         topics: Array.isArray(row.topics) ? row.topics : (row.topics ? [row.topics] : []),
         additionalData: row.additionalData || {},
+        contentType: row.contentType,
+        country: row.country,
+        genre: row.genre,
+        durationMillis: row.durationMillis,
+        rssUrl: row.rssUrl,
+        processingDone: row.processingDone,
+        isSynced: row.isSynced,
+        transcriptUri: row.transcriptUri,
+        processedTranscriptUri: row.processedTranscriptUri,
+        summaryAudioUri: row.summaryAudioUri,
+        summaryDurationMillis: row.summaryDurationMillis,
+        summaryTranscriptUri: row.summaryTranscriptUri,
       };
       
       logger.info(`Episode fetched successfully: ${episodeId}`);

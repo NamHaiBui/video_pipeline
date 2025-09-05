@@ -143,17 +143,38 @@ export class SQSService {
    */
   startVisibilityExtender(receiptHandle: string, extendEverySec = 60, extendBySec = 300): () => void {
     let stopped = false;
+    let failures = 0;
     const timer = setInterval(async () => {
       if (stopped) return;
       try {
         await this.changeMessageVisibility(receiptHandle, extendBySec);
-      } catch {
-        // already logged
+        failures = 0; // reset on success
+      } catch (err: any) {
+        failures++;
+        const msg = (err?.message || '').toString();
+        const name = (err?.name || '').toString();
+        // If the receipt handle is invalid or message no longer exists/visible, stop extending
+        const terminal = name === 'InvalidParameterValue' ||
+          msg.includes('ReceiptHandle is invalid') ||
+          msg.includes('Message does not exist') ||
+          msg.includes('not available for visibility');
+        if (terminal) {
+          logger.info('Stopping SQS visibility extender: message no longer eligible for extension');
+          stopped = true;
+          clearInterval(timer);
+          return;
+        }
+        // Backoff: after a few consecutive failures, stop to avoid log spam
+        if (failures >= 3) {
+          logger.warn('Stopping SQS visibility extender after repeated failures');
+          stopped = true;
+          clearInterval(timer);
+        }
       }
-    }, extendEverySec * 1000);
+    }, Math.max(5, extendEverySec) * 1000);
     return () => {
       stopped = true;
-      clearInterval(timer);
+      try { clearInterval(timer); } catch {}
     };
   }
 

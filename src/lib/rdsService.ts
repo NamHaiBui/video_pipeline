@@ -250,6 +250,13 @@ export class RDSService {
         const expVal = (expected as any)[key];
         if (expVal === undefined) return; // not part of validation
         const curVal = (current as any)[key];
+        if (key === 'contentType') {
+          // Compare case-insensitively and trimmed for safety
+          const a = typeof expVal === 'string' ? expVal.trim().toLowerCase() : expVal;
+          const b = typeof curVal === 'string' ? curVal.trim().toLowerCase() : curVal;
+          if (a !== b) fail(String(key), { expected: expVal, actual: curVal });
+          return;
+        }
         if (expVal !== curVal) fail(String(key), { expected: expVal, actual: curVal });
       };
 

@@ -74,6 +74,44 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 // CPU detection aware of cgroups (Linux containers)
+function parseCpuset(cpuset: string): number {
+  // Example formats: "0-3", "0,2,4-6", "1"; may include whitespace
+  const parts = cpuset.split(',').map(s => s.trim()).filter(Boolean);
+  let count = 0;
+  for (const p of parts) {
+    if (p.includes('-')) {
+      const [startStr, endStr] = p.split('-');
+      const start = parseInt(startStr, 10);
+      const end = parseInt(endStr, 10);
+      if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+        count += (end - start + 1);
+      }
+    } else {
+      const n = parseInt(p, 10);
+      if (Number.isFinite(n)) count += 1;
+    }
+  }
+  return Math.max(0, count);
+}
+
+function detectCpusetCount(): number | undefined {
+  try {
+    // cgroup v2 unified hierarchy often exposes cpuset at /sys/fs/cgroup/cpuset.cpus
+    const candidates = [
+      '/sys/fs/cgroup/cpuset.cpus',
+      '/sys/fs/cgroup/cpuset/cpuset.cpus', // cgroup v1 typical path
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf8').trim();
+        const cnt = parseCpuset(content);
+        if (cnt > 0) return cnt;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
 function detectCpuQuota(): number | undefined {
   try {
     // cgroup v2: /sys/fs/cgroup/cpu.max => "<quota> <period>" or "max"
@@ -90,6 +128,23 @@ function detectCpuQuota(): number | undefined {
         }
       }
     }
+
+    // cgroup v1: cpu.cfs_quota_us and cpu.cfs_period_us
+    const v1Candidates = [
+      { q: '/sys/fs/cgroup/cpu/cpu.cfs_quota_us', p: '/sys/fs/cgroup/cpu/cpu.cfs_period_us' },
+      { q: '/sys/fs/cgroup/cpuacct/cpu.cfs_quota_us', p: '/sys/fs/cgroup/cpuacct/cpu.cfs_period_us' },
+      { q: '/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us', p: '/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us' },
+    ];
+    for (const { q, p } of v1Candidates) {
+      if (fs.existsSync(q) && fs.existsSync(p)) {
+        const quota = parseInt(fs.readFileSync(q, 'utf8').trim(), 10);
+        const period = parseInt(fs.readFileSync(p, 'utf8').trim(), 10) || 100000;
+        if (Number.isFinite(quota) && quota > 0 && period > 0) {
+          const cpus = Math.max(1, Math.floor(quota / period));
+          return cpus;
+        }
+      }
+    }
   } catch {}
   return undefined;
 }
@@ -99,8 +154,10 @@ function defaultCpuCount(): number {
 }
 
 export function computeDefaultConcurrency(kind: 'cpu' | 'io'): number {
+  // Prefer cpuset limits if present (more precise), then quota, else physical cores
+  const cpusetCpus = detectCpusetCount();
   const quotaCpus = detectCpuQuota();
-  const cores = quotaCpus ?? defaultCpuCount();
+  const cores = cpusetCpus ?? quotaCpus ?? defaultCpuCount();
   if (kind === 'cpu') return Math.max(1, cores);
   // For I/O, allow higher fan-out
   return Math.max(4, cores * 2);
@@ -110,20 +167,25 @@ export function computeDefaultConcurrency(kind: 'cpu' | 'io'): number {
  * Log current CPU utilization configuration for debugging and monitoring
  */
 export function logCpuConfiguration(): void {
+  const cpusetCpus = detectCpusetCount();
   const quotaCpus = detectCpuQuota();
   const physicalCores = defaultCpuCount();
-  const effectiveCores = quotaCpus ?? physicalCores;
+  const effectiveCores = cpusetCpus ?? quotaCpus ?? physicalCores;
   const cpuConcurrency = computeDefaultConcurrency('cpu');
   const ioConcurrency = computeDefaultConcurrency('io');
 
   console.log('🖥️ CPU Utilization Configuration:');
   console.log(`  Physical CPU cores: ${physicalCores}`);
+  if (cpusetCpus) {
+    console.log(`  CPUSet limit: ${cpusetCpus} cores`);
+  }
   if (quotaCpus) {
     console.log(`  Container CPU limit: ${quotaCpus} cores (cgroups detected)`);
   }
   console.log(`  Effective CPU cores: ${effectiveCores}`);
   console.log(`  CPU-bound concurrency: ${cpuConcurrency}`);
   console.log(`  I/O-bound concurrency: ${ioConcurrency}`);
+  console.log(`  Greedy per-job mode: ${GREEDY_PER_JOB ? 'ENABLED' : 'disabled'}`);
   
   console.log('📊 Active Semaphore Limits:');
   console.log(`  S3 operations: ${s3Concurrency}`);
@@ -141,16 +203,29 @@ export function getConcurrencyFromEnv(envVar: string, fallback: number): number 
   return Math.max(1, chosen);
 }
 
+// Greedy per-job mode: when enabled, we serialize CPU-bound heavy work (like ffmpeg/yt-dlp)
+// so a single job can fully utilize all cores/threads. Override with DISK_CONCURRENCY env.
+const GREEDY_PER_JOB = (process.env.GREEDY_PER_JOB ?? process.env.GREEDY_MODE ?? 'true').toLowerCase() !== 'false';
+
 // Global semaphores for subsystems
 const s3Concurrency = getConcurrencyFromEnv('S3_UPLOAD_CONCURRENCY', computeDefaultConcurrency('io'));
 const httpConcurrency = getConcurrencyFromEnv('HTTP_CONCURRENCY', computeDefaultConcurrency('io'));
-const diskConcurrency = getConcurrencyFromEnv('DISK_CONCURRENCY', computeDefaultConcurrency('cpu'));
+const diskConcurrency = getConcurrencyFromEnv('DISK_CONCURRENCY', GREEDY_PER_JOB ? 1 : computeDefaultConcurrency('cpu'));
 const dbInflight = getConcurrencyFromEnv('DB_MAX_INFLIGHT', Math.max(2, computeDefaultConcurrency('cpu')));
 
 export const s3Semaphore = new Semaphore(s3Concurrency);
 export const httpSemaphore = new Semaphore(httpConcurrency);
 export const diskSemaphore = new Semaphore(diskConcurrency);
 export const dbSemaphore = new Semaphore(dbInflight);
+
+export function isGreedyPerJob(): boolean { return GREEDY_PER_JOB; }
+
+/**
+ * Lightweight signal to detect we're likely running on ECS
+ */
+export function isRunningInEcs(): boolean {
+  return Boolean(process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI);
+}
 
 // Lightweight in-memory metrics
 type CounterKey = string;

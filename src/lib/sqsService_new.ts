@@ -3,6 +3,7 @@ import {
   ReceiveMessageCommand, 
   DeleteMessageCommand, 
   SendMessageCommand,
+  ChangeMessageVisibilityCommand,
   GetQueueAttributesCommand,
   ReceiveMessageCommandOutput, 
   Message 
@@ -24,6 +25,7 @@ export class SQSService {
   private queueUrl: string;
   private maxMessages: number;
   private waitTimeSeconds: number;
+  private visibilitySeconds?: number;
 
   constructor(config: SQSServiceConfig) {
     this.client = new SQSClient({
@@ -37,7 +39,8 @@ export class SQSService {
 
     this.queueUrl = config.queueUrl;
     this.maxMessages = config.maxMessages || 10;
-    this.waitTimeSeconds = config.waitTimeSeconds || 20;
+  this.waitTimeSeconds = config.waitTimeSeconds || 20;
+  this.visibilitySeconds = process.env.SQS_VISIBILITY_SECONDS ? parseInt(process.env.SQS_VISIBILITY_SECONDS, 10) : undefined;
   }
 
   /**
@@ -98,13 +101,16 @@ export class SQSService {
    */
   async receiveMessages(maxMessages?: number): Promise<Message[]> {
     try {
-      const command = new ReceiveMessageCommand({
+      const params: any = {
         QueueUrl: this.queueUrl,
         MaxNumberOfMessages: maxMessages || this.maxMessages,
         WaitTimeSeconds: this.waitTimeSeconds,
-        VisibilityTimeout: 14400, // Default visibility timeout
         AttributeNames: ['All']
-      });
+      };
+      if (this.visibilitySeconds && Number.isFinite(this.visibilitySeconds)) {
+        params.VisibilityTimeout = this.visibilitySeconds;
+      }
+      const command = new ReceiveMessageCommand(params);
 
       const result: ReceiveMessageCommandOutput = await this.client.send(command);
       return result.Messages || [];
@@ -112,6 +118,43 @@ export class SQSService {
       logger.error(`Failed to receive SQS messages: ${error.message}`, undefined, { error });
       return [];
     }
+  }
+
+  /**
+   * Change the visibility timeout for a specific message
+   */
+  async changeMessageVisibility(receiptHandle: string, timeoutSeconds: number): Promise<void> {
+    try {
+      const command = new ChangeMessageVisibilityCommand({
+        QueueUrl: this.queueUrl,
+        ReceiptHandle: receiptHandle,
+        VisibilityTimeout: timeoutSeconds
+      });
+      await this.client.send(command);
+    } catch (error: any) {
+      logger.error(`Failed to change message visibility: ${error.message}`, undefined, { error });
+      throw error;
+    }
+  }
+
+  /**
+   * Periodically extend message visibility while processing
+   * Returns a stop function to cancel extensions.
+   */
+  startVisibilityExtender(receiptHandle: string, extendEverySec = 60, extendBySec = 300): () => void {
+    let stopped = false;
+    const timer = setInterval(async () => {
+      if (stopped) return;
+      try {
+        await this.changeMessageVisibility(receiptHandle, extendBySec);
+      } catch {
+        // already logged
+      }
+    }, extendEverySec * 1000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
   }
 
   /**

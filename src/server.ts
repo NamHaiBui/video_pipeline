@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { logCpuConfiguration } from './lib/utils/concurrency.js';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -16,11 +17,13 @@ import { SQSMessageBody } from './lib/rdsService.js';
 import { 
   getVideoMetadata,
   downloadAndMergeVideo,
-  downloadVideoWithAudioSimple
+  downloadVideoWithAudioSimple,
+  renderingLowerDefinitionVersions
 } from './lib/ytdlpWrapper.js';
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/utils/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
 import { createS3ServiceFromEnv} from './lib/s3Service.js';
+import { getS3ArtifactBucket } from './lib/s3KeyUtils.js';
 import { createSQSServiceFromEnv} from './lib/sqsService_new.js';
 import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
 import { logger } from './lib/utils/logger.js';
@@ -144,7 +147,7 @@ const downloadJobs = new Map<string, DownloadJob>();
 /**
  * Enable ECS task protection to prevent scale-in during job processing
  */
-async function enableTaskProtection(durationMinutes: number = 60): Promise<void> {
+export async function enableTaskProtection(durationMinutes: number = 60): Promise<void> {
   if (!isECSDeployment || !ecsClient) {
     return;
   }
@@ -169,7 +172,7 @@ async function enableTaskProtection(durationMinutes: number = 60): Promise<void>
 /**
  * Disable ECS task protection when no jobs are running
  */
-async function disableTaskProtection(): Promise<void> {
+export async function disableTaskProtection(): Promise<void> {
   if (!isECSDeployment || !ecsClient) {
     return;
   }
@@ -206,8 +209,16 @@ async function manageTaskProtection(): Promise<void> {
            job.status === 'downloading' || 
            job.status === 'merging'
   );
+  // Include SQS poller active jobs (if poller is running)
+  let pollerActiveCount = 0;
+  try {
+    const poller = await import('./sqsPoller.js');
+    pollerActiveCount = poller?.jobTracker?.count || 0;
+  } catch {}
 
-  if (activeJobs.length > 0) {
+  const totalActive = activeJobs.length + pollerActiveCount;
+
+  if (totalActive > 0) {
     // Always maintain protection when jobs are active - extend for another hour
     await enableTaskProtection(60);
     
@@ -218,8 +229,8 @@ async function manageTaskProtection(): Promise<void> {
     }
     taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // 30 minutes
     
-    logger.info(`Task protection maintained - ${activeJobs.length} active jobs detected`);
-    console.log(`🛡️ Task protection extended for ${activeJobs.length} active jobs`);
+    logger.info(`Task protection maintained - ${totalActive} active jobs detected (server: ${activeJobs.length}, poller: ${pollerActiveCount})`);
+    console.log(`🛡️ Task protection extended for ${totalActive} active jobs (server: ${activeJobs.length}, poller: ${pollerActiveCount})`);
   } else {
     // No active jobs, disable protection to allow scale-in
     await disableTaskProtection();
@@ -702,6 +713,11 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
 
   // Enable ECS task protection for existing episode processing
   await enableTaskProtection(60); // 1 hour protection for existing episodes
+  // Start continuous protection management immediately (auto-renew while job runs)
+  if (!taskProtectionTimeout) {
+    taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // Check in 30 minutes
+    logger.info('Started continuous task protection monitoring');
+  }
 
   try {
     // 1. Get existing episode data from RDS
@@ -730,8 +746,9 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
       outputDir: downloadsDir,
       outputFilename: outputFilename,
       s3Upload: { 
-        enabled: isS3Enabled,
-        deleteLocalAfterUpload: true 
+        // Keep local to render lower renditions for existing-episode flow
+        enabled: false,
+        deleteLocalAfterUpload: false 
       },
       onProgress: (progressInfo: ProgressInfo) => {
         logger.debug(`Video+audio download progress for ${episodeId}:`, progressInfo);
@@ -739,23 +756,39 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     }, metadata);
 
     logger.info(`Video+audio download completed: ${videoPath}`);
+    // 4. Render lower renditions (HLS) and upload to S3, then update RDS
+  const metaForHls = metadata || await getVideoMetadata(videoUrl);
 
-    // 4. Update RDS entry with video file name
-    let episodeUri: string;
-    if (isS3Enabled && !path.isAbsolute(videoPath)) {
-      episodeUri = `https://${process.env.S3_BUCKET_NAME}.s3.us-east-1.amazonaws.com/${videoPath}`;
-      logger.info(`Using S3 URL for RDS: ${episodeUri}`);
+    const bucketName = process.env.S3_ARTIFACT_BUCKET || 'spice-episode-artifacts';
+    const s3 = createS3ServiceFromEnv();
+    if (s3) {
+      const originalQuality: 1080 | 720 = 1080;
+      const { masterPlaylists3Link } = await renderingLowerDefinitionVersions(
+        videoPath,
+        metaForHls,
+        originalQuality,
+        s3,
+        bucketName
+      );
+
+      // Update RDS: set additionalData.master_m3u8 and episodeUri (public URL for video if uploaded later)
+      await rdsService.updateEpisode(episodeId, {
+        additionalData: {
+          master_m3u8: masterPlaylists3Link
+        },
+        contentType: 'video'
+      });
+      logger.info(`Updated episode ${episodeId} with master_m3u8: ${masterPlaylists3Link}`);
     } else {
-      // Local path returned, convert to relative path
-      episodeUri = path.relative(downloadsDir, videoPath);
-      logger.info(`Using relative local path for RDS: ${episodeUri}`);
+      logger.warn('S3 service unavailable; skipping lower rendition upload for existing episode.');
     }
-    
-    await rdsService.updateEpisode(episodeId, {
-      episodeUri: episodeUri,
-    });
 
-    logger.info(`Updated episode ${episodeId} with episodeUri: ${episodeUri}`);
+    // Optional: cleanup local file after processing
+    try {
+      if (fs.existsSync(videoPath)) {
+        await fs.promises.unlink(videoPath);
+      }
+    } catch {}
     
     // Check and manage task protection after successful completion
     await manageTaskProtection();
@@ -1060,6 +1093,14 @@ app.use((error: Error, req: Request, res: Response, next: any) => {
 // Startup function with yt-dlp update check and periodic monitoring
 async function startServer(): Promise<void> {
   console.log('🔧 Performing startup checks...');
+  // Log CPU/greedy concurrency configuration at boot
+  try { logCpuConfiguration(); } catch {}
+  logger.info('Concurrency knobs', {
+    GREEDY_PER_JOB: (process.env.GREEDY_PER_JOB ?? process.env.GREEDY_MODE ?? 'true'),
+    DISK_CONCURRENCY: process.env.DISK_CONCURRENCY || '1 (default when greedy)',
+    YTDLP_CONNECTIONS: process.env.YTDLP_CONNECTIONS || 'auto(max cores)',
+    FFMPEG_THREADS: process.env.FFMPEG_THREADS || 'auto(max cores)'
+  });
   
   // Read configuration from environment variables
   const useNightly = process.env.YTDLP_USE_NIGHTLY === 'true';
@@ -1085,7 +1126,7 @@ async function startServer(): Promise<void> {
     console.log('⏸️ Periodic update checks are disabled for cloud deployment');
     
     // Start the server
-    const server = app.listen(PORT, async () => {
+  const server = app.listen(PORT, async () => {
       console.log(`🎙️ Podcast Processing Pipeline running on port ${PORT}`);
       console.log(`📍 API Documentation: http://localhost:${PORT}/`);
       console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
@@ -1106,10 +1147,10 @@ async function startServer(): Promise<void> {
       };
       
       // Start SQS polling if enabled
-      if (enableSQS) {
+    if (enableSQS) {
         try {
           // Import SQS polling functionality
-          const { startSQSPolling } = await import('./sqsPoller.js');
+      const { startSQSPolling } = await import('./sqsPoller.js');
           
           // Start polling
           startSQSPolling();
@@ -1141,6 +1182,14 @@ async function startServer(): Promise<void> {
       }
       
       console.log('SIGINT received, shutting down server...');
+      // Drain SQS poller first
+      try {
+        const { requestPollerShutdown } = await import('./sqsPoller.js');
+        const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
+        await requestPollerShutdown(grace);
+      } catch (e: any) {
+        console.warn('Failed to drain SQS poller on SIGINT:', e?.message || e);
+      }
       if (taskProtectionTimeout) {
         clearTimeout(taskProtectionTimeout);
       }
@@ -1152,12 +1201,27 @@ async function startServer(): Promise<void> {
     
     process.on('SIGTERM', async () => {
       if (!allowShutdown) {
-        console.log('🛡️ SIGTERM received but shutdown is protected - ignoring external signal');
-        console.log('💡 Use the shutdown API endpoint or internal shutdown functions to terminate');
-        return;
+        console.log('🛡️ SIGTERM received. Starting graceful drain (shutdown protected).');
+        // Even when protected, begin draining to be resilient against ECS SIGKILL
+        try {
+          const { requestPollerShutdown } = await import('./sqsPoller.js');
+          const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
+          await requestPollerShutdown(grace);
+        } catch (e: any) {
+          console.warn('Failed to drain SQS poller on protected SIGTERM:', e?.message || e);
+        }
+        return; // Keep process alive; orchestrator may force-stop after timeout
       }
       
       console.log('SIGTERM received, shutting down server...');
+      // Drain SQS poller first
+      try {
+        const { requestPollerShutdown } = await import('./sqsPoller.js');
+        const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
+        await requestPollerShutdown(grace);
+      } catch (e: any) {
+        console.warn('Failed to drain SQS poller on SIGTERM:', e?.message || e);
+      }
       if (taskProtectionTimeout) {
         clearTimeout(taskProtectionTimeout);
       }

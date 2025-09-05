@@ -203,6 +203,105 @@ export class RDSService {
   }
 
   /**
+   * Deep-ish equality for arrays/objects/primitives used in validation.
+   * Arrays are compared by length and ordered elements; objects by shallow keys and primitive equality.
+   */
+  private deepEqual(a: any, b: any): boolean {
+    if (a === b) return true;
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!this.deepEqual(a[i], b[i])) return false;
+      }
+      return true;
+    }
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+      const aKeys = Object.keys(a);
+      const bKeys = Object.keys(b);
+      if (aKeys.length !== bKeys.length) return false;
+      for (const k of aKeys) {
+        if (!this.deepEqual(a[k], (b as any)[k])) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Independently validate that an episode has expected updates applied.
+   * Only fields present in `expected` are validated; others are ignored.
+   * For additionalData, ensures keys exist and values match when provided (primitives); for nested objects, presence check.
+   */
+  private async validateEpisodeUpdate(episodeId: string, expected: Partial<EpisodeRecord>): Promise<boolean> {
+    try {
+      const current = await this.getEpisode(episodeId);
+      if (!current) {
+        logger.warn(`Validation failed: episode ${episodeId} not found`);
+        return false;
+      }
+
+      let ok = true;
+      const fail = (field: string, details?: any) => {
+        ok = false;
+        logger.warn(`Validation mismatch for ${episodeId} on field '${field}'`, details);
+      };
+
+      const checkPrimitive = (key: keyof EpisodeRecord) => {
+        const expVal = (expected as any)[key];
+        if (expVal === undefined) return; // not part of validation
+        const curVal = (current as any)[key];
+        if (expVal !== curVal) fail(String(key), { expected: expVal, actual: curVal });
+      };
+
+      const checkArray = (key: keyof EpisodeRecord) => {
+        const expVal = (expected as any)[key];
+        if (expVal === undefined) return;
+        const curVal = (current as any)[key];
+        if (!Array.isArray(expVal) || !Array.isArray(curVal) || !this.deepEqual(expVal, curVal)) {
+          fail(String(key), { expected: expVal, actual: curVal });
+        }
+      };
+
+      // Validate basic primitives when provided
+      [
+        'episodeTitle','episodeDescription','hostName','hostDescription','episodeUri','originalUri',
+        'contentType','country','genre','durationMillis','rssUrl','processingDone','isSynced',
+        'transcriptUri','processedTranscriptUri','summaryAudioUri','summaryDurationMillis','summaryTranscriptUri'
+      ].forEach(k => checkPrimitive(k as keyof EpisodeRecord));
+
+      // Validate array fields
+      ['guests','guestDescriptions','topics','episodeImages'].forEach(k => checkArray(k as keyof EpisodeRecord));
+
+      // Validate additionalData minimally
+      if (expected.additionalData !== undefined) {
+        const expAD = expected.additionalData || {};
+        const curAD = current.additionalData || {};
+
+        for (const [k, v] of Object.entries(expAD)) {
+          if (!(k in curAD)) {
+            fail(`additionalData.${k}`, { expected: v, actual: undefined });
+            continue;
+          }
+          const curV = (curAD as any)[k];
+          // If expected value is object, only check presence of the key
+          if (v !== null && typeof v === 'object') {
+            // presence already checked; optionally ensure same type
+            if (typeof curV !== 'object') fail(`additionalData.${k}`, { expectedType: typeof v, actualType: typeof curV });
+          } else if (v !== undefined) {
+            // primitive compare when provided
+            if (v !== curV) fail(`additionalData.${k}`, { expected: v, actual: curV });
+          }
+        }
+      }
+
+      return ok;
+    } catch (err) {
+      logger.warn(`Validation error for episode ${episodeId}: ${(err as any)?.message || String(err)}`);
+      return false;
+    }
+  }
+
+  /**
    * Gracefully close all connections (call on server shutdown)
    */
   async closeClient(): Promise<void> {
@@ -752,7 +851,10 @@ export class RDSService {
       logger.info(`Fetching episode: ${episodeId}`);
 
       const query = `
-        SELECT "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt", "guestImageUrl", "additionalData"
+        SELECT 
+          "episodeId", "episodeTitle", "episodeDescription", "episodeImages", "episodeUri", 
+          "originalUri", "channelId", "channelName", "publishedDate", "createdAt", "updatedAt", 
+          "guestImageUrl", "additionalData", "guests", "guestDescriptions", "topics"
         FROM public."Episodes"
         WHERE "episodeId" = $1
       `;
@@ -792,6 +894,9 @@ export class RDSService {
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
         guestImageUrl: guestImageUrl,
+        guests: Array.isArray(row.guests) ? row.guests : (row.guests ? [row.guests] : []),
+        guestDescriptions: Array.isArray(row.guestDescriptions) ? row.guestDescriptions : (row.guestDescriptions ? [row.guestDescriptions] : []),
+        topics: Array.isArray(row.topics) ? row.topics : (row.topics ? [row.topics] : []),
         additionalData: row.additionalData || {},
       };
       
@@ -811,9 +916,42 @@ export class RDSService {
    * Update episode data with proper transaction handling
    */
   async updateEpisode(episodeId: string, updateData: Partial<EpisodeRecord>): Promise<void> {
-    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
-      return this.updateEpisodeInternal(client, episodeId, updateData);
-    }));
+    const maxValidateRetries = parseInt(process.env.RDS_UPDATE_VALIDATE_RETRIES || '3', 10);
+    const baseDelayMs = parseInt(process.env.RDS_UPDATE_VALIDATE_BASE_DELAY_MS || '200', 10);
+
+    return withSemaphore(dbSemaphore, 'db_write', async () => {
+      let attempt = 0;
+      let lastError: any;
+      while (attempt < maxValidateRetries) {
+        attempt++;
+        try {
+          // Perform the update within its own transaction (READ COMMITTED)
+          await this.executeWithRetry(async (client) => {
+            return this.updateEpisodeInternal(client, episodeId, updateData);
+          });
+
+          // Independently validate in a separate query context
+          const validationOk = await this.validateEpisodeUpdate(episodeId, updateData);
+          if (validationOk) {
+            return; // success
+          }
+
+          const delay = baseDelayMs * Math.pow(2, attempt - 1);
+          logger.warn(`RDS update validation failed for episode ${episodeId} (attempt ${attempt}/${maxValidateRetries}). Retrying in ${delay}ms...`);
+          await new Promise((res) => setTimeout(res, delay));
+        } catch (err) {
+          lastError = err;
+          if (attempt >= maxValidateRetries) break;
+          const delay = baseDelayMs * Math.pow(2, attempt - 1);
+          logger.warn(`RDS update attempt ${attempt} failed for episode ${episodeId}. Retrying in ${delay}ms...`, {
+            error: (err as any)?.message || String(err)
+          });
+          await new Promise((res) => setTimeout(res, delay));
+        }
+      }
+      // If we reached here, validation still failed or repeated errors occurred
+      throw lastError || new Error(`RDS update validation failed after ${maxValidateRetries} attempts for episode ${episodeId}`);
+    });
   }
 
   /**
@@ -1040,8 +1178,9 @@ export class RDSService {
     episodeId: string,
     extractionResult: GuestExtractionResult
   ): Promise<void> {
-    // Start transaction with appropriate isolation level
-    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+  // Start transaction with the lowest effective isolation level in PostgreSQL.
+  // Note: PostgreSQL treats READ UNCOMMITTED as READ COMMITTED, so we explicitly use READ COMMITTED.
+  await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     
     try {
       logger.info(`Updating episode ${episodeId} with guest extraction results: ${JSON.stringify(extractionResult, null, 2)}`);
@@ -1142,6 +1281,32 @@ export class RDSService {
       await client.query('COMMIT');
       
       logger.info(`Updated episode ${episodeId} with ${guestNames.length} guests, ${extractionResult.topics.length} topics, and ${guestImageUrl.length} guest images`);
+      
+      // Independently validate in a separate query context; retry on mismatch with exponential backoff
+  const maxValidateRetries = parseInt(process.env.RDS_UPDATE_VALIDATE_RETRIES || '3', 10);
+      const baseDelayMs = parseInt(process.env.RDS_UPDATE_VALIDATE_BASE_DELAY_MS || '200', 10);
+      for (let attempt = 1; attempt <= maxValidateRetries; attempt++) {
+        const expected: Partial<EpisodeRecord> = {
+          guests: guestNames,
+          guestDescriptions: guestDescriptions,
+          topics: extractionResult.topics,
+          // additionalData should contain at least the keys we added/updated
+          additionalData: {
+    // Use an object to assert presence; validator checks for presence/type when value is object
+    guestEnrichmentMetadata: {},
+    extractedDescription: extractionResult.description
+          } as any
+        } as any;
+
+        const ok = await this.validateEpisodeUpdate(episodeId, expected);
+        if (ok) break;
+        if (attempt === maxValidateRetries) {
+          throw new Error(`RDS validation failed after updating guest extraction fields for episode ${episodeId}`);
+        }
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        logger.warn(`RDS guest extraction update validation failed (attempt ${attempt}/${maxValidateRetries}) for ${episodeId}. Retrying in ${delay}ms...`);
+        await new Promise((res) => setTimeout(res, delay));
+      }
       
     } catch (error: any) {
       // Rollback transaction on any error

@@ -13,6 +13,7 @@ import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getManifestUrl, 
 import { logger } from './utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
 import { withSemaphore, diskSemaphore, httpSemaphore, computeDefaultConcurrency } from './utils/concurrency.js';
+import { ValidationService } from './validationService.js';
 import { sendToTranscriptionQueue } from '../sqsPoller.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -196,7 +197,10 @@ function buildYtdlpArgs(
   const optionsWithCookies = ensureCookiesInOptions(options);
   // Make yt-dlp connections CPU-aware: use all available CPU cores for maximum throughput
   const maxCpuConnections = computeDefaultConcurrency('cpu');
-  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || maxCpuConnections);
+  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 4) || maxCpuConnections);
+  if (process.env.LOG_LEVEL !== 'silent') {
+    logger.info('yt-dlp connection tuning', { ytdlpConnections, maxCpuConnections });
+  }
   
   let baseArgs = [
     videoUrl,
@@ -204,6 +208,7 @@ function buildYtdlpArgs(
     '-f', format,
     '--plugin-dirs','./.config/yt-dlp/plugins/',
     '-N', String(ytdlpConnections),
+  '--no-part',
     '--extractor-args', `youtubepot-bgutilhttp:base_url=${process.env.BGUTIL_PROVIDER_URL || 'http://localhost:4416'}`,
     '--no-continue',
     ...additionalArgs
@@ -424,8 +429,8 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
       }
     }
     
-    // Prepare output template with metadata if available
-    if (videoMetadata) {
+    // Prepare output template with metadata only if caller did not specify an explicit filename
+    if (!options.outputFilename && videoMetadata) {
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, videoMetadata, true); // Use subdirectory for final files
     }
     
@@ -555,8 +560,8 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
     // More flexible format selection for video-only downloads
     const format = options.format || `bestvideo[height<=${videoDefinition}]/bestvideo[height<=${parseInt(videoDefinition)+200}]/bestvideo/best[height<=${videoDefinition}]/best`;
 
-    // Prepare output template with metadata if available
-    if (metadata) {
+    // Prepare output template with metadata only if caller did not specify an explicit filename
+    if (!options.outputFilename && metadata) {
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, metadata, false); 
     }
     
@@ -605,7 +610,7 @@ export function downloadAndMergeVideo(
     }
     
     // Prepare output template with metadata if available
-    if (videoMetadata) {
+    if (!options.outputFilename && videoMetadata) {
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, videoMetadata, true); // Use subdirectory for final files
     }
     
@@ -982,7 +987,31 @@ export function downloadAndMergeVideo(
       
       
       logger.info(`Video download and merge completed successfully: ${finalMergedPath}`);
-      
+
+      // Run HLS (lower renditions) unconditionally after merge. Upload to S3 only if available.
+      let hlsMasterLink: string = '';
+      try {
+        const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
+        const hlsS3 = createS3ServiceFromEnv();
+        const hlsBucket = hlsS3 ? getS3ArtifactBucket() : undefined;
+        logger.info('🎬 Rendering HLS renditions after merge (unconditional)...');
+        const metaForHls = videoMetadata || await getVideoMetadata(videoUrl);
+        const renditionResult = await withRetry(
+          () => renderingLowerDefinitionVersions(finalMergedPath, metaForHls, originalQuality, hlsS3, hlsBucket),
+          3,
+          2000,
+          2
+        );
+        hlsMasterLink = renditionResult.masterPlaylists3Link || '';
+        if (hlsMasterLink) {
+          logger.info('✅ HLS renditions ready' , { master: hlsMasterLink });
+        } else {
+          logger.info('✅ HLS renditions generated locally (no S3 upload)');
+        }
+      } catch (renditionError: any) {
+        logger.error('❌ HLS rendering failed (continuing):', renditionError?.message || renditionError);
+      }
+
       if (options.s3Upload?.enabled) {
         try {
           const s3Service = createS3ServiceFromEnv();
@@ -1006,7 +1035,7 @@ export function downloadAndMergeVideo(
 
             
             if (videoUploadResult.success) {
-              logger.info(`Starting creating lower definitions and uploading to S3...`);
+              logger.info(`Merged video uploaded. HLS renditions were already rendered; proceeding with metadata updates...`);
               
               // try {
                   // Ensure only '1080p' or '720p' is passed as originalQuality
@@ -1025,22 +1054,34 @@ export function downloadAndMergeVideo(
                       contentType: 'video'
                     });
                     const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
-                  // await createAndUploadRenditions(finalMergedPath, originalQuality, s3Service, videoMetadata);
-                  logger.info(`🔄 Starting video rendering with retry logic (max 3 retries with exponential backoff)...`);
-                  const renditionResult = await withRetry(
-                    () => renderingLowerDefinitionVersions(finalMergedPath, videoMetadata, originalQuality, s3Service, bucketName),
-                    3, // maxRetries
-                    2000, // baseDelayMs - 2 seconds
-                    2 // backoffMultiplier
-                  );
-                  logger.info(`✅ Lower definition versions rendered and uploaded successfully`);
+                  // Also add master_m3u8 if available from earlier HLS run
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL in additionalData`);
-                  await rdsService.updateEpisode(episodeId, {
-                    processingDone:true,
-                    additionalData: {
-                      master_m3u8: renditionResult.masterPlaylists3Link
-                    },
-                  });
+                  if (hlsMasterLink) {
+                    await rdsService.updateEpisode(episodeId, {
+                      processingDone: true,
+                      additionalData: {
+                        master_m3u8: hlsMasterLink
+                      },
+                    });
+                  }
+
+                  // Independent validation: RDS + S3 existence checks
+                  try {
+                    const validation = new ValidationService(createS3ServiceFromEnv(), rdsService);
+                    const expectAdditionalData = hlsMasterLink ? ['videoLocation', 'master_m3u8'] : ['videoLocation'];
+                    const result = await validation.validateAfterProcessing({
+                      episodeId,
+                      expectAdditionalData,
+                      s3Urls: [videoUploadResult.location, hlsMasterLink].filter(Boolean) as string[],
+                    });
+                    if (!result.ok) {
+                      logger.error('❌ Post-process validation failed', new Error('validation_failed'), { errors: result.errors });
+                    } else {
+                      logger.info('✅ Post-process validation succeeded for episode', { episodeId });
+                    }
+                  } catch (vErr: any) {
+                    logger.warn('Validation error (non-fatal):', vErr?.message || vErr);
+                  }
                   }
                 } catch (updateError: any) {
                   logger.warn('⚠️ RDS video URL update error:', updateError);
@@ -1229,8 +1270,7 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       '-y',
       '-avoid_negative_ts', 'make_zero',
       '-fflags', '+genpts',
-      // Add threading for any processing operations
-      '-threads', String(getCpuCores()),
+  // Note: no '-threads' here since we're stream-copying; avoids FFmpeg warning about unused option
       outputPath
     ];
 
@@ -1588,11 +1628,12 @@ function transcodeRendition(inputPath: string, outputPath: string, resolution: V
         const threads = Math.max(1, parseInt(process.env.FFMPEG_THREADS || '', 10) || getCpuCores());
         logger.info(`Starting transcoding to ${resolution}...`);
 
-        const args = [
+    const args = [
             '-i', inputPath,
             '-vf', `scale=-2:${height}`, 
             '-c:v', 'libx264',
-            '-x264-params', `threads=${threads}`,
+      '-x264-params', `threads=${threads}`,
+      '-threads', String(threads),
             '-c:a', 'aac',
             '-y', 
             outputPath
@@ -1707,11 +1748,11 @@ async function withRetry<T>(
 }
 
 export async function renderingLowerDefinitionVersions(
-    finalMergedPath: string,
-    metadata: VideoMetadata,
-    topEdition: 1080 | 720,
-    s3Service: S3Service,
-    bucketName: string
+  finalMergedPath: string,
+  metadata: VideoMetadata,
+  topEdition: 1080 | 720,
+  s3Service?: S3Service | null,
+  bucketName?: string
 ): Promise<{ success: boolean; message?: string; masterPlaylists3Link: string }> {
 
     const outputDir = path.join(path.dirname(finalMergedPath), 'hls_output');
@@ -1819,11 +1860,19 @@ export async function renderingLowerDefinitionVersions(
   // Ensure FFmpeg itself can use all available cores for filtering/muxing as well
   // Place global threads flag before any inputs/options
   ffmpegArgs.unshift('-threads', String(cores));
+  // Increase filter graph threads for parallelism on multi-core systems
+  ffmpegArgs.unshift('-filter_complex_threads', String(Math.max(1, Math.min(cores, renditions.length * 2))));
+  ffmpegArgs.unshift('-filter_threads', String(Math.max(1, Math.floor(cores / 2) || 1)));
 
-  // Optimize thread allocation: distribute cores across encoders to target ~100% total CPU
-  // Each encoder gets at least 2 threads; otherwise divide cores across renditions without the 50% cap
+  // Optimize thread allocation: distribute available cores across encoders to target ~100% CPU
+  // Each encoder gets at least 2 threads; distribute any remainder to the first N encoders.
   const minThreadsPerEncoder = 2;
-  const threadsPerEncoder = Math.max(minThreadsPerEncoder, Math.floor(cores / renditions.length) || 1);
+  const baseThreads = Math.max(minThreadsPerEncoder, Math.floor(cores / renditions.length) || 1);
+  let remainder = Math.max(0, cores - baseThreads * renditions.length);
+  const perEncoderThreads: number[] = renditions.map((_, idx) => baseThreads + (remainder-- > 0 ? 1 : 0));
+
+  logger.info('FFmpeg thread allocation per rendition', { cores, perEncoderThreads, renditions: renditions.map(r => r.name) });
+
   renditions.forEach((r, i) => {
             const renditionDir = path.join(outputDir, r.name);
             fsPromises.mkdir(renditionDir, { recursive: true }); // Create sub-directory for each rendition
@@ -1833,7 +1882,7 @@ export async function renderingLowerDefinitionVersions(
                 `-map`, `[a${i}]`,
                 `-c:v`, `libx264`,
                 '-preset', 'veryfast',
-    '-x264-params', `threads=${threadsPerEncoder}:keyint=48:min-keyint=48:scenecut=0`,
+    '-x264-params', `threads=${perEncoderThreads[i]}:keyint=48:min-keyint=48:scenecut=0`,
                 '-b:v', r.bitrate,
                 ...audioCodecParams, // Use the robust audio codec parameters
                 '-f', 'hls',
@@ -1905,37 +1954,43 @@ export async function renderingLowerDefinitionVersions(
     // Ensure master.m3u8 exists (fallback to manual generation if FFmpeg didn't create it)
     await ensureMasterPlaylist();
 
-    // S3 upload logic remains the same, as it's already efficient.
+    // Conditionally upload to S3 if available; otherwise, skip upload and return empty link
     const masterPathLocal = path.join(outputDir, 'master.m3u8');
     try {
       await fsPromises.access(masterPathLocal);
-      logger.info('🧾 master.m3u8 present; proceeding with upload');
+      logger.info('🧾 master.m3u8 present; proceeding to upload step');
     } catch {
-      logger.warn('⚠️ master.m3u8 still not found before upload; upload will proceed but playback may fail');
+      logger.warn('⚠️ master.m3u8 still not found before upload; upload (if any) will proceed but playback may fail');
     }
-    logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
-        const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
 
-        const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
-            const filePath = path.join(outputDir, relativeFilePath);
-            const fileStat = await fsPromises.stat(filePath);
-            if (fileStat.isFile()) {
-                const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath.replace(/\\/g, '/')}`;
-                return withRetry(() => s3Service.uploadFile(filePath, bucketName, s3Key), 2, 1000, 2);
-            }
-        });
-            
-        await Promise.all(uploadPromises.filter(p => p));
-        logger.info('✅ All files uploaded successfully.');
+    if (s3Service && bucketName) {
+      logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
+      const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
 
-  const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;
-  masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
+      const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
+        const filePath = path.join(outputDir, relativeFilePath);
+        const fileStat = await fsPromises.stat(filePath);
+        if (fileStat.isFile()) {
+          const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath.replace(/\\/g, '/')}`;
+          return withRetry(() => s3Service.uploadFile(filePath, bucketName, s3Key), 2, 1000, 2);
+        }
+      });
+
+      await Promise.all(uploadPromises.filter(p => p));
+      logger.info('✅ All HLS files uploaded successfully.');
+
+      const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;
+      masterPlaylists3Link = getPublicUrl(bucketName, masterPlaylistS3Key);
+    } else {
+      logger.info('📦 S3 not available; skipping HLS upload and returning empty master playlist link');
+      masterPlaylists3Link = '';
+    }
         
         return { success: true, message: 'Lower definition versions rendered and uploaded.', masterPlaylists3Link };
      } catch (error: any) {
         logger.error(`❌ Error in renderingLowerDefinitionVersions: ${error.message}`, error);
         throw error;
-    } finally {
+  } finally {
         try {
             logger.info(`🧹 Cleaning up local directory: ${outputDir}...`);
             await fsPromises.rm(outputDir, { recursive: true, force: true });

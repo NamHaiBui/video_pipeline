@@ -2,19 +2,24 @@ import { Message, SQSClient, SendMessageCommand, GetQueueAttributesCommand, Send
 import { createSQSServiceFromEnv } from './lib/sqsService_new.js';
 import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
-import { processDownload, downloadVideoForExistingEpisode } from './server.js';
+import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection } from './server.js';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
-import { metrics, computeDefaultConcurrency } from './lib/utils/concurrency.js';
+import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
 
 // Configuration
-// Size workers to available CPU by default; can be overridden via MAX_CONCURRENT_JOBS
+// Size workers to ensure 100% compute:
+// - If greedy-per-job, run a single job to allow it to saturate all cores.
+// - Otherwise, scale workers to available CPU cores.
+// Can be overridden via MAX_CONCURRENT_JOBS.
 const MAX_CONCURRENT_JOBS = (() => {
   const fromEnv = parseInt(process.env.MAX_CONCURRENT_JOBS || '', 10);
   if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
-  return computeDefaultConcurrency('cpu');
+  return isGreedyPerJob() ? 1 : computeDefaultConcurrency('cpu');
 })();
-const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS || '300000', 10);
+// Poll frequently by default (5s). Override with POLLING_INTERVAL_MS.
+const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS || '5000', 10);
+const AUTO_EXIT_ON_IDLE = (process.env.AUTO_EXIT_ON_IDLE || 'false').toLowerCase() === 'true';
 const WORKER_ID = `${os.hostname()}-${process.pid}`;
 
 // Create SQS service
@@ -42,12 +47,26 @@ class JobTracker {
   private active: Map<string, {
     jobId: string;
     startTime: Date;
+    receiptHandle?: string;
+    stopExtend?: () => void;
   }> = new Map();
   private maxConcurrent: number;
   
   constructor(maxConcurrent = 2) {
     this.maxConcurrent = maxConcurrent;
     logger.info(`Job tracker initialized with max ${maxConcurrent} concurrent jobs`);
+  }
+  
+  /**
+   * Adjust maximum concurrent jobs at runtime
+   */
+  setMaxConcurrent(nextMax: number): void {
+    const normalized = Math.max(1, Math.floor(nextMax));
+    if (normalized !== this.maxConcurrent) {
+      logger.info(`🔧 Adjusting max concurrent jobs: ${this.maxConcurrent} -> ${normalized}`);
+      this.maxConcurrent = normalized;
+      metrics.gauge('jobs_max_concurrent', this.maxConcurrent);
+    }
   }
   
   /**
@@ -60,12 +79,21 @@ class JobTracker {
     
     this.active.set(jobId, {
       jobId,
-      startTime: new Date()
+  startTime: new Date()
     });
     
     logger.info(`Job ${jobId} started. Active jobs: ${this.active.size}/${this.maxConcurrent}`);
   metrics.gauge('jobs_in_flight', this.active.size);
     return true;
+  }
+  
+  attachMessageContext(jobId: string, receiptHandle?: string, stopExtend?: () => void): void {
+    const entry = this.active.get(jobId);
+    if (entry) {
+      if (receiptHandle) entry.receiptHandle = receiptHandle;
+      if (stopExtend) entry.stopExtend = stopExtend;
+      this.active.set(jobId, entry);
+    }
   }
   
   /**
@@ -74,6 +102,7 @@ class JobTracker {
   completeJob(jobId: string): void {
     if (this.active.has(jobId)) {
       const job = this.active.get(jobId);
+  try { job?.stopExtend?.(); } catch {}
       const duration = job ? new Date().getTime() - job.startTime.getTime() : 0;
       this.active.delete(jobId);
       logger.info(`Job ${jobId} completed in ${Math.round(duration / 1000)}s. Active jobs: ${this.active.size}/${this.maxConcurrent}`);
@@ -106,9 +135,32 @@ class JobTracker {
 // Create job tracker
 const jobTracker = new JobTracker(MAX_CONCURRENT_JOBS);
 
+// Poller state for graceful shutdown
+let shuttingDown = false;
+let pollInterval: NodeJS.Timeout | null = null;
+let healthInterval: NodeJS.Timeout | null = null;
+const REQUEUE_ON_TIMEOUT_SECONDS = parseInt(process.env.SQS_REQUEUE_ON_TIMEOUT_SECONDS || '30', 10);
+
 // Track empty polls for service shutdown
 let consecutiveEmptyPolls = 0;
 const MAX_EMPTY_POLLS = 2;
+
+// Auto-scale job concurrency to saturate CPU unless explicitly overridden via MAX_CONCURRENT_JOBS
+const AUTOSCALE_JOBS = !(Number.isFinite(parseInt(process.env.MAX_CONCURRENT_JOBS || '', 10)) && parseInt(process.env.MAX_CONCURRENT_JOBS || '', 10) > 0);
+if (AUTOSCALE_JOBS) {
+  setInterval(() => {
+    try {
+      const target = isGreedyPerJob() ? 1 : computeDefaultConcurrency('cpu');
+      jobTracker.setMaxConcurrent(target);
+      // If capacity increased, trigger a poll
+      if (jobTracker.canAcceptMoreJobs()) {
+        pollSQSMessages();
+      }
+    } catch (e: any) {
+      logger.warn(`Autoscale concurrency check failed: ${e?.message || e}`);
+    }
+  }, Math.max(15000, parseInt(process.env.AUTOSCALE_INTERVAL_MS || '30000', 10))); // 30s default
+}
 
 
 /**
@@ -166,11 +218,18 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         return false; // Failed to start job, try again later
       }
       
-      // Process video enrichment job async
-      downloadVideoForExistingEpisode(jobData.id!, jobData.url!)
+  // Apply ECS task protection and start visibility extender
+  try { await enableTaskProtection(120); } catch {}
+  // Start visibility extender to protect long-running job from being re-delivered
+  const stopExtend = sqsService ? sqsService.startVisibilityExtender(message.ReceiptHandle!, 120, 900) : () => {};
+  jobTracker.attachMessageContext(trackingJobId, message.ReceiptHandle!, stopExtend);
+    // Process video enrichment job async
+    downloadVideoForExistingEpisode(jobData.id!, jobData.url!)
         .then(async () => {
           logger.info(`Video enrichment ${jobData.id} completed successfully`);
+      stopExtend();
           jobTracker.completeJob(trackingJobId);
+          try { await disableTaskProtection(); } catch {}
           if (sqsService) {
             await sqsService.deleteMessage(message.ReceiptHandle!);
           }
@@ -180,7 +239,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         })
         .catch(async error => {
           logger.error(`Error processing video enrichment job ${jobData.id}: ${error.message}`, undefined, { error });
+      stopExtend();
           jobTracker.completeJob(trackingJobId);
+          try { await disableTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -208,21 +269,30 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         return false; // Failed to start job, try again later
       }
       
-      // Process new entry job async - pass the full jobData with new entry structure
-      processDownload(generatedJobId, jobData.originalUri!, jobData)
+  // Apply ECS task protection and start visibility extender for long-running processing
+  try { await enableTaskProtection(120); } catch {}
+  // Start visibility extender for long-running processing
+  const stopExtend = sqsService ? sqsService.startVisibilityExtender(message.ReceiptHandle!, 120, 900) : () => {};
+  jobTracker.attachMessageContext(trackingJobId, message.ReceiptHandle!, stopExtend);
+  // Process new entry job async - pass the full jobData with new entry structure
+  processDownload(generatedJobId, jobData.originalUri!, jobData)
         .then(async () => {
           logger.info(`New entry creation ${generatedJobId} completed successfully`);
+    stopExtend();
             if (sqsService) {
               await sqsService.deleteMessage(message.ReceiptHandle!);
             }
           jobTracker.completeJob(trackingJobId);
+          try { await disableTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
         })
         .catch(async error => {
           logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
+      stopExtend();
           jobTracker.completeJob(trackingJobId);
+          try { await disableTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -247,7 +317,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       jobData.jobId = jobData.jobId.trim();
     }
     
-    // At this point jobId should always be defined and non-empty
+  // At this point jobId should always be defined and non-empty
     const channelInfo = jobData.channelId ? ` [Channel: ${jobData.channelId}]` : '';
     logger.debug(`Processing legacy download job: ${jobData.jobId} - ${jobData.url}${channelInfo}`);
     
@@ -261,6 +331,36 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     if (!jobTracker.startJob(jobData.jobId)) {
       return false; // Failed to start job, try again later
     }
+  const legacyJobId = jobData.jobId as string;
+  // Apply ECS task protection and start visibility extender for long-running processing
+  try { await enableTaskProtection(120); } catch {}
+  // Start visibility extender for long-running processing
+  const stopExtend = sqsService ? sqsService.startVisibilityExtender(message.ReceiptHandle!, 120, 900) : () => {};
+  jobTracker.attachMessageContext(legacyJobId, message.ReceiptHandle!, stopExtend);
+  // Process legacy job async
+  processDownload(legacyJobId, jobData.url)
+      .then(async () => {
+    logger.info(`Legacy download ${legacyJobId} completed successfully`);
+        stopExtend();
+        if (sqsService) {
+          await sqsService.deleteMessage(message.ReceiptHandle!);
+        }
+  jobTracker.completeJob(legacyJobId);
+    try { await disableTaskProtection(); } catch {}
+        if (jobTracker.canAcceptMoreJobs()) {
+          pollSQSMessages();
+        }
+      })
+      .catch(async error => {
+    logger.error(`Error processing legacy job ${legacyJobId}: ${error.message}`, undefined, { error });
+    stopExtend();
+  jobTracker.completeJob(legacyJobId);
+  try { await disableTaskProtection(); } catch {}
+        if (jobTracker.canAcceptMoreJobs()) {
+          pollSQSMessages();
+        }
+      });
+
     return true;
   } catch (error: any) {
     logger.error(`Error handling SQS message: ${error.message}`, undefined, { error });
@@ -274,6 +374,10 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
 async function pollSQSMessages(): Promise<void> {
   if (!sqsService) {
     logger.debug('SQS service not configured, skipping poll');
+    return;
+  }
+  if (shuttingDown) {
+    logger.debug('Shutdown in progress, skipping SQS poll');
     return;
   }
   
@@ -310,14 +414,20 @@ async function pollSQSMessages(): Promise<void> {
       consecutiveEmptyPolls++;
       
       if (consecutiveEmptyPolls >= MAX_EMPTY_POLLS) {
-        // Only shut down if there are no active jobs AND no messages in queue
-        if (jobTracker.count === 0) {
-          logger.info(`Received ${consecutiveEmptyPolls} consecutive empty polls with no active jobs. Shutting down service.`);
-          logger.info(`Final job status: ${jobTracker.count}/${MAX_CONCURRENT_JOBS} active jobs`);
-          process.exit(0);
+        // Only shut down automatically if explicitly enabled
+        if (AUTO_EXIT_ON_IDLE) {
+          if (jobTracker.count === 0) {
+            logger.info(`Received ${consecutiveEmptyPolls} consecutive empty polls with no active jobs. Shutting down service (AUTO_EXIT_ON_IDLE=true).`);
+            logger.info(`Final job status: ${jobTracker.count}/${MAX_CONCURRENT_JOBS} active jobs`);
+            process.exit(0);
+          } else {
+            logger.info(`Received ${consecutiveEmptyPolls} consecutive empty polls, but ${jobTracker.count} jobs still active. Continuing to poll.`);
+            // Reset consecutive empty polls to avoid immediate shutdown when jobs finish
+            consecutiveEmptyPolls = Math.floor(MAX_EMPTY_POLLS / 2);
+          }
         } else {
-          logger.info(`Received ${consecutiveEmptyPolls} consecutive empty polls, but ${jobTracker.count} jobs still active. Continuing to poll.`);
-          // Reset consecutive empty polls to avoid immediate shutdown when jobs finish
+          // Just log and keep running in service mode
+          logger.debug(`Idle polls threshold reached (${consecutiveEmptyPolls}) with ${jobTracker.count} active jobs. Service will continue running.`);
           consecutiveEmptyPolls = Math.floor(MAX_EMPTY_POLLS / 2);
         }
       }
@@ -390,6 +500,10 @@ export function startSQSPolling(): void {
     logger.warn('SQS service not configured, polling disabled');
     return;
   }
+  if (pollInterval) {
+    logger.debug('SQS polling already started');
+    return;
+  }
   
   logger.info(`Starting SQS polling with max ${MAX_CONCURRENT_JOBS} concurrent jobs`);
   logger.info('📬 SQS Message Types Supported:');
@@ -403,12 +517,14 @@ export function startSQSPolling(): void {
   pollSQSMessages();
   
   // Set up periodic polling
-  setInterval(() => {
-    pollSQSMessages();
+  pollInterval = setInterval(() => {
+    if (!shuttingDown) {
+      pollSQSMessages();
+    }
   }, POLLING_INTERVAL_MS);
   
   // Set up health check logging
-  setInterval(() => {
+  healthInterval = setInterval(() => {
     logger.info(`SQS polling health check: ${jobTracker.count}/${MAX_CONCURRENT_JOBS} active jobs`, {
       workerId: WORKER_ID,
       activeJobs: jobTracker.count,
@@ -418,15 +534,53 @@ export function startSQSPolling(): void {
   }, 60000); // Every minute
 }
 
-// Setup graceful shutdown
-process.on('SIGINT', () => {
-  logger.info(`SIGINT received, shutting down. ${jobTracker.count} jobs still active.`);
-  process.exit(0);
+function stopPolling(): void {
+  shuttingDown = true;
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  if (healthInterval) {
+    clearInterval(healthInterval);
+    healthInterval = null;
+  }
+}
+
+export async function requestPollerShutdown(graceMs: number = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10)): Promise<void> {
+  stopPolling();
+  const start = Date.now();
+  logger.info(`SQS poller draining started. Waiting up to ${Math.round(graceMs/1000)}s for ${jobTracker.count} active jobs to finish.`);
+  while (jobTracker.count > 0 && Date.now() - start < graceMs) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  if (jobTracker.count === 0) {
+    logger.info('SQS poller drain complete. No active jobs remaining.');
+  } else {
+    logger.warn(`SQS poller drain timeout reached with ${jobTracker.count} job(s) still active. Re-queuing in-flight messages with ${REQUEUE_ON_TIMEOUT_SECONDS}s visibility.`);
+    // Best-effort: stop extenders and shorten visibility so another worker can pick them up soon
+    for (const jobId of jobTracker.activeJobIds) {
+      const entry: any = (jobTracker as any).active.get(jobId);
+      try { entry?.stopExtend?.(); } catch {}
+      if (sqsService && entry?.receiptHandle) {
+        try {
+          await sqsService.changeMessageVisibility(entry.receiptHandle, REQUEUE_ON_TIMEOUT_SECONDS);
+        } catch (e: any) {
+          logger.error(`Failed to adjust visibility for job ${jobId}: ${e?.message || e}`);
+        }
+      }
+    }
+  }
+}
+
+// Setup graceful shutdown handlers (best-effort; server may also coordinate)
+process.on('SIGINT', async () => {
+  logger.info(`SIGINT received by poller. Initiating graceful drain with ${jobTracker.count} active job(s).`);
+  await requestPollerShutdown();
 });
 
-process.on('SIGTERM', () => {
-  logger.info(`SIGTERM received, shutting down. ${jobTracker.count} jobs still active.`);
-  process.exit(0);
+process.on('SIGTERM', async () => {
+  logger.info(`SIGTERM received by poller. Initiating graceful drain with ${jobTracker.count} active job(s).`);
+  await requestPollerShutdown();
 });
 
 export { jobTracker, pollSQSMessages, handleSQSMessage, };

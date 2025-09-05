@@ -122,6 +122,65 @@ export class S3Service {
     this.s3Client = new S3Client(clientConfig);
   }
 
+  /** Parse S3 URLs in common formats into bucket/key */
+  parseS3Url(url: string): { bucket: string; key: string } | null {
+    try {
+      if (!url) return null;
+      // s3://bucket/key
+      if (url.startsWith('s3://')) {
+        const without = url.replace('s3://', '');
+        const firstSlash = without.indexOf('/');
+        if (firstSlash === -1) return null;
+        const bucket = without.substring(0, firstSlash);
+        const key = without.substring(firstSlash + 1);
+        return { bucket, key };
+      }
+      // https://bucket.s3.<region>.amazonaws.com/key or virtual-hosted-style
+      if (url.startsWith('http://') || url.startsWith('https://')) {
+        const u = new URL(url);
+        // virtual-hosted style: bucket.s3.<region>.amazonaws.com
+        const hostParts = u.hostname.split('.');
+        let bucket = '';
+        if (hostParts.length >= 3 && hostParts[1] === 's3') {
+          bucket = hostParts[0];
+        } else if (u.pathname.startsWith('/')) {
+          // path-style (deprecated in many regions): s3.<region>.amazonaws.com/bucket/key
+          const parts = u.pathname.replace(/^\/+/, '').split('/');
+          bucket = parts.shift() || '';
+          const key = parts.join('/');
+          if (bucket && key) return { bucket, key };
+        }
+        const key = u.pathname.replace(/^\/+/, '');
+        if (bucket && key) return { bucket, key };
+      }
+    } catch {}
+    return null;
+  }
+
+  /** HEAD an object to check existence */
+  async objectExists(bucket: string, key: string): Promise<boolean> {
+    try {
+      await withSemaphore(s3Semaphore, 's3_head', async () =>
+        this.s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+      );
+      return true;
+    } catch (err: any) {
+      if (err?.$metadata?.httpStatusCode === 404 || err?.name === 'NotFound' || err?.Code === 'NotFound') {
+        return false;
+      }
+      // For other errors, log and treat as non-existent to be conservative
+      logger.warn(`s3 HEAD error for s3://${bucket}/${key}: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  /** Check object existence from an S3 or HTTPS URL */
+  async objectExistsByUrl(url: string): Promise<boolean> {
+    const parsed = this.parseS3Url(url);
+    if (!parsed) return false;
+    return this.objectExists(parsed.bucket, parsed.key);
+  }
+
   /**
    * Upload a file to S3
    */

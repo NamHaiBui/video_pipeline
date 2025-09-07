@@ -17,7 +17,8 @@ if (!fs.existsSync(BIN_DIR)) {
 }
 
 // --- yt-dlp Setup ---
-const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux'; // For Linux
+// Use the portable Python script (works on Alpine/musl) instead of the glibc-linked binary
+const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
 const YTDLP_FINAL_PATH = path.join(BIN_DIR, 'yt-dlp');
 
 // --- FFmpeg Setup ---

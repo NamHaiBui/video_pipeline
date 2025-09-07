@@ -292,8 +292,17 @@ function executeDownloadProcess(
   options: DownloadOptions
 ): Promise<string> {
   return withSemaphore(diskSemaphore, 'disk_ytdlp', () => new Promise((resolve, reject) => {
+    // On Alpine, the portable script runs with python3; try binary first, then fall back
     logger.debug('Executing yt-dlp command', { command: `${YTDLP_PATH} ${args.join(' ')}` });
-    const ytdlpProcess = spawn(YTDLP_PATH, args);
+    let ytdlpProcess = spawn(YTDLP_PATH, args);
+    let spawnedWithPython = false;
+    ytdlpProcess.on('error', (err: any) => {
+      if (!spawnedWithPython) {
+        spawnedWithPython = true;
+        logger.warn('yt-dlp direct exec failed, retrying with python3 runner', { error: err?.message });
+        ytdlpProcess = spawn('python3', [YTDLP_PATH, ...args]);
+      }
+    });
     let downloadedFilePath = '';
     let stderrOutput = '';
 

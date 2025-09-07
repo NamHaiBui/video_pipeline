@@ -440,7 +440,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         logger.info(`Video duration: ${durationMinutes.toFixed(1)} minutes`);
         
         // Skip videos that are too short (less than 20 minutes) unless whitelisted
-        if (metadata.duration < 20 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
+        if (metadata.duration < 15 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
           job.status = 'completed';
           job.error = `Video duration is too short (${durationMinutes.toFixed(1)} minutes, minimum 20 minutes required)`;
           job.completedAt = new Date();

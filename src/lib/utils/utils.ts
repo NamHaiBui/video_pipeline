@@ -312,5 +312,6 @@ export function inWhiteList(title: string, uploader: string): boolean {
   //TODO: Change this to a config file or database in the future 
     const whiteList: { [key: string]: string } = {
         'UCM1guA1E-RHLO2OyfQPOkEQ':'cheeky',
+        'UCcefcZRL2oaA_uBNeo5UOWg':':'
     }
     return title.toLowerCase().includes(whiteList[uploader]);}

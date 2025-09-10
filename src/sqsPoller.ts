@@ -2,7 +2,7 @@ import { Message, SQSClient, SendMessageCommand, GetQueueAttributesCommand, Send
 import { createSQSServiceFromEnv } from './lib/sqsService_new.js';
 import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
-import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection } from './server.js';
+import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection, manageTaskProtection } from './server.js';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
@@ -261,7 +261,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
           logger.info(`Video enrichment ${jobData.id} completed successfully`);
       stopExtend();
           jobTracker.completeJob(trackingJobId);
-          try { await disableTaskProtection(); } catch {}
+          try { await manageTaskProtection(); } catch {}
           if (sqsService) {
             await sqsService.deleteMessage(message.ReceiptHandle!);
           }
@@ -273,7 +273,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
           logger.error(`Error processing video enrichment job ${jobData.id}: ${error.message}`, undefined, { error });
       stopExtend();
           jobTracker.completeJob(trackingJobId);
-          try { await disableTaskProtection(); } catch {}
+          try { await manageTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -315,7 +315,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
               await sqsService.deleteMessage(message.ReceiptHandle!);
             }
           jobTracker.completeJob(trackingJobId);
-          try { await disableTaskProtection(); } catch {}
+          try { await manageTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -324,7 +324,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
           logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
       stopExtend();
           jobTracker.completeJob(trackingJobId);
-          try { await disableTaskProtection(); } catch {}
+          try { await manageTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }

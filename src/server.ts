@@ -30,6 +30,8 @@ import { logger } from './lib/utils/logger.js';
 import { create_slug, inWhiteList} from './lib/utils/utils.js';
 import { GuestExtractionService, GuestExtractionResult } from './lib/guestExtractionService.js';
 import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+import { METRICS } from './constants.js';
 
 /**
  * Wrapper function to safely execute yt-dlp operations with server protection
@@ -95,10 +97,32 @@ const ECS_TASK_ARN = process.env.ECS_TASK_ARN;
 const isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
 
 let ecsClient: ECSClient | null = null;
+let cloudWatchClient: CloudWatchClient | null = null;
 let taskProtectionTimeout: NodeJS.Timeout | null = null;
 
 if (isECSDeployment) {
   ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+}
+// CloudWatch metrics client (lazy init on first use if not ECS)
+try {
+  cloudWatchClient = new CloudWatchClient({ region: process.env.AWS_REGION || 'us-east-1' });
+} catch {}
+
+async function emitMetric(name: string, value: number = 1, dimensions: { Name: string; Value: string }[] = []) {
+  if (!cloudWatchClient) return;
+  try {
+    await cloudWatchClient.send(new PutMetricDataCommand({
+      Namespace: 'VideoPipeline',
+      MetricData: [{
+        MetricName: name,
+        Value: value,
+        Unit: 'Count',
+        Dimensions: dimensions
+      }]
+    }));
+  } catch (e: any) {
+    logger.warn(`Failed to emit metric ${name}: ${e?.message || e}`);
+  }
 }
 
 if (isS3Enabled) {
@@ -197,7 +221,7 @@ export async function disableTaskProtection(): Promise<void> {
  * Check if there are any active jobs and manage task protection accordingly
  * Always maintains protection when jobs are active with automatic renewal
  */
-async function manageTaskProtection(): Promise<void> {
+export async function manageTaskProtection(): Promise<void> {
   if (!isECSDeployment) {
     return;
   }
@@ -233,7 +257,7 @@ async function manageTaskProtection(): Promise<void> {
     console.log(`🛡️ Task protection extended for ${totalActive} active jobs (server: ${activeJobs.length}, poller: ${pollerActiveCount})`);
   } else {
     // No active jobs, disable protection to allow scale-in
-    await disableTaskProtection();
+  await disableTaskProtection();
     
     if (taskProtectionTimeout) {
       clearTimeout(taskProtectionTimeout);
@@ -445,6 +469,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           job.error = `Video duration is too short (${durationMinutes.toFixed(1)} minutes, minimum 20 minutes required)`;
           job.completedAt = new Date();
           await persistJobUpdate(jobId, job);
+          await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'TooShort' }]);
           return;
         }
 
@@ -454,6 +479,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           job.error = `Video duration is ${durationMinutes.toFixed(1)} minutes (between 20-30 min), but not whitelisted`;
           job.completedAt = new Date();
           await persistJobUpdate(jobId, job);
+          await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'NotWhitelisted' }]);
           return;
         }
         
@@ -497,7 +523,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
       
     } catch (metaError: any) {
-      console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
+  console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
       job = downloadJobs.get(jobId);
       if (job) {
         job.status = 'error';
@@ -506,6 +532,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         await persistJobUpdate(jobId, job);
         await cleanupMetadataFile(jobId);
       }
+  await emitMetric(METRICS.NAMES.DOWNLOAD_FAILED, 1, [{ Name: 'Stage', Value: 'Metadata' }]);
       return; 
     }
     
@@ -647,7 +674,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
 
     } catch (downloadError: any) {
-      console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
+  console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
       logger.error(`yt-dlp operation failed for job ${jobId} - server protected, abandoning job`, downloadError);
       
       const errorJobState = downloadJobs.get(jobId);
@@ -663,6 +690,10 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         errorJobState.completedAt = new Date();
         await persistJobUpdate(jobId, errorJobState);
       }
+      await emitMetric(METRICS.NAMES.DOWNLOAD_FAILED, 1, [{ Name: 'Stage', Value: 'DownloadMerge' }]);
+      if ((downloadError?.message || '').includes('yt-dlp')) {
+        await emitMetric(METRICS.NAMES.YTDLP_FAILURE, 1);
+      }
       
       await cleanupMetadataFile(jobId);
       
@@ -671,7 +702,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     }
 
   } catch (error: any) {
-    console.error(`Overall error in processDownload for job ${jobId}:`, error);
+  console.error(`Overall error in processDownload for job ${jobId}:`, error);
     logger.error(`Critical failure in processDownload for job ${jobId} - server protected, abandoning job`, error);
     
     const criticalFailureJob = downloadJobs.get(jobId);
@@ -681,7 +712,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       // Categorize the error for better diagnostics
       const errorMessage = error?.message || String(error);
       let categorizedError = '';
-      if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
+  if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
         categorizedError = `yt-dlp critical error (job abandoned): ${errorMessage}`;
       } else if (errorMessage.includes('metadata') || errorMessage.includes('getVideoMetadata')) {
         categorizedError = `Metadata extraction error (job abandoned): ${errorMessage}`;
@@ -699,6 +730,10 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     
     // Check and manage task protection after critical failure
     await manageTaskProtection();
+    await emitMetric(METRICS.NAMES.DOWNLOAD_FAILED, 1, [{ Name: 'Stage', Value: 'Critical' }]);
+    if ((error?.message || '').includes('yt-dlp')) {
+      await emitMetric(METRICS.NAMES.YTDLP_FAILURE, 1);
+    }
   }
 }
 

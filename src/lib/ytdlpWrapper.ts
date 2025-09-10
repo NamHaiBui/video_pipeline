@@ -1105,6 +1105,9 @@ export function downloadAndMergeVideo(
                       episodeId,
                       expectAdditionalData,
                       s3Urls: [videoUploadResult.location, hlsMasterLink].filter(Boolean) as string[],
+                      validateStream: !!hlsMasterLink,
+                      requireProcessingDone: !!hlsMasterLink,
+                      verifyContentTypeVideo: true
                     });
                     if (!result.ok) {
                       logger.error('❌ Post-process validation failed', new Error('validation_failed'), { errors: result.errors });

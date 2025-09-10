@@ -6,6 +6,7 @@ import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection,
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
+import { createRDSServiceFromEnv, RDSService } from './lib/rdsService.js';
 
 // Configuration
 // Size workers to ensure 100% compute:
@@ -24,6 +25,20 @@ const WORKER_ID = `${os.hostname()}-${process.pid}`;
 
 // Create SQS service
 const sqsService = createSQSServiceFromEnv();
+
+// Create RDS service (optional)
+const rdsService: RDSService | null = createRDSServiceFromEnv();
+const isRDSEnabled = !!rdsService;
+let rdsInitStarted = false;
+async function ensureRdsReady(): Promise<void> {
+  if (!rdsService) return;
+  if (!rdsInitStarted) {
+    rdsInitStarted = true;
+    try { await rdsService.initClient(); } catch (e: any) {
+      logger.warn(`Failed to initialize RDS client in poller: ${e?.message || e}`);
+    }
+  }
+}
 
 // Create a separate SQS client specifically for transcription queue
 const createTranscriptionSQSClient = () => {
@@ -205,6 +220,23 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     // Handle video enrichment (existing episode video download)
     if (isVideoEnrichment) {
       logger.info(`Processing video enrichment: ${jobData.id} - ${jobData.url}`);
+      // Skip if episode already processed (has master_m3u8)
+      if (isRDSEnabled) {
+        try {
+          await ensureRdsReady();
+          const episode = await rdsService!.getEpisode(jobData.id!);
+          const hasMaster = !!episode?.additionalData?.master_m3u8;
+          if (episode && hasMaster) {
+            logger.info(`Skipping enrichment for episode ${jobData.id}: master_m3u8 already present`);
+            if (sqsService) {
+              await sqsService.deleteMessage(message.ReceiptHandle!);
+            }
+            return true; // handled (deleted)
+          }
+        } catch (e: any) {
+          logger.warn(`RDS check failed for enrichment ${jobData.id}, proceeding anyway: ${e?.message || e}`);
+        }
+      }
       
       // Check if we can accept more jobs
       if (!jobTracker.canAcceptMoreJobs()) {

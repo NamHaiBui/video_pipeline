@@ -10,17 +10,18 @@ const __dirname = path.dirname(__filename);
 
 const BIN_DIR = path.resolve(__dirname, '..', '..', 'bin');
 const YTDLP_FINAL_PATH = path.join(BIN_DIR, 'yt-dlp');
-const YTDLP_RELEASE_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-const YTDLP_NIGHTLY_URL = 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_linux';
+// Use portable Python script that works on Alpine/musl
+const YTDLP_RELEASE_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+const YTDLP_NIGHTLY_URL = 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
 
 // Alternative download URLs (mirrors/fallbacks)
 const YTDLP_ALTERNATIVE_URLS = {
   stable: [
-    'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux',
+  'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp',
     // Add more mirrors here if available
   ],
   nightly: [
-    'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_linux',
+  'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp',
     // Add more mirrors here if available
   ]
 };
@@ -82,8 +83,18 @@ function getCurrentYtdlpVersion(): string | null {
       return null;
     }
     
-    const version = execSync(`"${YTDLP_FINAL_PATH}" --version`, { encoding: 'utf-8' }).trim();
-    return version;
+    try {
+      const version = execSync(`"${YTDLP_FINAL_PATH}" --version`, { encoding: 'utf-8' }).trim();
+      return version;
+    } catch (e) {
+      // Fallback to python3 runner for portable script or incompatible binary
+      try {
+        const versionPy = execSync(`python3 "${YTDLP_FINAL_PATH}" --version`, { encoding: 'utf-8' }).trim();
+        return versionPy;
+      } catch {
+        throw e;
+      }
+    }
   } catch (error) {
     console.warn('Failed to get current yt-dlp version:', error);
     return null;

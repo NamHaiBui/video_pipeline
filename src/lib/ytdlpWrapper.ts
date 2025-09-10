@@ -197,8 +197,8 @@ function buildYtdlpArgs(
   const optionsWithCookies = ensureCookiesInOptions(options);
   // Make yt-dlp connections CPU-aware: use all available CPU cores for maximum throughput
   const maxCpuConnections = computeDefaultConcurrency('cpu');
-  // Respect explicit env override; parse in base-10. Fallback to auto (CPU-aware)
-  const ytdlpConnections = Math.max(1, parseInt(process.env.YTDLP_CONNECTIONS || '', 10) || maxCpuConnections);
+  const envConn = parseInt(process.env.YTDLP_CONNECTIONS || '', 10);
+  const ytdlpConnections = Math.max(1, Number.isFinite(envConn) && envConn > 0 ? envConn : maxCpuConnections);
   if (process.env.LOG_LEVEL !== 'silent') {
     logger.info('yt-dlp connection tuning', { ytdlpConnections, maxCpuConnections });
   }
@@ -293,8 +293,17 @@ function executeDownloadProcess(
   options: DownloadOptions
 ): Promise<string> {
   return withSemaphore(diskSemaphore, 'disk_ytdlp', () => new Promise((resolve, reject) => {
+    // On Alpine, the portable script runs with python3; try binary first, then fall back
     logger.debug('Executing yt-dlp command', { command: `${YTDLP_PATH} ${args.join(' ')}` });
-    const ytdlpProcess = spawn(YTDLP_PATH, args);
+    let ytdlpProcess = spawn(YTDLP_PATH, args);
+    let spawnedWithPython = false;
+    ytdlpProcess.on('error', (err: any) => {
+      if (!spawnedWithPython) {
+        spawnedWithPython = true;
+        logger.warn('yt-dlp direct exec failed, retrying with python3 runner', { error: err?.message });
+        ytdlpProcess = spawn('python3', [YTDLP_PATH, ...args]);
+      }
+    });
     let downloadedFilePath = '';
     let stderrOutput = '';
 
@@ -613,6 +622,33 @@ export function downloadAndMergeVideo(
     // Prepare output template with metadata if available
     if (!options.outputFilename && videoMetadata) {
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, videoMetadata, true); // Use subdirectory for final files
+    }
+
+    // Early skip: if episode already fully processed (has master_m3u8), avoid any downloads
+    try {
+      const rds = createRDSServiceFromEnv();
+      if (rds && videoMetadata?.id) {
+        try { await rds.initClient(); } catch {}
+        const existing = await rds.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
+        const hasVideo = !!existing?.additionalData?.videoLocation;
+        const hasMaster = !!existing?.additionalData?.master_m3u8;
+        if (existing && hasVideo && hasMaster) {
+          const existingId = existing.episodeId;
+          logger.info(`✅ Skipping processing for ${videoMetadata.id} (${existingId}): master_m3u8 already present`);
+          // Optionally update guest extraction if provided
+          if (guestExtractionResult) {
+            try {
+              await rds.updateEpisodeWithGuestExtraction(existingId, guestExtractionResult);
+              logger.info(`Guest extraction updated for existing episode ${existingId}`);
+            } catch (e: any) {
+              logger.warn(`Failed to update guest extraction for ${existingId}: ${e?.message || e}`);
+            }
+          }
+          return resolve({ mergedFilePath: '', episodeId: existingId });
+        }
+      }
+    } catch (e: any) {
+      logger.warn(`Skip-precheck failed; proceeding with processing: ${e?.message || e}`);
     }
     
     // Ensure the directory structure exists for the podcast-title subdirectory
@@ -1443,6 +1479,26 @@ export async function downloadVideoWithAudioSimple(videoUrl: string, options: Do
   
   // Use best video+audio format (merged)
   const format = options.format || 'best[ext=mp4]/best';
+
+  // Early skip if already fully processed
+  try {
+    const rds = createRDSServiceFromEnv();
+    if (rds) { try { await rds.initClient(); } catch {} }
+    const meta = metadata ?? await getVideoMetadata(videoUrl, options);
+    if (rds && meta?.id) {
+      const existing = await rds.checkEpisodeExistsByYoutubeVideoId(meta.id);
+      const hasMaster = !!existing?.additionalData?.master_m3u8;
+      const hasVideo = !!existing?.additionalData?.videoLocation;
+      if (existing && hasMaster && hasVideo) {
+        logger.info(`✅ Skipping simple video download: episode ${existing.episodeId} already has master_m3u8`);
+        return existing.episodeId; // return episodeId as a signal to caller
+      }
+    }
+    // Assign back the possibly fetched metadata
+    metadata = meta;
+  } catch (e: any) {
+    logger.warn(`Skip-precheck (simple) failed; continuing: ${e?.message || e}`);
+  }
 
   // Prepare output template with metadata if available
   if (metadata) {

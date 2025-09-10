@@ -26,7 +26,8 @@
   "test:cpu-utilization": "tsx scripts/test-cpu-utilization.ts",
   "show:performance-comparison": "tsx scripts/performance-comparison.ts",
   "backfill:master": "tsx scripts/backfill-master-m3u8.ts",
-  "auto-tune": "tsx scripts/auto-tune.ts"
+  "auto-tune": "tsx scripts/auto-tune.ts",
+  "validate:integrity": "tsx scripts/validate-integrity.ts"
   },
   "keywords": [
     "podcast",

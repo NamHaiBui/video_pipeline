@@ -14,6 +14,7 @@ import { logger } from './utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
 import { withSemaphore, diskSemaphore, httpSemaphore, computeDefaultConcurrency } from './utils/concurrency.js';
 import { ValidationService } from './validationService.js';
+import { emitValidationMetric } from './cloudwatchMetrics.js';
 import { sendToTranscriptionQueue } from '../sqsPoller.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1084,12 +1085,14 @@ export function downloadAndMergeVideo(
                     );
                     hlsMasterLink = renditionResult.masterPlaylists3Link || '';
                     if (hlsMasterLink) {
+                      // Store master_m3u8, mark processingDone immediately, and set isSynced false for downstream sync
                       await rdsService.updateEpisode(episodeId, {
                         additionalData: { master_m3u8: hlsMasterLink },
                         processingDone: true,
+                        isSynced: false,
                         contentType: 'video'
                       });
-                      logger.info('✅ HLS renditions uploaded and RDS updated', { master: hlsMasterLink });
+                      logger.info('✅ HLS renditions uploaded; master_m3u8 + processingDone stored', { master: hlsMasterLink });
                     } else {
                       logger.warn('⚠️ HLS master link missing after upload; skipping RDS update for master_m3u8');
                     }
@@ -1107,9 +1110,11 @@ export function downloadAndMergeVideo(
                       s3Urls: [videoUploadResult.location, hlsMasterLink].filter(Boolean) as string[],
                     });
                     if (!result.ok) {
-                      logger.error('❌ Post-process validation failed', new Error('validation_failed'), { errors: result.errors });
+                      logger.error('❌ Post-process validation failed (processingDone already set)', new Error('validation_failed'), { errors: result.errors });
+                      emitValidationMetric({ episodeId, success: false, errors: result.errors.length, warnings: 0, stage: 'post_process' }).catch(()=>{});
                     } else {
-                      logger.info('✅ Post-process validation succeeded for episode', { episodeId });
+                      logger.info('✅ Post-process validation succeeded (processingDone confirmed)', { episodeId });
+                      emitValidationMetric({ episodeId, success: true, errors: 0, warnings: 0, stage: 'post_process' }).catch(()=>{});
                     }
                   } catch (vErr: any) {
                     logger.warn('Validation error (non-fatal):', vErr?.message || vErr);

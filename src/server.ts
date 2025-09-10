@@ -26,6 +26,9 @@ import { createS3ServiceFromEnv} from './lib/s3Service.js';
 import { getS3ArtifactBucket, generateVideoS3Key } from './lib/s3KeyUtils.js';
 import { createSQSServiceFromEnv} from './lib/sqsService_new.js';
 import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
+import { createValidationServiceFromEnv } from './lib/validationService.js';
+import { emitValidationMetric } from './lib/cloudwatchMetrics.js';
+import { emitYtdlpErrorMetric } from './lib/cloudwatchMetrics.js';
 import { logger } from './lib/utils/logger.js';
 import { create_slug, inWhiteList} from './lib/utils/utils.js';
 import { GuestExtractionService, GuestExtractionResult } from './lib/guestExtractionService.js';
@@ -139,6 +142,32 @@ export function initiateShutdown(reason: string = 'Manual shutdown'): void {
   console.log(`🔄 Initiating self-shutdown: ${reason}`);
   allowShutdown = true;
   process.kill(process.pid, 'SIGTERM');
+}
+
+// Guard to avoid multiple fatal triggers
+let ytDlpFatalTriggered = false;
+
+/**
+ * Trigger a fatal reaction to a yt-dlp error:
+ *  - Emit CloudWatch metric (alarmable)
+ *  - Attempt to drain the SQS poller (short grace)
+ *  - Initiate container shutdown
+ * Idempotent: only first invocation acts.
+ */
+export async function triggerYtdlpFatal(errorMessage: string, context: { existingEpisode?: boolean } = {}): Promise<void> {
+  if (ytDlpFatalTriggered) return;
+  ytDlpFatalTriggered = true;
+  const categorized = errorMessage.includes('metadata') ? 'metadata' : errorMessage.includes('network') ? 'network' : 'generic';
+  try { await emitYtdlpErrorMetric(categorized, !!context.existingEpisode); } catch {}
+  logger.error('🚨 yt-dlp fatal error detected, beginning drain and shutdown', undefined, { categorized, errorMessage });
+  // Dynamic import to avoid circular dependency at module load
+  try {
+    const poller = await import('./sqsPoller.js');
+    if (poller?.requestPollerShutdown) {
+      poller.requestPollerShutdown(10000).catch(()=>{}); // 10s grace
+    }
+  } catch {}
+  setTimeout(() => initiateShutdown(`yt-dlp fatal error: ${errorMessage.substring(0,140)}`), 3000);
 }
 
 // In-memory storage for download jobs
@@ -649,6 +678,8 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     } catch (downloadError: any) {
       console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
       logger.error(`yt-dlp operation failed for job ${jobId} - server protected, abandoning job`, downloadError);
+  // Emit fatal metric & schedule shutdown
+  triggerYtdlpFatal(downloadError?.message || String(downloadError), { existingEpisode: false }).catch(()=>{});
       
       const errorJobState = downloadJobs.get(jobId);
       if (errorJobState) {
@@ -699,6 +730,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     
     // Check and manage task protection after critical failure
     await manageTaskProtection();
+  triggerYtdlpFatal(error?.message || String(error), { existingEpisode: false }).catch(()=>{});
   }
 }
 
@@ -802,15 +834,33 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
     bucketName
       );
 
-  // Update RDS: set additionalData.master_m3u8 and mark processingDone
+  // Update RDS: set additionalData.master_m3u8, mark processingDone, and set isSynced false
       await rdsService.updateEpisode(episodeId, {
-        additionalData: {
-          master_m3u8: masterPlaylists3Link
-        },
+        additionalData: { master_m3u8: masterPlaylists3Link },
         processingDone: true,
+        isSynced: false,
         contentType: 'video'
       });
-      logger.info(`Updated episode ${episodeId} with master_m3u8: ${masterPlaylists3Link}`);
+      logger.info(`Stored master_m3u8 & processingDone for episode ${episodeId}; running final validation`);
+
+      try {
+        const validation = createValidationServiceFromEnv();
+        const result = await validation.validateAfterProcessing({
+          episodeId,
+          expectAdditionalData: ['videoLocation', 'master_m3u8'],
+          s3Urls: [masterPlaylists3Link].filter(Boolean) as string[]
+        });
+        if (!result.ok) {
+          logger.error('Final validation failed after setting processingDone', undefined, { errors: result.errors });
+          emitValidationMetric({ episodeId, success: false, errors: result.errors.length, warnings: 0, stage: 'post_process' }).catch(()=>{});
+        } else {
+          logger.info(`Final validation succeeded for episode ${episodeId}`);
+          emitValidationMetric({ episodeId, success: true, errors: 0, warnings: 0, stage: 'post_process' }).catch(()=>{});
+        }
+      } catch (valErr: any) {
+        logger.warn('Final validation threw error (processingDone already set)', valErr?.message || valErr);
+        emitValidationMetric({ episodeId, success: false, errors: 1, warnings: 0, stage: 'post_process' }).catch(()=>{});
+      }
     } else {
       logger.warn('S3 service unavailable; skipping lower rendition upload for existing episode.');
     }
@@ -827,6 +877,7 @@ export async function downloadVideoForExistingEpisode(episodeId: string, videoUr
   } catch (error: any) {
     logger.error(`Failed to download video for existing episode ${episodeId}: ${error.message}`, error);
     logger.error(`yt-dlp operation failed for existing episode ${episodeId} - server protected, abandoning job`, error);
+  triggerYtdlpFatal(error?.message || String(error), { existingEpisode: true }).catch(()=>{});
     
     // Update episode with error status if possible
     try {

@@ -43,8 +43,8 @@
     {
       "name": "video-episode-downloader",
       "image": "221082194281.dkr.ecr.us-east-1.amazonaws.com/video_episode_downloader",
-      "cpu": 768,
-      "memory": 2560,
+  "cpu": 7680,
+  "memory": 15872,
       "portMappings": [
         {
           "containerPort": 3000,
@@ -76,7 +76,7 @@
         },
         {
           "name": "MAX_CONCURRENT_JOBS",
-          "value": "2"
+          "value": "1"
         },
         {
           "name": "S3_VIDEO_BUCKET",
@@ -101,6 +101,42 @@
         {
           "name": "LOG_LEVEL",
           "value": "info"
+        },
+        {
+          "name": "GREEDY_PER_JOB",
+          "value": "true"
+        },
+        {
+          "name": "EFFECTIVE_CPU_CORES",
+          "value": "8"
+        },
+        {
+          "name": "DISK_CONCURRENCY",
+          "value": "1"
+        },
+        {
+          "name": "FFMPEG_THREADS",
+          "value": "8"
+        },
+        {
+          "name": "YTDLP_CONNECTIONS",
+          "value": "8"
+        },
+        {
+          "name": "S3_UPLOAD_CONCURRENCY",
+          "value": "16"
+        },
+        {
+          "name": "S3_DOWNLOAD_CONCURRENCY",
+          "value": "16"
+        },
+        {
+          "name": "HTTP_CONCURRENCY",
+          "value": "16"
+        },
+        {
+          "name": "UV_THREADPOOL_SIZE",
+          "value": "32"
         },
         {
           "name": "YTDLP_VERBOSE_WARNINGS",
@@ -176,8 +212,8 @@
   "requiresCompatibilities": [
     "FARGATE"
   ],
-  "cpu": "1024",
-  "memory": "3072",
+  "cpu": "8192",
+  "memory": "16384",
   "runtimePlatform": {
     "cpuArchitecture": "X86_64",
     "operatingSystemFamily": "LINUX"

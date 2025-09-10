@@ -1,6 +1,7 @@
 import { S3Service, createS3ServiceFromEnv } from './s3Service.js';
 import { RDSService, createRDSServiceFromEnv } from './rdsService.js';
 import { logger } from './utils/logger.js';
+import { emitValidationMetric } from './cloudwatchMetrics.js';
 
 export type PostProcessValidationResult = {
   ok: boolean;
@@ -64,6 +65,15 @@ export class ValidationService {
     const ok = errors.length === 0;
     if (ok) logger.info('✅ Post-process validation OK');
     else logger.error('❌ Post-process validation FAILED', new Error('validation_failed'), { errors });
+
+    // Emit CloudWatch metric (non-blocking)
+    emitValidationMetric({
+      episodeId: params.episodeId,
+      success: ok,
+      errors: errors.length,
+      warnings: 0,
+      stage: 'post_process'
+    }).catch(() => {});
 
     return { ok, errors, details };
   }

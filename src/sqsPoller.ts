@@ -2,7 +2,7 @@ import { Message, SQSClient, SendMessageCommand, GetQueueAttributesCommand, Send
 import { createSQSServiceFromEnv } from './lib/sqsService_new.js';
 import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
-import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection } from './server.js';
+import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection, triggerYtdlpFatal } from './server.js';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
@@ -274,6 +274,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       stopExtend();
           jobTracker.completeJob(trackingJobId);
           try { await disableTaskProtection(); } catch {}
+          if ((error?.message || '').includes('yt-dlp')) {
+            triggerYtdlpFatal(error.message || String(error), { existingEpisode: true }).catch(()=>{});
+          }
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -325,6 +328,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       stopExtend();
           jobTracker.completeJob(trackingJobId);
           try { await disableTaskProtection(); } catch {}
+          if ((error?.message || '').includes('yt-dlp')) {
+            triggerYtdlpFatal(error.message || String(error), { existingEpisode: false }).catch(()=>{});
+          }
           if (jobTracker.canAcceptMoreJobs()) {
             pollSQSMessages();
           }
@@ -388,6 +394,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     stopExtend();
   jobTracker.completeJob(legacyJobId);
   try { await disableTaskProtection(); } catch {}
+        if ((error?.message || '').includes('yt-dlp')) {
+          triggerYtdlpFatal(error.message || String(error), { existingEpisode: false }).catch(()=>{});
+        }
         if (jobTracker.canAcceptMoreJobs()) {
           pollSQSMessages();
         }

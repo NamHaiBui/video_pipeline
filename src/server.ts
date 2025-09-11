@@ -16,9 +16,7 @@ import {
 import { SQSMessageBody } from './lib/rdsService.js';
 import { 
   getVideoMetadata,
-  downloadAndMergeVideo,
-  downloadVideoWithAudioSimple,
-  renderingLowerDefinitionVersions
+  downloadAndMergeVideo
 } from './lib/ytdlpWrapper.js';
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/utils/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
@@ -33,6 +31,9 @@ import { logger } from './lib/utils/logger.js';
 import { create_slug, inWhiteList} from './lib/utils/utils.js';
 import { GuestExtractionService, GuestExtractionResult } from './lib/guestExtractionService.js';
 import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+import { METRICS } from './constants.js';
+import fetch from 'node-fetch';
 
 /**
  * Wrapper function to safely execute yt-dlp operations with server protection
@@ -92,16 +93,80 @@ const guestExtractionService = GuestExtractionService.createFromEnv(isRDSEnabled
 
 const isPodcastConversionEnabled = process.env.PODCAST_CONVERSION_ENABLED !== 'false';
 
-// ECS Task Protection Configuration
-const ECS_CLUSTER_NAME = process.env.ECS_CLUSTER_NAME;
-const ECS_TASK_ARN = process.env.ECS_TASK_ARN;
-const isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
+// ECS Task Protection Configuration (auto-discovers on Fargate)
+let ECS_CLUSTER_NAME: string | undefined = process.env.ECS_CLUSTER_NAME;
+let ECS_TASK_ARN: string | undefined = process.env.ECS_TASK_ARN;
+let isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
 
 let ecsClient: ECSClient | null = null;
+let cloudWatchClient: CloudWatchClient | null = null;
 let taskProtectionTimeout: NodeJS.Timeout | null = null;
+let ecsDiscoveryInFlight: Promise<void> | null = null;
+let lastProtectionExpiresAt: number | null = null; // epoch ms
+let lastEnableAttemptAt: number = 0;
+const MIN_RENEW_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Attempt to discover ECS cluster/task from Fargate metadata if not provided */
+async function ensureEcsIdentity(): Promise<void> {
+  if (isECSDeployment) return;
+  if (ecsDiscoveryInFlight) return ecsDiscoveryInFlight;
+  const uri = process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI;
+  if (!uri) return; // Not on ECS/Fargate
+  ecsDiscoveryInFlight = (async () => {
+    try {
+      const res = await fetch(`${uri}/task`);
+      if (!res.ok) return;
+      const data: any = await res.json();
+      const taskArn: string | undefined = data?.TaskARN || data?.TaskArn || data?.TaskArnArn;
+      const clusterArn: string | undefined = data?.Cluster || data?.ClusterARN || data?.ClusterArn;
+      if (taskArn) ECS_TASK_ARN = taskArn;
+      if (clusterArn) {
+        // Extract cluster name from ARN if possible
+        const parts = String(clusterArn).split('/');
+        ECS_CLUSTER_NAME = parts[parts.length - 1] || clusterArn;
+      }
+      isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
+      if (isECSDeployment && !ecsClient) {
+        ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+      }
+      if (isECSDeployment) {
+        logger.info(`Discovered ECS identity: cluster=${ECS_CLUSTER_NAME}, taskArn=${ECS_TASK_ARN}`);
+      }
+    } catch (e: any) {
+      logger.debug(`ECS metadata discovery failed: ${e?.message || e}`);
+    } finally {
+      ecsDiscoveryInFlight = null;
+    }
+  })();
+  return ecsDiscoveryInFlight;
+}
 
 if (isECSDeployment) {
   ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+} else {
+  // Try best-effort discovery (non-blocking)
+  ensureEcsIdentity().catch(() => {});
+}
+// CloudWatch metrics client (lazy init on first use if not ECS)
+try {
+  cloudWatchClient = new CloudWatchClient({ region: process.env.AWS_REGION || 'us-east-1' });
+} catch {}
+
+async function emitMetric(name: string, value: number = 1, dimensions: { Name: string; Value: string }[] = []) {
+  if (!cloudWatchClient) return;
+  try {
+    await cloudWatchClient.send(new PutMetricDataCommand({
+      Namespace: 'VideoPipeline',
+      MetricData: [{
+        MetricName: name,
+        Value: value,
+        Unit: 'Count',
+        Dimensions: dimensions
+      }]
+    }));
+  } catch (e: any) {
+    logger.warn(`Failed to emit metric ${name}: ${e?.message || e}`);
+  }
 }
 
 if (isS3Enabled) {
@@ -177,13 +242,21 @@ const downloadJobs = new Map<string, DownloadJob>();
  * Enable ECS task protection to prevent scale-in during job processing
  */
 export async function enableTaskProtection(durationMinutes: number = 60): Promise<void> {
-  if (!isECSDeployment || !ecsClient) {
-    return;
+  await ensureEcsIdentity();
+  if (!isECSDeployment || !ecsClient) return;
+
+  // Coalesce redundant renewals: if we recently enabled and still have ample time, skip
+  const now = Date.now();
+  const desiredExpiry = now + durationMinutes * 60 * 1000;
+  const bufferMs = 10 * 60 * 1000; // renew if less than 10 minutes remaining
+  if (lastProtectionExpiresAt && lastProtectionExpiresAt - now > bufferMs) {
+    // Still protected sufficiently; skip noisy call unless last attempt older than MIN_RENEW_INTERVAL_MS
+    if (now - lastEnableAttemptAt < MIN_RENEW_INTERVAL_MS) return;
   }
 
   try {
     const command = new UpdateTaskProtectionCommand({
-      cluster: ECS_CLUSTER_NAME,
+      cluster: ECS_CLUSTER_NAME!,
       tasks: [ECS_TASK_ARN!],
       protectionEnabled: true,
       expiresInMinutes: durationMinutes
@@ -192,6 +265,8 @@ export async function enableTaskProtection(durationMinutes: number = 60): Promis
     await ecsClient.send(command);
     logger.info(`ECS task protection enabled for ${durationMinutes} minutes`);
     console.log(`🛡️ ECS task protection enabled for ${durationMinutes} minutes`);
+    lastEnableAttemptAt = now;
+    lastProtectionExpiresAt = desiredExpiry;
   } catch (error: any) {
     logger.error('Failed to enable ECS task protection:', error);
     console.error('❌ Failed to enable ECS task protection:', error.message);
@@ -202,13 +277,12 @@ export async function enableTaskProtection(durationMinutes: number = 60): Promis
  * Disable ECS task protection when no jobs are running
  */
 export async function disableTaskProtection(): Promise<void> {
-  if (!isECSDeployment || !ecsClient) {
-    return;
-  }
+  await ensureEcsIdentity();
+  if (!isECSDeployment || !ecsClient) return;
 
   try {
     const command = new UpdateTaskProtectionCommand({
-      cluster: ECS_CLUSTER_NAME,
+      cluster: ECS_CLUSTER_NAME!,
       tasks: [ECS_TASK_ARN!],
       protectionEnabled: false
     });
@@ -216,6 +290,7 @@ export async function disableTaskProtection(): Promise<void> {
     await ecsClient.send(command);
     logger.info('ECS task protection disabled');
     console.log('🛡️ ECS task protection disabled');
+    lastProtectionExpiresAt = null;
   } catch (error: any) {
     logger.error('Failed to disable ECS task protection:', error);
     console.error('❌ Failed to disable ECS task protection:', error.message);
@@ -226,10 +301,9 @@ export async function disableTaskProtection(): Promise<void> {
  * Check if there are any active jobs and manage task protection accordingly
  * Always maintains protection when jobs are active with automatic renewal
  */
-async function manageTaskProtection(): Promise<void> {
-  if (!isECSDeployment) {
-    return;
-  }
+export async function manageTaskProtection(): Promise<void> {
+  await ensureEcsIdentity();
+  if (!isECSDeployment) return;
 
   const activeJobs = Array.from(downloadJobs.values()).filter(
     job => job.status === 'pending' || 
@@ -248,21 +322,21 @@ async function manageTaskProtection(): Promise<void> {
   const totalActive = activeJobs.length + pollerActiveCount;
 
   if (totalActive > 0) {
-    // Always maintain protection when jobs are active - extend for another hour
-    await enableTaskProtection(60);
+  // Maintain protection while active; renew if needed with a 60-minute window
+  await enableTaskProtection(60);
     
     // Clear existing timeout and set a new one to check again in 30 minutes
     // This ensures protection is always active while jobs are running
     if (taskProtectionTimeout) {
       clearTimeout(taskProtectionTimeout);
     }
-    taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // 30 minutes
+  taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // 30 minutes
     
     logger.info(`Task protection maintained - ${totalActive} active jobs detected (server: ${activeJobs.length}, poller: ${pollerActiveCount})`);
     console.log(`🛡️ Task protection extended for ${totalActive} active jobs (server: ${activeJobs.length}, poller: ${pollerActiveCount})`);
   } else {
     // No active jobs, disable protection to allow scale-in
-    await disableTaskProtection();
+  await disableTaskProtection();
     
     if (taskProtectionTimeout) {
       clearTimeout(taskProtectionTimeout);
@@ -474,6 +548,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           job.error = `Video duration is too short (${durationMinutes.toFixed(1)} minutes, minimum 20 minutes required)`;
           job.completedAt = new Date();
           await persistJobUpdate(jobId, job);
+          await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'TooShort' }]);
           return;
         }
 
@@ -483,6 +558,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           job.error = `Video duration is ${durationMinutes.toFixed(1)} minutes (between 20-30 min), but not whitelisted`;
           job.completedAt = new Date();
           await persistJobUpdate(jobId, job);
+          await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'NotWhitelisted' }]);
           return;
         }
         
@@ -526,7 +602,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
       
     } catch (metaError: any) {
-      console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
+  console.error(`Job ${jobId}: Failed to fetch metadata:`, metaError);
       job = downloadJobs.get(jobId);
       if (job) {
         job.status = 'error';
@@ -535,6 +611,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         await persistJobUpdate(jobId, job);
         await cleanupMetadataFile(jobId);
       }
+  await emitMetric(METRICS.NAMES.DOWNLOAD_FAILED, 1, [{ Name: 'Stage', Value: 'Metadata' }]);
       return; 
     }
     
@@ -676,7 +753,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
 
     } catch (downloadError: any) {
-      console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
+  console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
       logger.error(`yt-dlp operation failed for job ${jobId} - server protected, abandoning job`, downloadError);
   // Emit fatal metric & schedule shutdown
   triggerYtdlpFatal(downloadError?.message || String(downloadError), { existingEpisode: false }).catch(()=>{});
@@ -694,6 +771,10 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
         errorJobState.completedAt = new Date();
         await persistJobUpdate(jobId, errorJobState);
       }
+      await emitMetric(METRICS.NAMES.DOWNLOAD_FAILED, 1, [{ Name: 'Stage', Value: 'DownloadMerge' }]);
+      if ((downloadError?.message || '').includes('yt-dlp')) {
+        await emitMetric(METRICS.NAMES.YTDLP_FAILURE, 1);
+      }
       
       await cleanupMetadataFile(jobId);
       
@@ -702,7 +783,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     }
 
   } catch (error: any) {
-    console.error(`Overall error in processDownload for job ${jobId}:`, error);
+  console.error(`Overall error in processDownload for job ${jobId}:`, error);
     logger.error(`Critical failure in processDownload for job ${jobId} - server protected, abandoning job`, error);
     
     const criticalFailureJob = downloadJobs.get(jobId);
@@ -712,7 +793,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       // Categorize the error for better diagnostics
       const errorMessage = error?.message || String(error);
       let categorizedError = '';
-      if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
+  if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
         categorizedError = `yt-dlp critical error (job abandoned): ${errorMessage}`;
       } else if (errorMessage.includes('metadata') || errorMessage.includes('getVideoMetadata')) {
         categorizedError = `Metadata extraction error (job abandoned): ${errorMessage}`;
@@ -733,238 +814,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
   triggerYtdlpFatal(error?.message || String(error), { existingEpisode: false }).catch(()=>{});
   }
 }
-
-/**
- * Download video for an existing podcast episode without creating new audio or metadata
- * Updates the videoFileName in RDS and checks for trimming queue eligibility
- */
-export async function downloadVideoForExistingEpisode(episodeId: string, videoUrl: string): Promise<void> {
-  if (!isRDSEnabled) {
-    throw new Error('RDS is not enabled - cannot process existing episode');
-  }
-
-  // Enable ECS task protection for existing episode processing
-  await enableTaskProtection(60); // 1 hour protection for existing episodes
-  // Start continuous protection management immediately (auto-renew while job runs)
-  if (!taskProtectionTimeout) {
-    taskProtectionTimeout = setTimeout(manageTaskProtection, 30 * 60 * 1000); // Check in 30 minutes
-    logger.info('Started continuous task protection monitoring');
-  }
-
-  try {
-    // 1. Get existing episode data from RDS
-    logger.info(`Fetching existing episode data for ${episodeId}`);
-    const existingEpisode = await rdsService.getEpisode(episodeId);
-    
-    if (!existingEpisode) {
-      throw new Error(`Episode ${episodeId} not found in database`);
-    }
-
-    logger.info(`Found existing episode: ${existingEpisode.episodeTitle || 'Unknown Title'}`);
-
-    // 2. Get video metadata (for filename generation)
-    logger.info(`Fetching video metadata for ${videoUrl}`);
-    const metadata = await getVideoMetadata(videoUrl);
-
-    // 3. Download video with audio (simple download, no database operations)
-    logger.info(`Starting video+audio download for existing episode ${episodeId}`);
-    
-    // Generate output filename using existing episode data
-    const podcastSlug = create_slug(existingEpisode.channelName || metadata.uploader || 'unknown');
-    const episodeSlug = create_slug(existingEpisode.episodeTitle || metadata.title || 'untitled');
-    const outputFilename = `${podcastSlug}/${episodeSlug}.mp4`;
-
-    // Download the merged MP4 locally first; we'll upload to S3 next and then run HLS
-    const videoPath = await downloadVideoWithAudioSimple(videoUrl, {
-      outputDir: downloadsDir,
-      outputFilename: outputFilename,
-      s3Upload: { 
-        enabled: false,
-        deleteLocalAfterUpload: false 
-      },
-      onProgress: (progressInfo: ProgressInfo) => {
-        logger.debug(`Video+audio download progress for ${episodeId}:`, progressInfo);
-      }
-    }, metadata);
-
-    logger.info(`Video+audio download completed: ${videoPath}`);
-
-    // 4. Upload MP4 to S3 and update RDS with videoLocation before HLS
-    const s3 = createS3ServiceFromEnv();
-    const bucketName = process.env.S3_ARTIFACT_BUCKET || getS3ArtifactBucket();
-    if (s3) {
-      try {
-        let videoKey: string;
-        if (metadata) {
-          const videoExtension = path.extname(videoPath) || '.mp4';
-          videoKey = generateVideoS3Key(metadata, videoExtension, '1080p');
-        } else {
-          const filename = path.basename(videoPath);
-          videoKey = `videos/${filename}`;
-        }
-        const uploadResult = await s3.uploadFile(videoPath, bucketName, videoKey);
-        if (uploadResult.success) {
-          if (isRDSEnabled) {
-            await rdsService.updateEpisode(episodeId, {
-              additionalData: { videoLocation: uploadResult.location },
-              contentType: 'video'
-            });
-            logger.info(`Updated episode ${episodeId} with videoLocation before HLS`);
-          }
-        } else {
-          logger.error('Failed to upload MP4 to S3 before HLS', undefined, { error: uploadResult.error });
-        }
-      } catch (e: any) {
-        logger.warn('MP4 S3 upload failed; skipping HLS for existing-episode path', e?.message || e);
-      }
-    } else {
-      logger.warn('S3 service unavailable; skipping video upload and HLS for existing episode.');
-    }
-
-    // 5. Render lower renditions (HLS) and upload to S3, then update RDS
-    const metaForHls = metadata || await getVideoMetadata(videoUrl);
-
-  if (s3) {
-      const originalQuality: 1080 | 720 = 1080;
-      const { masterPlaylists3Link } = await renderingLowerDefinitionVersions(
-        videoPath,
-        metaForHls,
-        originalQuality,
-        s3,
-    bucketName
-      );
-
-  // Update RDS: set additionalData.master_m3u8, mark processingDone, and set isSynced false
-      await rdsService.updateEpisode(episodeId, {
-        additionalData: { master_m3u8: masterPlaylists3Link },
-        processingDone: true,
-        isSynced: false,
-        contentType: 'video'
-      });
-      logger.info(`Stored master_m3u8 & processingDone for episode ${episodeId}; running final validation`);
-
-      try {
-        const validation = createValidationServiceFromEnv();
-        const result = await validation.validateAfterProcessing({
-          episodeId,
-          expectAdditionalData: ['videoLocation', 'master_m3u8'],
-          s3Urls: [masterPlaylists3Link].filter(Boolean) as string[]
-        });
-        if (!result.ok) {
-          logger.error('Final validation failed after setting processingDone', undefined, { errors: result.errors });
-          emitValidationMetric({ episodeId, success: false, errors: result.errors.length, warnings: 0, stage: 'post_process' }).catch(()=>{});
-        } else {
-          logger.info(`Final validation succeeded for episode ${episodeId}`);
-          emitValidationMetric({ episodeId, success: true, errors: 0, warnings: 0, stage: 'post_process' }).catch(()=>{});
-        }
-      } catch (valErr: any) {
-        logger.warn('Final validation threw error (processingDone already set)', valErr?.message || valErr);
-        emitValidationMetric({ episodeId, success: false, errors: 1, warnings: 0, stage: 'post_process' }).catch(()=>{});
-      }
-    } else {
-      logger.warn('S3 service unavailable; skipping lower rendition upload for existing episode.');
-    }
-
-    // Optional: cleanup local file after processing
-    try {
-      if (fs.existsSync(videoPath)) {
-        await fs.promises.unlink(videoPath);
-      }
-    } catch {}
-    
-    // Check and manage task protection after successful completion
-    await manageTaskProtection();
-  } catch (error: any) {
-    logger.error(`Failed to download video for existing episode ${episodeId}: ${error.message}`, error);
-    logger.error(`yt-dlp operation failed for existing episode ${episodeId} - server protected, abandoning job`, error);
-  triggerYtdlpFatal(error?.message || String(error), { existingEpisode: true }).catch(()=>{});
-    
-    // Update episode with error status if possible
-    try {
-      if (isRDSEnabled) {
-        const currentEpisode = await rdsService.getEpisode(episodeId);
-        const errorMessage = error?.message || String(error);
-        let categorizedError = '';
-        if (errorMessage.includes('yt-dlp') || errorMessage.includes('YouTube') || errorMessage.includes('video')) {
-          categorizedError = `yt-dlp error: ${errorMessage}`;
-        } else {
-          categorizedError = errorMessage;
-        }
-        
-        await rdsService.updateEpisode(episodeId, {
-          additionalData: { 
-            ...currentEpisode?.additionalData, 
-            videoDownloadError: categorizedError
-          }
-        });
-      }
-    } catch (updateError: any) {
-      logger.error(`Failed to update episode ${episodeId} with error status: ${updateError.message}`);
-    }
-    
-    // Check and manage task protection after error
-    await manageTaskProtection();
-    
-    throw error;
-  }
-}
-/**
- * POST /api/download-video-existing
- * Download video for an existing podcast episode
- */
-app.post('/api/download-video-existing', async (req: Request, res: Response) => {
-  try {
-    const { episodeId, videoUrl } = req.body;
-
-    if (!episodeId || !videoUrl) {
-      res.status(400).json({
-        success: false,
-        message: 'Both episodeId and videoUrl are required'
-      });
-      return;
-    }
-
-    if (!isValidYouTubeUrl(videoUrl)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid YouTube URL provided'
-      });
-      return;
-    }
-
-    if (!isRDSEnabled) {
-      res.status(500).json({
-        success: false,
-        message: 'RDS is not enabled - cannot process existing episodes'
-      });
-      return;
-    }
-
-    const sanitizedUrl = sanitizeYouTubeUrl(videoUrl);
-
-    // Start the download process asynchronously
-    downloadVideoForExistingEpisode(episodeId, sanitizedUrl)
-      .then(() => {
-        logger.info(`Video download completed for existing episode ${episodeId}`);
-      })
-      .catch((error: any) => {
-        logger.error(`Video download failed for existing episode ${episodeId}: ${error.message}`);
-      });
-
-    res.json({
-      success: true,
-      message: `Video download started for episode ${episodeId}`,
-      episodeId,
-      videoUrl: sanitizedUrl
-    });
-  } catch (error) {
-    logger.error('Error starting video download for existing episode', error as Error);
-    res.status(500).json({
-      success: false,
-      message: error instanceof Error ? error.message : 'Internal server error'
-    });
-  }
-});
 
 /**
  * GET /health

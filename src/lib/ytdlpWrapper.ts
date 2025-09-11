@@ -625,17 +625,19 @@ export function downloadAndMergeVideo(
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, videoMetadata, true); // Use subdirectory for final files
     }
 
-    // Early skip: if episode already fully processed (has master_m3u8), avoid any downloads
+    // Early skip: if episode already fully processed (has master_m3u8 and processingDone=true), avoid any downloads
     try {
       const rds = createRDSServiceFromEnv();
       if (rds && videoMetadata?.id) {
         try { await rds.initClient(); } catch {}
         const existing = await rds.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
-        const hasVideo = !!existing?.additionalData?.videoLocation;
-        const hasMaster = !!existing?.additionalData?.master_m3u8;
-        if (existing && hasVideo && hasMaster) {
-          const existingId = existing.episodeId;
-          logger.info(`✅ Skipping processing for ${videoMetadata.id} (${existingId}): master_m3u8 already present`);
+        if (existing) {
+          const full = await rds.getEpisode(existing.episodeId);
+          const hasMaster = !!full?.additionalData?.master_m3u8;
+          const isDone = !!full?.processingDone;
+          if (hasMaster && isDone) {
+            const existingId = existing.episodeId;
+            logger.info(`✅ Skipping processing for ${videoMetadata.id} (${existingId}): master_m3u8 present and processingDone=true`);
           // Optionally update guest extraction if provided
           if (guestExtractionResult) {
             try {
@@ -645,11 +647,85 @@ export function downloadAndMergeVideo(
               logger.warn(`Failed to update guest extraction for ${existingId}: ${e?.message || e}`);
             }
           }
-          return resolve({ mergedFilePath: '', episodeId: existingId });
+            return resolve({ mergedFilePath: '', episodeId: existingId });
+          }
         }
       }
     } catch (e: any) {
       logger.warn(`Skip-precheck failed; proceeding with processing: ${e?.message || e}`);
+    }
+    // If videoLocation exists but master/processingDone are not complete, download from S3 instead of yt-dlp
+    try {
+      const rds = createRDSServiceFromEnv();
+      const s3 = createS3ServiceFromEnv();
+      if (rds && s3 && videoMetadata?.id) {
+        try { await rds.initClient(); } catch {}
+        const existing = await rds.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
+        if (existing) {
+          const full = await rds.getEpisode(existing.episodeId);
+          const vloc = full?.additionalData?.videoLocation as string | undefined;
+          const hasMaster = !!full?.additionalData?.master_m3u8;
+          const isDone = !!full?.processingDone;
+          if (vloc && (!hasMaster || !isDone)) {
+            logger.info(`♻️ Reprocessing requested but video exists on S3; downloading from S3 instead of yt-dlp for ${existing.episodeId}`);
+            // Build final path under podcast/uploader/episode slug
+            const podcastSlug = create_slug(videoMetadata.uploader || 'unknown');
+            const episodeSlug = create_slug(videoMetadata.title || 'untitled');
+            const podcastDir = path.join(outputDir, podcastSlug, episodeSlug);
+            if (!fs.existsSync(podcastDir)) {
+              fs.mkdirSync(podcastDir, { recursive: true });
+            }
+            const localVideoPath = path.join(podcastDir, `${episodeSlug}.mp4`);
+            // Parse S3 URL and download
+            const parsed = s3.parseS3Url(vloc);
+            if (parsed) {
+              const dl = await s3.downloadFile(parsed.bucket, parsed.key, localVideoPath);
+              if (!dl.success) {
+                logger.warn(`Failed to download existing S3 video (${vloc}): ${dl.error}; falling back to yt-dlp path`);
+              } else {
+                logger.info(`✅ Downloaded existing video from S3 to ${localVideoPath}`);
+                // Generate HLS renditions and upload
+                try {
+                  const originalQuality: 1080 | 720 = (metadata?.filesize_approx && metadata.filesize_approx < 1000000) ? 1080 : 720;
+                  const bucketName = getS3ArtifactBucket();
+                  const { masterPlaylists3Link } = await withRetry(
+                    () => renderingLowerDefinitionVersions(localVideoPath, videoMetadata!, originalQuality, s3, bucketName),
+                    3,
+                    2000,
+                    2
+                  );
+                  if (masterPlaylists3Link) {
+                    await rds.updateEpisode(existing.episodeId, {
+                      additionalData: { master_m3u8: masterPlaylists3Link },
+                      processingDone: true,
+                      isSynced: false,
+                      contentType: 'video'
+                    });
+                    logger.info(`✅ Updated episode ${existing.episodeId} with master_m3u8 and processingDone=true`);
+                  } else {
+                    logger.warn('HLS master link missing after rendering; RDS not updated with master_m3u8');
+                  }
+                } catch (e: any) {
+                  logger.error(`❌ HLS rendering from existing S3 video failed: ${e?.message || e}`);
+                } finally {
+                  // Optionally clean local video
+                  try {
+                    if (fs.existsSync(localVideoPath)) {
+                      await fsPromises.unlink(localVideoPath);
+                      await cleanupEmptyPodcastDirectories(podcastDir);
+                    }
+                  } catch {}
+                }
+                return resolve({ mergedFilePath: '', episodeId: existing.episodeId });
+              }
+            } else {
+              logger.warn(`Could not parse S3 URL for videoLocation: ${vloc}; falling back to yt-dlp path`);
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      logger.warn(`S3 reprocess shortcut failed; proceeding with yt-dlp: ${e?.message || e}`);
     }
     
     // Ensure the directory structure exists for the podcast-title subdirectory
@@ -791,12 +867,14 @@ export function downloadAndMergeVideo(
               logger.info(`📝 Found existing episode by youtubeVideoId: ${existingEpisode.episodeId}`);
               
               // Check the processing status of the existing episode
-              const additionalData = existingEpisode.additionalData || {};
+              const fullExisting = await rdsService.getEpisode(existingEpisode.episodeId);
+              const additionalData = fullExisting?.additionalData || {};
               const hasVideoLocation = additionalData.videoLocation !== undefined;
               const hasMasterM3u8 = additionalData.master_m3u8 !== undefined;
+              const doneFlag = !!fullExisting?.processingDone;
               
-              if (hasVideoLocation && hasMasterM3u8) {
-                logger.info(`✅ Episode ${existingEpisode.episodeId} already fully processed - skipping all processing`);
+              if (hasVideoLocation && hasMasterM3u8 && doneFlag) {
+                logger.info(`✅ Episode ${existingEpisode.episodeId} already fully processed (processingDone=true) - skipping all processing`);
                 episodeId = existingEpisode.episodeId;
                 shouldSendToTranscriptionQueue = false;
                 
@@ -809,7 +887,7 @@ export function downloadAndMergeVideo(
                 
                 // Return early - skip all video processing
                 return episodeId;
-              } else if (hasVideoLocation && !hasMasterM3u8) {
+              } else if (hasVideoLocation && (!hasMasterM3u8 || !doneFlag)) {
                 logger.info(`🔄 Episode ${existingEpisode.episodeId} has videoLocation but missing master_m3u8 - will reprocess video`);
                 episodeId = existingEpisode.episodeId;
                 shouldSendToTranscriptionQueue = false; // Don't send transcription message for reprocessing
@@ -1021,12 +1099,8 @@ export function downloadAndMergeVideo(
         });
       }
 
-
-      
-      
       logger.info(`Video download and merge completed successfully: ${finalMergedPath}`);
 
-  // Defer HLS: will run after S3 upload and RDS update of video URL
   let hlsMasterLink: string = '';
 
       if (options.s3Upload?.enabled) {
@@ -1035,9 +1109,7 @@ export function downloadAndMergeVideo(
           if (s3Service) {
             logger.info('🚀 Uploading merged video file to S3...');
             
-            // Use already retrieved metadata instead of making another network call
             let videoKey: string| undefined;
-            // let m3u8Key: string| undefined;
             if (videoMetadata) {
               const videoExtension = path.extname(finalMergedPath);
               videoKey = generateVideoS3Key(videoMetadata, videoExtension, videoDefinition);
@@ -1053,13 +1125,6 @@ export function downloadAndMergeVideo(
             
             if (videoUploadResult.success) {
               logger.info(`Merged video uploaded. HLS renditions were already rendered; proceeding with metadata updates...`);
-              
-              // try {
-                  // Ensure only '1080p' or '720p' is passed as originalQuality
-                
-              // } catch (renditionError) {
-              //     logger.error(`❌ Failed to create and upload lower definition video renditions. This will not stop the main process.`, renditionError instanceof Error ? renditionError : new Error(String(renditionError)));
-              // }
                 try {
                 const rdsService = createRDSServiceFromEnv();
                 if (rdsService) {
@@ -1072,7 +1137,6 @@ export function downloadAndMergeVideo(
                   });
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL in additionalData`);
 
-                  // Now run HLS (must be after successful upload), upload HLS to S3, then update RDS with master_m3u8 + processingDone
                   try {
                     const metaForHls = videoMetadata || await getVideoMetadata(videoUrl);
                     const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
@@ -1108,6 +1172,10 @@ export function downloadAndMergeVideo(
                       episodeId,
                       expectAdditionalData,
                       s3Urls: [videoUploadResult.location, hlsMasterLink].filter(Boolean) as string[],
+                      validateStream: !!hlsMasterLink,
+                      requireProcessingDone: !!hlsMasterLink,
+                      verifyContentTypeVideo: true,
+                      verifyDurationToleranceSeconds: 2
                     });
                     if (!result.ok) {
                       logger.error('❌ Post-process validation failed (processingDone already set)', new Error('validation_failed'), { errors: result.errors });
@@ -1299,7 +1367,6 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
       '-y',
       '-avoid_negative_ts', 'make_zero',
       '-fflags', '+genpts',
-  // Note: no '-threads' here since we're stream-copying; avoids FFmpeg warning about unused option
       outputPath
     ];
 
@@ -1312,19 +1379,19 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
     ffmpegProcess.stderr?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegError += output + '\n';
-      if (output.trim().length > 0) {
-        logger.info(`ffmpeg output`, { message: output });
-        console.log(`[ffmpeg] ${output}`);
-      }
+      // if (output.trim().length > 0) {
+      //   logger.info(`ffmpeg output`, { message: output });
+      //   console.log(`[ffmpeg] ${output}`);
+      // }
     });
 
     ffmpegProcess.stdout?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegOutput += output + '\n';
-      if (output.trim().length > 0) {
-        logger.info(`ffmpeg stdout`, { message: output });
-        console.log(`[ffmpeg stdout] ${output}`);
-      }
+      // if (output.trim().length > 0) {
+      //   logger.info(`ffmpeg stdout`, { message: output });
+      //   console.log(`[ffmpeg stdout] ${output}`);
+      // }
     });
 
     ffmpegProcess.on('error', (error: Error) => {
@@ -1468,167 +1535,6 @@ async function cleanupPodcastFileAndDirectories(filePath: string): Promise<void>
   }
 }
 
-/**
- * Download video with audio (merged) without any database operations
- * This is specifically for existing episodes where we just need the video file
- * 
- * @param videoUrl - The YouTube video URL to download
- * @param options - Download options including S3 upload configuration
- * @param metadata - Optional video metadata to use for naming
- * @returns Promise<string> - Returns S3 key if upload is successful, otherwise local file path
- */
-export async function downloadVideoWithAudioSimple(videoUrl: string, options: DownloadOptions, metadata?: VideoMetadata): Promise<string> {
-  checkBinaries();
-  const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
-  let outputFilenameTemplate = options.outputFilename || 'video-with-audio.%(ext)s';
-  
-  // Use best video+audio format (merged)
-  const format = options.format || 'best[ext=mp4]/best';
-
-  // Early skip if already fully processed
-  try {
-    const rds = createRDSServiceFromEnv();
-    if (rds) { try { await rds.initClient(); } catch {} }
-    const meta = metadata ?? await getVideoMetadata(videoUrl, options);
-    if (rds && meta?.id) {
-      const existing = await rds.checkEpisodeExistsByYoutubeVideoId(meta.id);
-      const hasMaster = !!existing?.additionalData?.master_m3u8;
-      const hasVideo = !!existing?.additionalData?.videoLocation;
-      if (existing && hasMaster && hasVideo) {
-        logger.info(`✅ Skipping simple video download: episode ${existing.episodeId} already has master_m3u8`);
-        return existing.episodeId; // return episodeId as a signal to caller
-      }
-    }
-    // Assign back the possibly fetched metadata
-    metadata = meta;
-  } catch (e: any) {
-    logger.warn(`Skip-precheck (simple) failed; continuing: ${e?.message || e}`);
-  }
-
-  // Prepare output template with metadata if available
-  if (metadata) {
-    outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, metadata, true); // Use subdirectory for final files
-  }
-  
-  // Ensure the directory structure exists
-  const templatePath = path.join(outputDir, outputFilenameTemplate);
-  const templateDir = path.dirname(templatePath);
-  if (!fs.existsSync(templateDir)) {
-    fs.mkdirSync(templateDir, { recursive: true });
-  }
-  
-  const outputPathAndFilename = templatePath;
-
-  // Build args for video+audio download (no additional flags needed, yt-dlp will merge automatically)
-  const baseArgs = buildYtdlpArgs(videoUrl, outputPathAndFilename, format, options);
-
-  logger.info(`Starting video+audio download for: ${videoUrl}`);
-  const downloadedPath = await executeDownloadProcess(baseArgs, options);
-  
-  // Upload to S3 if enabled
-  if (options.s3Upload?.enabled) {
-    try {
-      const s3Service = createS3ServiceFromEnv();
-      if (s3Service) {
-        logger.info('Uploading video to S3');
-        
-        // Use provided metadata or fallback to fetching it
-        let videoMetadata = metadata;
-        if (!videoMetadata) {
-          try {
-            videoMetadata = await getVideoMetadata(videoUrl);
-          } catch (metaError) {
-            logger.warn('Could not fetch metadata for S3 naming, using fallback', { error: metaError });
-          }
-        }
-        
-        // Generate S3 key for video
-        let videoKey: string;
-        if (videoMetadata) {
-          const videoExtension = path.extname(downloadedPath).substring(1) || 'mp4';
-          videoKey = generateVideoS3Key(videoMetadata, videoExtension, '720p'); // Default to 720p if no specific quality
-        } else {
-          // Fallback naming
-          const filename = path.basename(downloadedPath);
-          videoKey = `videos/${filename}`;
-        }
-        
-        const bucketName = getS3ArtifactBucket();
-        const uploadResult = await s3Service.uploadFile(downloadedPath, bucketName, videoKey);
-        
-        if (uploadResult.success) {
-          logger.info('Video uploaded to S3 successfully', { location: uploadResult.location, videoKey });
-          
-          // Only delete local file if deleteLocalAfterUpload is not explicitly set to false
-          const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
-          if (shouldDeleteLocal) {
-            try {
-              await s3Service.deleteLocalFile(downloadedPath);
-              logger.info('Deleted local video file after S3 upload', { filename: path.basename(downloadedPath) });
-              
-              // Clean up empty directories after deleting the video file
-              const videoDir = path.dirname(downloadedPath);
-              await cleanupEmptyDirectories(videoDir);
-            } catch (deleteError) {
-              logger.warn('Failed to delete local video file', { error: deleteError, filename: path.basename(downloadedPath) });
-            }
-          } else {
-            logger.info('Keeping local video file for further processing', { filename: path.basename(downloadedPath) });
-          }
-          
-          // Return S3 key when upload is successful
-          return videoKey;
-        } else {
-          logger.error('Failed to upload video to S3', undefined, { error: uploadResult.error });
-          
-          // Clean up local file if upload failed and deleteLocalAfterUpload is true
-          const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
-          if (shouldDeleteLocal) {
-            try {
-              await s3Service.deleteLocalFile(downloadedPath);
-              logger.info('Deleted local video file after failed S3 upload', { filename: path.basename(downloadedPath) });
-              
-              // Clean up empty directories after deleting the video file
-              const videoDir = path.dirname(downloadedPath);
-              await cleanupEmptyDirectories(videoDir);
-            } catch (deleteError) {
-              logger.warn('Failed to delete local video file after failed upload', { error: deleteError, filename: path.basename(downloadedPath) });
-            }
-          }
-        }
-      } else {
-        logger.warn('S3 service not available, skipping upload');
-        
-        // Clean up local file if S3 upload was requested but service is unavailable
-        const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
-        if (shouldDeleteLocal) {
-          try {
-            await cleanupFileAndDirectories(downloadedPath);
-            logger.info('Deleted local video file (S3 service unavailable)', { filename: path.basename(downloadedPath) });
-          } catch (deleteError) {
-            logger.warn('Failed to delete local video file', { error: deleteError, filename: path.basename(downloadedPath) });
-          }
-        }
-      }
-    } catch (error: any) {
-      logger.error('Error during S3 upload', error);
-      
-      // Clean up local file if S3 upload was requested but failed with error
-      const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
-      if (shouldDeleteLocal) {
-        try {
-          await cleanupFileAndDirectories(downloadedPath);
-          logger.info('Deleted local video file after S3 upload error', { filename: path.basename(downloadedPath) });
-        } catch (deleteError) {
-          logger.warn('Failed to delete local video file after upload error', { error: deleteError, filename: path.basename(downloadedPath) });
-        }
-      }
-    }
-  }
-  
-  // Return local path if S3 upload is disabled or failed
-  return downloadedPath;
-}
 
 export async function downloadContent(url: string): Promise<Buffer | null> {
     if (!url) {
@@ -1660,29 +1566,16 @@ export async function downloadContent(url: string): Promise<Buffer | null> {
         return null;
     }
 }
-/**
- * Transcodes a video file to a specified resolution using a direct ffmpeg spawn.
- * @param inputPath - The path to the source video file.
- * @param outputPath - The path where the transcoded video will be saved.
- * @param resolution - The target vertical resolution.
- * @returns A promise that resolves when transcoding is complete.
- */
-function getCpuCores(): number {
-  return computeDefaultConcurrency('cpu');
-}
 
 function transcodeRendition(inputPath: string, outputPath: string, resolution: VideoQuality): Promise<void> {
   return withSemaphore(diskSemaphore, 'disk_ffmpeg_transcode', () => new Promise((resolve, reject) => {
         const height = parseInt(resolution.replace('p', ''), 10);
-        const threads = Math.max(1, parseInt(process.env.FFMPEG_THREADS || '', 10) || getCpuCores());
         logger.info(`Starting transcoding to ${resolution}...`);
 
     const args = [
             '-i', inputPath,
             '-vf', `scale=-2:${height}`, 
             '-c:v', 'libx264',
-      '-x264-params', `threads=${threads}`,
-      '-threads', String(threads),
             '-c:a', 'aac',
             '-y', 
             outputPath
@@ -1712,43 +1605,6 @@ function transcodeRendition(inputPath: string, outputPath: string, resolution: V
         });
   }));
 }
-async function createAndUploadRenditions(
-    originalFilePath: string,
-    originalQuality: 1080 | 720,
-    s3Service: S3Service,
-    metadata: VideoMetadata
-): Promise<void> {
-    const renditionsToCreate: VideoQuality[] = [];
-    if (originalQuality === 1080) {
-        renditionsToCreate.push('720p');
-    }
-    renditionsToCreate.push('480p', '360p');
-
-    const tempDir = path.dirname(originalFilePath);
-    const createdFiles: string[] = [];
-
-    for (const quality of renditionsToCreate) {
-        const outputFileName = `${path.basename(originalFilePath, path.extname(originalFilePath))}_${quality}.mp4`;
-        const outputFilePath = path.join(tempDir, outputFileName);
-        createdFiles.push(outputFilePath);
-
-        try {
-            // 1. Transcode the video
-            await transcodeRendition(originalFilePath, outputFilePath, quality);
-
-            // 2. Upload the transcoded file
-            const s3Key = generateLowerDefVideoS3Key(metadata, quality);
-            const bucketName = getS3ArtifactBucket();
-            await s3Service.uploadFile(outputFilePath, bucketName, s3Key);
-            logger.info(`✅ Successfully uploaded ${quality} rendition to S3.`);
-
-        } catch (error) {
-            logger.error(`❌ Failed to process ${quality} rendition.`, error instanceof Error ? error : new Error('error instance is undefined'));
-            // Continue to the next rendition even if one fails
-        }
-    }
-  }
-
 /**
  * Retry wrapper for operations that may fail due to transient issues
  * @param operation - The async operation to retry
@@ -1827,7 +1683,6 @@ export async function renderingLowerDefinitionVersions(
       const masterPath = path.join(outputDir, 'master.m3u8');
       try {
         await fsPromises.access(masterPath);
-        // Master exists; nothing to do
         return masterPath;
       } catch {
         logger.warn('⚠️ FFmpeg did not generate master.m3u8; generating manually...');
@@ -1905,22 +1760,7 @@ export async function renderingLowerDefinitionVersions(
         
         const audioCodecParams = getAudioCodecParams();
         
-  const cores = getCpuCores();
-  // Ensure FFmpeg itself can use all available cores for filtering/muxing as well
-  // Place global threads flag before any inputs/options
-  ffmpegArgs.unshift('-threads', String(cores));
-  // Increase filter graph threads for parallelism on multi-core systems
-  ffmpegArgs.unshift('-filter_complex_threads', String(Math.max(1, Math.min(cores, renditions.length * 2))));
-  ffmpegArgs.unshift('-filter_threads', String(Math.max(1, Math.floor(cores / 2) || 1)));
-
-  // Optimize thread allocation: distribute available cores across encoders to target ~100% CPU
-  // Each encoder gets at least 2 threads; distribute any remainder to the first N encoders.
-  const minThreadsPerEncoder = 2;
-  const baseThreads = Math.max(minThreadsPerEncoder, Math.floor(cores / renditions.length) || 1);
-  let remainder = Math.max(0, cores - baseThreads * renditions.length);
-  const perEncoderThreads: number[] = renditions.map((_, idx) => baseThreads + (remainder-- > 0 ? 1 : 0));
-
-  logger.info('FFmpeg thread allocation per rendition', { cores, perEncoderThreads, renditions: renditions.map(r => r.name) });
+  // Removed explicit thread thresholds; rely on ffmpeg defaults
 
   renditions.forEach((r, i) => {
             const renditionDir = path.join(outputDir, r.name);
@@ -1931,15 +1771,16 @@ export async function renderingLowerDefinitionVersions(
                 `-map`, `[a${i}]`,
                 `-c:v`, `libx264`,
                 '-preset', 'veryfast',
-    '-x264-params', `threads=${perEncoderThreads[i]}:keyint=48:min-keyint=48:scenecut=0`,
+                '-x264-params', 
+                `keyint=48:min-keyint=48:scenecut=0`,
                 '-b:v', r.bitrate,
-                ...audioCodecParams, // Use the robust audio codec parameters
+                ...audioCodecParams, 
                 '-f', 'hls',
                 '-hls_flags', 'single_file',
                 '-hls_time', '6',
                 '-hls_playlist_type', 'vod',
                 '-hls_segment_type', 'fmp4',
-                path.join(renditionDir, `${r.name}.m3u8`) // Main output is now the playlist
+                path.join(renditionDir, `${r.name}.m3u8`) 
             );
             streamMapVar.push(`v:${i},a:${i}`);
         });
@@ -1985,12 +1826,10 @@ export async function renderingLowerDefinitionVersions(
                             break;
                         }
                     }
-                    
                     logger.info('🔄 Retrying with audio copy instead of AAC encoding...');
                     await executeCommand(FFMPEG_PATH, fallbackArgs, outputDir);
                     logger.info('✅ Fallback with audio copy succeeded');
                 } else {
-                    // Re-throw other errors
                     throw error;
                 }
             }
@@ -1998,9 +1837,6 @@ export async function renderingLowerDefinitionVersions(
         
         await withRetry(executeFFmpegWithFallback, 1, 1500, 2);
     logger.info('✅ All renditions transcoded successfully in a single run.');
-        // --- End of Optimized FFmpeg Logic ---
-
-    // Ensure master.m3u8 exists (fallback to manual generation if FFmpeg didn't create it)
     await ensureMasterPlaylist();
 
     // Conditionally upload to S3 if available; otherwise, skip upload and return empty link

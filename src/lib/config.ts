@@ -49,13 +49,13 @@ const config: Config = {
   
   nodeEnv: process.env.NODE_ENV || 'development',
   logLevel: process.env.LOG_LEVEL || 'info',
-  semaphoreMaxConcurrency: parseInt(process.env.SEMAPHORE_MAX_CONCURRENCY || '', 10) || undefined,
-  s3UploadConcurrency: parseInt(process.env.S3_UPLOAD_CONCURRENCY || '', 10) || undefined,
-  httpConcurrency: parseInt(process.env.HTTP_CONCURRENCY || '', 10) || undefined,
-  diskConcurrency: parseInt(process.env.DISK_CONCURRENCY || '', 10) || undefined,
-  dbMaxInflight: parseInt(process.env.DB_MAX_INFLIGHT || '', 10) || undefined,
-  retryAttempts: parseInt(process.env.RETRY_ATTEMPTS || '', 10) || undefined,
-  retryBaseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS || '', 10) || undefined,
+  semaphoreMaxConcurrency: parseInt(process.env.SEMAPHORE_MAX_CONCURRENCY || '', 16) || undefined,
+  s3UploadConcurrency: parseInt(process.env.S3_UPLOAD_CONCURRENCY || '', 16) || undefined,
+  httpConcurrency: parseInt(process.env.HTTP_CONCURRENCY || '', 16) || undefined,
+  diskConcurrency: parseInt(process.env.DISK_CONCURRENCY || '', 16) || undefined,
+  dbMaxInflight: parseInt(process.env.DB_MAX_INFLIGHT || '', 16) || undefined,
+  retryAttempts: parseInt(process.env.RETRY_ATTEMPTS || '', 16) || undefined,
+  retryBaseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS || '', 16) || undefined,
 };
 
 export default config;

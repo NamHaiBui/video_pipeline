@@ -198,7 +198,10 @@ export const METRICS = {
     API_REQUEST: 'ApiRequest',
     RATE_LIMIT_HIT: 'RateLimitHit',
     CONTENT_DURATION: 'ContentDuration',
-    PODCAST_EPISODES_PROCESSED: 'PodcastEpisodesProcessed',
+  PODCAST_EPISODES_PROCESSED: 'PodcastEpisodesProcessed',
+  DOWNLOAD_FAILED: 'DownloadFailed',
+  EPISODE_SKIPPED: 'EpisodeSkipped',
+  YTDLP_FAILURE: 'YtDlpFailure'
   },
 } as const;
 

@@ -2,11 +2,11 @@ import { Message, SQSClient, SendMessageCommand, GetQueueAttributesCommand, Send
 import { createSQSServiceFromEnv } from './lib/sqsService_new.js';
 import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
-import { processDownload, downloadVideoForExistingEpisode, enableTaskProtection, disableTaskProtection, manageTaskProtection } from './server.js';
+import { processDownload, enableTaskProtection, disableTaskProtection, manageTaskProtection } from './server.js';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
-import { createRDSServiceFromEnv, RDSService } from './lib/rdsService.js';
+// Removed RDS enrichment dependency
 
 // Configuration
 // Size workers to ensure 100% compute:
@@ -26,19 +26,7 @@ const WORKER_ID = `${os.hostname()}-${process.pid}`;
 // Create SQS service
 const sqsService = createSQSServiceFromEnv();
 
-// Create RDS service (optional)
-const rdsService: RDSService | null = createRDSServiceFromEnv();
-const isRDSEnabled = !!rdsService;
-let rdsInitStarted = false;
-async function ensureRdsReady(): Promise<void> {
-  if (!rdsService) return;
-  if (!rdsInitStarted) {
-    rdsInitStarted = true;
-    try { await rdsService.initClient(); } catch (e: any) {
-      logger.warn(`Failed to initialize RDS client in poller: ${e?.message || e}`);
-    }
-  }
-}
+// Video enrichment removed: RDS client no longer needed here
 
 // Create a separate SQS client specifically for transcription queue
 const createTranscriptionSQSClient = () => {
@@ -193,17 +181,10 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     const jobData = JSON.parse(message.Body) as SQSJobMessage;
     
     // Determine message type based on structure
-    const isVideoEnrichment = !!(jobData.id && jobData.url && !jobData.videoId);
     const isNewEntry = !!(jobData.videoId && jobData.episodeTitle && jobData.originalUri);
     
     // Validate message structure
-    if (isVideoEnrichment) {
-      // Video Enrichment: {"id": str, "url": str}
-      if (!jobData.id || !jobData.url) {
-        logger.warn(`Invalid video enrichment message ${messageId}: missing id or url`);
-        return true; // Delete invalid messages
-      }
-    } else if (isNewEntry) {
+  if (isNewEntry) {
       // New Entry: comprehensive video metadata
       if (!jobData.videoId || !jobData.episodeTitle || !jobData.originalUri) {
         logger.warn(`Invalid new entry message ${messageId}: missing required fields (videoId, episodeTitle, originalUri)`);
@@ -215,72 +196,6 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         logger.warn(`Invalid job data in message ${messageId}: missing url or unknown message format`);
         return true; // Delete invalid messages
       }
-    }
-    
-    // Handle video enrichment (existing episode video download)
-    if (isVideoEnrichment) {
-      logger.info(`Processing video enrichment: ${jobData.id} - ${jobData.url}`);
-      // Skip if episode already processed (has master_m3u8)
-      if (isRDSEnabled) {
-        try {
-          await ensureRdsReady();
-          const episode = await rdsService!.getEpisode(jobData.id!);
-          const hasMaster = !!episode?.additionalData?.master_m3u8;
-          if (episode && hasMaster) {
-            logger.info(`Skipping enrichment for episode ${jobData.id}: master_m3u8 already present`);
-            if (sqsService) {
-              await sqsService.deleteMessage(message.ReceiptHandle!);
-            }
-            return true; // handled (deleted)
-          }
-        } catch (e: any) {
-          logger.warn(`RDS check failed for enrichment ${jobData.id}, proceeding anyway: ${e?.message || e}`);
-        }
-      }
-      
-      // Check if we can accept more jobs
-      if (!jobTracker.canAcceptMoreJobs()) {
-        logger.debug(`Cannot accept video enrichment job ${jobData.id}, max concurrent jobs reached`);
-        return false; // Keep in queue
-      }
-      
-      // Start job tracking
-      const trackingJobId = `enrichment-${jobData.id}`;
-      if (!jobTracker.startJob(trackingJobId)) {
-        return false; // Failed to start job, try again later
-      }
-      
-  // Apply ECS task protection and start visibility extender
-  try { await enableTaskProtection(120); } catch {}
-  // Start visibility extender to protect long-running job from being re-delivered
-  const stopExtend = sqsService ? sqsService.startVisibilityExtender(message.ReceiptHandle!, 120, 900) : () => {};
-  jobTracker.attachMessageContext(trackingJobId, message.ReceiptHandle!, stopExtend);
-    // Process video enrichment job async
-    downloadVideoForExistingEpisode(jobData.id!, jobData.url!)
-        .then(async () => {
-          logger.info(`Video enrichment ${jobData.id} completed successfully`);
-      stopExtend();
-          jobTracker.completeJob(trackingJobId);
-          try { await manageTaskProtection(); } catch {}
-          if (sqsService) {
-            await sqsService.deleteMessage(message.ReceiptHandle!);
-          }
-          if (jobTracker.canAcceptMoreJobs()) {
-            pollSQSMessages();
-          }
-        })
-        .catch(async error => {
-          logger.error(`Error processing video enrichment job ${jobData.id}: ${error.message}`, undefined, { error });
-      stopExtend();
-          jobTracker.completeJob(trackingJobId);
-          try { await manageTaskProtection(); } catch {}
-          if (jobTracker.canAcceptMoreJobs()) {
-            pollSQSMessages();
-          }
-        });
-    
-      
-      return true;
     }
     
     // Handle new entry creation
@@ -489,12 +404,12 @@ export async function sendToTranscriptionQueue(message: Record<string, string>):
     // Convert message to JSON string
     const messageBody = JSON.stringify(message);
     
-    // console.log('📤 Sending transcription message:', {
-    //   episodeId: message.episodeId,
-    //   audioUri: message.audioUri,
-    //   bodyLength: messageBody.length,
-    //   queueUrl: process.env.SQS_TRANSCRIBE_EPISODE_URL
-    // });
+    console.log('📤 Sending transcription message:', {
+      episodeId: message.episodeId,
+      audioUri: message.audioUri,
+      bodyLength: messageBody.length,
+      queueUrl: process.env.SQS_TRANSCRIBE_EPISODE_URL
+    });
     
     // Create and send the command directly
     const command = new SendMessageCommand({
@@ -539,7 +454,6 @@ export function startSQSPolling(): void {
   
   logger.info(`Starting SQS polling with max ${MAX_CONCURRENT_JOBS} concurrent jobs`);
   logger.info('📬 SQS Message Types Supported:');
-  logger.info('  - Video Enrichment: { "id": "episodeId", "url": "https://youtube.com/..." }');
   logger.info('  - New Entry: { "videoId": "...", "episodeTitle": "...", "originalUri": "https://youtube.com/...", "channelName": "...", "channelId": "...", ... }');
   logger.info('  - Legacy Downloads: { "jobId": "uuid" (optional), "url": "https://youtube.com/...", "channelId": "channel-id" (optional) }');
   logger.info('  - Note: jobId will be auto-generated if not provided for legacy downloads');

@@ -57,3 +57,6 @@ node_modules/
 .yarn-integrity
 
 test*.js
+
+# Cookies
+.config/yt-dlp/yt-dlp-cookies.txt

@@ -624,17 +624,19 @@ export function downloadAndMergeVideo(
       outputFilenameTemplate = prepareOutputTemplate(outputFilenameTemplate, videoMetadata, true); // Use subdirectory for final files
     }
 
-    // Early skip: if episode already fully processed (has master_m3u8), avoid any downloads
+    // Early skip: if episode already fully processed (has master_m3u8 and processingDone=true), avoid any downloads
     try {
       const rds = createRDSServiceFromEnv();
       if (rds && videoMetadata?.id) {
         try { await rds.initClient(); } catch {}
         const existing = await rds.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
-        const hasVideo = !!existing?.additionalData?.videoLocation;
-        const hasMaster = !!existing?.additionalData?.master_m3u8;
-        if (existing && hasVideo && hasMaster) {
-          const existingId = existing.episodeId;
-          logger.info(`✅ Skipping processing for ${videoMetadata.id} (${existingId}): master_m3u8 already present`);
+        if (existing) {
+          const full = await rds.getEpisode(existing.episodeId);
+          const hasMaster = !!full?.additionalData?.master_m3u8;
+          const isDone = !!full?.processingDone;
+          if (hasMaster && isDone) {
+            const existingId = existing.episodeId;
+            logger.info(`✅ Skipping processing for ${videoMetadata.id} (${existingId}): master_m3u8 present and processingDone=true`);
           // Optionally update guest extraction if provided
           if (guestExtractionResult) {
             try {
@@ -644,11 +646,85 @@ export function downloadAndMergeVideo(
               logger.warn(`Failed to update guest extraction for ${existingId}: ${e?.message || e}`);
             }
           }
-          return resolve({ mergedFilePath: '', episodeId: existingId });
+            return resolve({ mergedFilePath: '', episodeId: existingId });
+          }
         }
       }
     } catch (e: any) {
       logger.warn(`Skip-precheck failed; proceeding with processing: ${e?.message || e}`);
+    }
+    // If videoLocation exists but master/processingDone are not complete, download from S3 instead of yt-dlp
+    try {
+      const rds = createRDSServiceFromEnv();
+      const s3 = createS3ServiceFromEnv();
+      if (rds && s3 && videoMetadata?.id) {
+        try { await rds.initClient(); } catch {}
+        const existing = await rds.checkEpisodeExistsByYoutubeVideoId(videoMetadata.id);
+        if (existing) {
+          const full = await rds.getEpisode(existing.episodeId);
+          const vloc = full?.additionalData?.videoLocation as string | undefined;
+          const hasMaster = !!full?.additionalData?.master_m3u8;
+          const isDone = !!full?.processingDone;
+          if (vloc && (!hasMaster || !isDone)) {
+            logger.info(`♻️ Reprocessing requested but video exists on S3; downloading from S3 instead of yt-dlp for ${existing.episodeId}`);
+            // Build final path under podcast/uploader/episode slug
+            const podcastSlug = create_slug(videoMetadata.uploader || 'unknown');
+            const episodeSlug = create_slug(videoMetadata.title || 'untitled');
+            const podcastDir = path.join(outputDir, podcastSlug, episodeSlug);
+            if (!fs.existsSync(podcastDir)) {
+              fs.mkdirSync(podcastDir, { recursive: true });
+            }
+            const localVideoPath = path.join(podcastDir, `${episodeSlug}.mp4`);
+            // Parse S3 URL and download
+            const parsed = s3.parseS3Url(vloc);
+            if (parsed) {
+              const dl = await s3.downloadFile(parsed.bucket, parsed.key, localVideoPath);
+              if (!dl.success) {
+                logger.warn(`Failed to download existing S3 video (${vloc}): ${dl.error}; falling back to yt-dlp path`);
+              } else {
+                logger.info(`✅ Downloaded existing video from S3 to ${localVideoPath}`);
+                // Generate HLS renditions and upload
+                try {
+                  const originalQuality: 1080 | 720 = (metadata?.filesize_approx && metadata.filesize_approx < 1000000) ? 1080 : 720;
+                  const bucketName = getS3ArtifactBucket();
+                  const { masterPlaylists3Link } = await withRetry(
+                    () => renderingLowerDefinitionVersions(localVideoPath, videoMetadata!, originalQuality, s3, bucketName),
+                    3,
+                    2000,
+                    2
+                  );
+                  if (masterPlaylists3Link) {
+                    await rds.updateEpisode(existing.episodeId, {
+                      additionalData: { master_m3u8: masterPlaylists3Link },
+                      processingDone: true,
+                      isSynced: false,
+                      contentType: 'video'
+                    });
+                    logger.info(`✅ Updated episode ${existing.episodeId} with master_m3u8 and processingDone=true`);
+                  } else {
+                    logger.warn('HLS master link missing after rendering; RDS not updated with master_m3u8');
+                  }
+                } catch (e: any) {
+                  logger.error(`❌ HLS rendering from existing S3 video failed: ${e?.message || e}`);
+                } finally {
+                  // Optionally clean local video
+                  try {
+                    if (fs.existsSync(localVideoPath)) {
+                      await fsPromises.unlink(localVideoPath);
+                      await cleanupEmptyPodcastDirectories(podcastDir);
+                    }
+                  } catch {}
+                }
+                return resolve({ mergedFilePath: '', episodeId: existing.episodeId });
+              }
+            } else {
+              logger.warn(`Could not parse S3 URL for videoLocation: ${vloc}; falling back to yt-dlp path`);
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      logger.warn(`S3 reprocess shortcut failed; proceeding with yt-dlp: ${e?.message || e}`);
     }
     
     // Ensure the directory structure exists for the podcast-title subdirectory
@@ -790,12 +866,14 @@ export function downloadAndMergeVideo(
               logger.info(`📝 Found existing episode by youtubeVideoId: ${existingEpisode.episodeId}`);
               
               // Check the processing status of the existing episode
-              const additionalData = existingEpisode.additionalData || {};
+              const fullExisting = await rdsService.getEpisode(existingEpisode.episodeId);
+              const additionalData = fullExisting?.additionalData || {};
               const hasVideoLocation = additionalData.videoLocation !== undefined;
               const hasMasterM3u8 = additionalData.master_m3u8 !== undefined;
+              const doneFlag = !!fullExisting?.processingDone;
               
-              if (hasVideoLocation && hasMasterM3u8) {
-                logger.info(`✅ Episode ${existingEpisode.episodeId} already fully processed - skipping all processing`);
+              if (hasVideoLocation && hasMasterM3u8 && doneFlag) {
+                logger.info(`✅ Episode ${existingEpisode.episodeId} already fully processed (processingDone=true) - skipping all processing`);
                 episodeId = existingEpisode.episodeId;
                 shouldSendToTranscriptionQueue = false;
                 
@@ -808,7 +886,7 @@ export function downloadAndMergeVideo(
                 
                 // Return early - skip all video processing
                 return episodeId;
-              } else if (hasVideoLocation && !hasMasterM3u8) {
+              } else if (hasVideoLocation && (!hasMasterM3u8 || !doneFlag)) {
                 logger.info(`🔄 Episode ${existingEpisode.episodeId} has videoLocation but missing master_m3u8 - will reprocess video`);
                 episodeId = existingEpisode.episodeId;
                 shouldSendToTranscriptionQueue = false; // Don't send transcription message for reprocessing
@@ -1297,19 +1375,19 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
     ffmpegProcess.stderr?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegError += output + '\n';
-      if (output.trim().length > 0) {
-        logger.info(`ffmpeg output`, { message: output });
-        console.log(`[ffmpeg] ${output}`);
-      }
+      // if (output.trim().length > 0) {
+      //   logger.info(`ffmpeg output`, { message: output });
+      //   console.log(`[ffmpeg] ${output}`);
+      // }
     });
 
     ffmpegProcess.stdout?.on('data', (data: Buffer) => {
       const output = data.toString().trim();
       ffmpegOutput += output + '\n';
-      if (output.trim().length > 0) {
-        logger.info(`ffmpeg stdout`, { message: output });
-        console.log(`[ffmpeg stdout] ${output}`);
-      }
+      // if (output.trim().length > 0) {
+      //   logger.info(`ffmpeg stdout`, { message: output });
+      //   console.log(`[ffmpeg stdout] ${output}`);
+      // }
     });
 
     ffmpegProcess.on('error', (error: Error) => {

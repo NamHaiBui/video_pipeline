@@ -325,13 +325,15 @@ export interface AnalysisConfig {
  * Processing information for episodes matching the new RDS schema
  */
 export interface EpisodeProcessingInfo {
-  episodeTranscribingDone: boolean;
-  summaryTranscribingDone: boolean;
-  summarizingDone: boolean;
-  numChunks: number;
-  numRemovedChunks: number;
-  chunkingDone: boolean;
-  quotingDone: boolean;
+  quotingDone: boolean,
+  chunkingDone: boolean,
+  summarizingDone: boolean,
+  audioQuotingDone: boolean,
+  videoQuotingDone: boolean,
+  audioChunkingDone: boolean,
+  videoChunkingDone: boolean,
+  episodeTranscribingDone: boolean,
+  summaryTranscribingDone: boolean,
 }
 
 /**
@@ -406,9 +408,8 @@ export interface RDSEpisodeData {
   summaryDurationMillis?: number;
   /** S3 URL for summary transcript */
   summaryTranscriptUri?: string;
-  
   /** Content type: Audio or Video */
-  contentType: 'audio' | 'video';
+  contentType: 'video';
   /** Processing status information (as JSON) */
   processingInfo: EpisodeProcessingInfo;
   /** Additional data as JSON for future use */

@@ -5,6 +5,7 @@ import path from 'path';
 import { logger } from './utils/logger.js';
 import { Upload } from '@aws-sdk/lib-storage';
 import { withSemaphore, s3Semaphore, metrics, withRetry, computeDefaultConcurrency, getConcurrencyFromEnv } from './utils/concurrency.js';
+import { emitStepFailure, emitStepSuccess, emitStepDuration } from './cloudwatchMetrics.js';
 
 export interface S3Config {
   region: string;
@@ -41,18 +42,6 @@ class S3RetryUtility {
     'NoSuchBucket',
     'BucketNotEmpty',
     'InvalidArgument'
-  ];
-
-  // Error names that should be retried (network/timeout related)
-  private static readonly RETRYABLE_ERROR_NAMES = [
-    'NetworkError',
-    'TimeoutError',
-    'AbortError',
-    'RequestTimeout',
-    'ServiceUnavailable',
-    'InternalError',
-    'SlowDown',
-    'Throttling'
   ];
 
   static async executeWithRetry<T>(
@@ -190,8 +179,11 @@ export class S3Service {
     key: string, 
     contentType?: string
   ): Promise<S3UploadResult> {
-    try {
+  const __stepStart = Date.now();
+  try {
       if (!fs.existsSync(filePath)) {
+    emitStepFailure('s3_upload_video', 'FileNotFound', 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+    emitStepDuration('s3_upload_video', Date.now() - __stepStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
         return {
           success: false,
           key,
@@ -291,6 +283,8 @@ export class S3Service {
       const location = result.Location ||`https://${bucket}.s3.us-east-1.amazonaws.com/${key}`;
       logger.info(`✅ Successfully uploaded ${filePath} to ${uri}`);
       logger.info(`📁 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      emitStepSuccess('s3_upload_video', 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+      emitStepDuration('s3_upload_video', Date.now() - __stepStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
       
       return {
         success: true,
@@ -311,6 +305,8 @@ export class S3Service {
       };
       
       logger.error(`❌ Failed to upload ${filePath} to S3:`, errorMessage, errorDetails);
+  emitStepFailure('s3_upload_video', String(errorCode), 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  emitStepDuration('s3_upload_video', Date.now() - __stepStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
       return {
           success: false,
           key,
@@ -331,7 +327,8 @@ export class S3Service {
     destinationPath: string,
     opts?: { partSizeMB?: number; concurrency?: number }
   ): Promise<{ success: boolean; path?: string; error?: string }> {
-    try {
+  const __dlStart = Date.now();
+  try {
       const head = await withSemaphore(s3Semaphore, 's3_head', async () =>
         this.s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
       );
@@ -348,7 +345,10 @@ export class S3Service {
             .on('finish', resolve)
             .on('error', reject);
         });
-        return { success: true, path: destinationPath };
+  const outRes = { success: true, path: destinationPath } as const;
+  emitStepSuccess('s3_download', 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  emitStepDuration('s3_download', Date.now() - __dlStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  return outRes;
       }
 
       const partSize = Math.max(5, (opts?.partSizeMB ?? parseInt(process.env.S3_DOWNLOAD_PART_SIZE_MB || '32', 10))) * 1024 * 1024; // Increased default from 16MB to 32MB
@@ -398,11 +398,15 @@ export class S3Service {
         await fh.close();
       }
 
-      return { success: true, path: destinationPath };
+  emitStepSuccess('s3_download', 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  emitStepDuration('s3_download', Date.now() - __dlStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  return { success: true, path: destinationPath };
     } catch (error: any) {
       logger.error(`❌ Failed to download s3://${bucket}/${key}: ${error?.message || error}`);
       try { await fs.promises.unlink(destinationPath); } catch {}
-      return { success: false, error: error?.message || String(error) };
+  emitStepFailure('s3_download', String(error?.code || error?.name || 'Error'), 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  emitStepDuration('s3_download', Date.now() - __dlStart, 's3', [{ Name: 'Bucket', Value: bucket }]).catch(()=>{});
+  return { success: false, error: error?.message || String(error) };
     }
   }
   

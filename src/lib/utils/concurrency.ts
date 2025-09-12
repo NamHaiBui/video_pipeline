@@ -1,6 +1,5 @@
 import os from 'os';
 import fs from 'fs';
-import { logger } from './logger.js';
 
 // Simple async semaphore implementation
 export class Semaphore {

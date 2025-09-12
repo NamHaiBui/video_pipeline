@@ -101,11 +101,6 @@ USER nodejs
 # Expose port
 EXPOSE 3000
 
-# Add labels for better container management
-LABEL maintainer="episode_video_downloader" \
-      description="Podcast Processing Pipeline - Convert YouTube videos to podcast episodes" \
-      version="1.0.0"
-
 # Set environment variables
 ENV NODE_ENV=production \
     PORT=3000 \

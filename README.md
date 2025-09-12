@@ -1,193 +1,216 @@
-# Video Episode Downloader - TypeScript
+# Video pipeline (YouTube → audio/video → HLS → S3)
 
-A comprehensive video episode downloader built with TypeScript and Node.js that converts YouTube videos into podcast episodes with automatic audio extraction, metadata processing, and cloud storage integration.
+This app downloads a YouTube video, extracts MP3 audio, merges audio+video, renders HLS variants, and (optionally) uploads results to S3. It exposes a simple HTTP API and can also run as an ECS worker that reads jobs from SQS.
 
-## Features
+Keep it simple: install, run, hit the API, and you’ll get files in a local downloads/ folder or in S3 if you enable it.
 
-- 🎙️ **YouTube to Podcast Conversion**: Automatically process YouTube videos as podcast episodes
-- 🎧 **High-Quality Audio Extraction**: Extract podcast-optimized audio in MP3, AAC, or Opus formats
-- ☁️ **AWS Cloud Integration**: Upload to S3 buckets with organized folder structure
-- 🗄️ **DynamoDB Storage**: Store podcast episode metadata and processing status
-- 📊 **Real-time Progress Tracking**: Monitor processing jobs with detailed progress updates
-- 🔍 **Content Analysis**: AI-powered content categorization and guest detection
-- 📋 **Podcast Metadata**: Automatic generation of podcast-standard metadata
-- 🌊 **SQS Queue Processing**: Scalable job processing with AWS SQS integration
+## What you get
 
-## Installation
+- yt-dlp + ffmpeg are auto-installed into local bin/ on install
+- Download video and/or audio
+- Merge into one MP4
+- Make HLS playlists and renditions
+- Upload to S3 (optional)
+- Small API to start a download and check status
+
+## Requirements
+
+- Node.js 18+ (ES modules + tsx)
+- Python 3 (used to run the portable yt-dlp script on Alpine-like systems)
+- wget, xz, tar (only needed once to fetch ffmpeg/ffprobe during setup)
+- Optional: AWS account/creds if you want to upload to S3 or use SQS/RDS
+
+## Install
 
 ```bash
 npm install
 ```
 
-This will automatically download the required binaries (yt-dlp and ffmpeg).
-
-## Usage
-
-### Development Mode (TypeScript)
-
-```bash
-npm run dev
-```
-
-### Production Mode (Compiled JavaScript)
-
-```bash
-npm start
-```
-
-### SQS Integration
-
-The server includes integrated SQS polling that automatically processes jobs from an AWS SQS queue:
-
-```bash
-# Start the server with SQS polling enabled (enabled by default in docker-compose)
-ENABLE_SQS_POLLING=true npm run server
-```
-
-See [ECS_DEPLOYMENT_GUIDE.md](ECS_DEPLOYMENT_GUIDE.md) for detailed AWS ECS deployment instructions.
-
-### Manual Binary Setup
+On install, the app downloads yt-dlp and ffmpeg/ffprobe to bin/ and makes them executable. If that fails on your machine, run:
 
 ```bash
 npm run setup
 ```
 
-## Scripts
+Tip: If you plan to download members-only or age-gated videos, put your browser cookies at `.config/yt-dlp/yt-dlp-cookies.txt` (project root). The app will pick it up automatically.
 
-### Main Scripts
-- `npm run build` - Compile TypeScript to JavaScript
-- `npm run dev` - Run TypeScript directly with tsx
-- `npm start` - Build and run the compiled JavaScript
-- `npm run setup` - Download required binaries
-- `npm run clean` - Remove compiled output
+## Run (local)
 
-### Test Scripts
-- `npm run test:metadata-only` - Test metadata extraction only
-- `npm run test:slug-filename` - Test filename slug generation
-- `npm run test:slug-integration` - Test complete slug integration
-- `npm run test:complete-slug` - Test complete slug functionality
-- `npm run test:video-slug` - Test video slug generation
-- `npm run test:trimming-queue` - Test video trimming queue functionality
+Development (TypeScript with live tsx):
 
-## TypeScript Features
-
-### Type Definitions
-
-The project includes comprehensive type definitions for:
-
-- `VideoMetadata` - Complete video information from yt-dlp
-- `ProgressInfo` - Download progress tracking
-- `DownloadOptions` - Configuration options for downloads
-- `CommandResult` - Command execution results
-
-### Example Usage
-
-```typescript
-import { getVideoMetadata, downloadAndMergeVideo } from './lib/ytdlpWrapper.js';
-import { ProgressInfo } from './types.js';
-
-// Get video metadata with full type safety
-const metadata = await getVideoMetadata('https://youtube.com/watch?v=...');
-console.log(metadata.title, metadata.uploader);
-
-// Download video with audio merged
-await downloadAndMergeVideo('https://youtube.com/watch?v=...', {
-  outputFilename: 'Custom - %(title)s.mp4',
-  onProgress: (progress: ProgressInfo) => {
-    console.log(`Progress: ${progress.percent} - ${progress.raw}`);
-  }
-});
+```bash
+npm run dev
 ```
 
-## Project Structure
+Build + run (compiled to dist/):
 
-```
-src/
-├── index.ts                 # Main application entry point
-├── types.ts                 # TypeScript type definitions
-├── lib/
-│   └── ytdlpWrapper.ts     # yt-dlp wrapper with types
-└── scripts/
-    └── setup_binaries.ts   # Binary download script
-
-dist/                       # Compiled JavaScript output
-bin/                        # Downloaded binaries (yt-dlp, ffmpeg)
-downloads/                  # Downloaded videos
+```bash
+npm run start
 ```
 
-## Migration from JavaScript
+Server listens on `PORT` (default 3000).
 
-This project has been fully converted from JavaScript to TypeScript, providing:
+## Minimal usage (HTTP API)
 
-- **Type Safety**: Catch errors at compile time
-- **Better IDE Support**: IntelliSense, auto-completion, and refactoring
-- **Maintainability**: Clear interfaces and contracts
-- **Documentation**: Types serve as living documentation
+Start a download:
 
-## Dependencies
+```bash
+curl -X POST http://localhost:3000/api/download \
+	-H 'Content-Type: application/json' \
+	-d '{"url":"https://www.youtube.com/watch?v=VIDEO_ID"}'
+```
 
-- **Runtime**: `axios`, `progress`
-- **Development**: `typescript`, `tsx`, `@types/node`, `@types/progress`
+Response (example):
 
-## Configuration
+```json
+{ "success": true, "jobId": "<uuid>", "message": "Job created" }
+```
 
-Concurrency and retry (new):
+Check job status:
 
-- SEMAPHORE_MAX_CONCURRENCY: global default cap for bounded concurrency. Default: auto (CPU/io aware).
-- S3_UPLOAD_CONCURRENCY: limit parallel S3 operations. Default: 2x CPU cores (min 4).
-- HTTP_CONCURRENCY: limit HTTP calls (APIs, downloads). Default: 2x CPU cores (min 4).
-- DISK_CONCURRENCY: limit heavy disk/FFmpeg jobs. Default: CPU cores.
-- DB_MAX_INFLIGHT: limit concurrent DB transactions. Default: max(2, CPU cores).
-- RETRY_ATTEMPTS: retry attempts for transient failures. Default: 3.
-- RETRY_BASE_DELAY_MS: base backoff in ms. Default: 500.
+```bash
+curl http://localhost:3000/api/job/<jobId>
+```
 
-Tuning tips:
+List all jobs:
 
-- Start conservative in production, then increase gradually while monitoring in-flight gauges and tail latencies.
-- Observe metrics snapshot logs and CloudWatch to identify saturation (queue_depth rising while in_flight ~= capacity).
-- Increase S3/HTTP first for I/O-bound workloads; keep DB_MAX_INFLIGHT modest to avoid lock pressure.
-- Rollback: set specific concurrency envs to 1 to serialize a subsystem temporarily.
+```bash
+curl http://localhost:3000/api/jobs
+```
 
-### Environment Variables
+Health check:
 
-The pipeline supports various environment variables for configuration:
+```bash
+curl http://localhost:3000/health
+```
 
-#### AWS Services
+Where files go (local):
 
-- `AWS_REGION`: AWS region for services (default: us-east-1)
-- `AWS_ACCESS_KEY_ID`: AWS access key for authentication
-- `AWS_SECRET_ACCESS_KEY`: AWS secret key for authentication
+- downloads/podcasts/`podcast-slug`/`episode-slug`/*.mp3
+- downloads/`podcast-slug`/`episode-slug`/`episode-slug`.mp4
+- HLS renditions are created under a temporary folder during processing and uploaded to S3 when enabled
 
-#### S3 Configuration
+## Enable S3 uploads (optional)
 
-- `S3_UPLOAD_ENABLED`: Enable S3 uploads (true/false)
-- `AUDIO_BUCKET_NAME`: S3 bucket for audio files
-- `VIDEO_BUCKET_NAME`: S3 bucket for video files
+Set these environment variables, then restart the app:
 
-#### DynamoDB Configuration
+- S3_UPLOAD_ENABLED=true
+- AWS_REGION=us-east-1 (or your region)
+- AWS_ACCESS_KEY_ID=...
+- AWS_SECRET_ACCESS_KEY=...
+- S3_ARTIFACT_BUCKET=your-artifact-bucket
+- Optional key prefixes:
+	- S3_VIDEO_KEY_PREFIX=some/prefix/
+	- S3_AUDIO_KEY_PREFIX=some/prefix/
 
-- `DYNAMODB_PODCAST_EPISODES_TABLE`: Table name for podcast episodes (default: PodcastEpisodeStoreTest)
+The app will upload:
 
-#### SQS Configuration
+- Audio MP3 to: s3://S3_ARTIFACT_BUCKET/`podcast`/`episode`/original/audio/`episode`.mp3
+- Video MP4 to: s3://S3_ARTIFACT_BUCKET/`podcast`/`episode`/original/videos/`quality`.mp4
+- HLS master to: s3://S3_ARTIFACT_BUCKET/`podcast`/`episode`/original/video_stream/master.m3u8
 
-- `SQS_QUEUE_URL`: URL for the main processing queue
-- `VIDEO_TRIMMING_QUEUE_URL`: URL for the video trimming queue (triggered when processing is complete)
-- `ENABLE_SQS_POLLING`: Enable/disable SQS polling (default: true)
-- `SQS_MAX_MESSAGES`: Maximum messages to receive per poll (default: 10)
-- `SQS_WAIT_TIME`: Long polling wait time in seconds (default: 20)
+## SQS worker (optional)
 
-#### Video Trimming Integration
+If you want a worker that pulls jobs from SQS (typical on ECS):
 
-- When podcast processing is complete (both `quotes_audio_status` and `chunking_status` are "COMPLETED"), the system automatically queues a message to the video trimming SQS queue specified by `VIDEO_TRIMMING_QUEUE_URL`
-- Default queue: `https://sqs.us-east-1.amazonaws.com/221082194281/test-video-trimming`
-- Message format: `{"id": "episode-id"}`
+Required env:
 
-#### Other Configuration
+- `SQS_QUEUE_URL=https://sqs.region.amazonaws.com/account-id/queue-name`
+- AWS_REGION=<your-region>
+- AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (if not using a task role)
 
-- `PORT`: Server port (default: 3000)
-- `YOUTUBE_API_KEY`: YouTube Data API key for search functionality
-- `PREFERRED_AUDIO_FORMAT`: Audio format preference (mp3/aac/opus, default: mp3)
-- `YTDLP_USE_NIGHTLY`: Use nightly builds of yt-dlp (true/false)
-- `PODCAST_CONVERSION_ENABLED`: Enable podcast conversion features (default: true)
+Useful env:
 
-## TypeScript API
+- MAX_CONCURRENT_JOBS=number (defaults to CPU-aware)
+- POLLING_INTERVAL_MS=5000
+- SQS_VISIBILITY_SECONDS=300 (message invisibility while processing)
+- SQS_REQUEUE_ON_TIMEOUT_SECONDS=30
+- SPOT_REQUEUE_VISIBILITY_SECONDS=5
+- AUTO_EXIT_ON_IDLE=false
+
+In production we run a separate worker that imports `startSQSPolling()` from `src/sqsPoller.ts`. If you’re containerizing, run a worker image with those env vars set.
+
+## RDS (optional)
+
+If you store episode metadata in Postgres (RDS):
+
+- RDS_HOST, RDS_USER, RDS_PASSWORD, RDS_DATABASE, RDS_PORT
+- SSL is always required (the client uses `ssl: { rejectUnauthorized: false }`).
+
+The server can enrich and update episodes when uploads complete.
+
+## Update yt-dlp
+
+Run the script shortcut (defined in package.json):
+
+```bash
+npm run update-ytdlp
+```
+
+Nightly build / force / skip version check:
+
+```bash
+npm run update-ytdlp:nightly
+npm run update-ytdlp:force
+npm run update-ytdlp:skip-check
+```
+
+If the shortcut is not available in your branch, you can run the updater directly:
+
+```bash
+npx tsx src/lib/yt_dlp_update_script.ts
+```
+
+## Advanced tune-ups (optional)
+
+- Cookies file: `.config/yt-dlp/yt-dlp-cookies.txt` (absolute or project-relative path)
+- Connections for yt-dlp: `YTDLP_CONNECTIONS` (defaults to CPU-aware)
+- Preferred audio format: `PREFERRED_AUDIO_FORMAT=mp3|opus|aac|m4a` (default mp3)
+- ffmpeg/yt-dlp locations are auto-detected from `bin/` after setup
+- Retry knobs: `RETRY_ATTEMPTS`, `RETRY_BASE_DELAY_MS`
+- S3 upload tuning: `S3_UPLOAD_PART_SIZE_MB`, `S3_UPLOAD_QUEUE_SIZE`
+- S3 download tuning: `S3_DOWNLOAD_PART_SIZE_MB`, `S3_DOWNLOAD_CONCURRENCY`
+- Custom extractor base URL: `BGUTIL_PROVIDER_URL` (used in `--extractor-args`)
+
+## Docker (local)
+
+Build and run with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Place your environment in a `.env` file in the project root if needed. The server port is published according to the compose file.
+
+## ECS (Fargate / Fargate Spot)
+
+Runtime behavior is controlled by env:
+
+- FARGATE_CAPACITY=on_demand or spot
+
+On-demand enables ECS Task Protection during active work to avoid scale-in. Spot skips protection and requeues in-flight jobs on interruption. See `docs/ECS_OPTIMIZATIONS.md` for short, practical details.
+
+## Further docs
+
+- End-to-end pipeline guide: `docs/Guide_to_understanding_to_process.md`
+- MP4 ➜ HLS details: `docs/MP4_TO_HLS.md`
+- yt-dlp setup, update, and usage: `docs/YTDLP_props.md`
+- ECS on-demand vs. Spot behavior: `docs/ECS_OPTIMIZATIONS.md`
+
+## Project structure (short)
+
+- src/server.ts: HTTP API
+- src/lib/ytdlpWrapper.ts: All yt-dlp + ffmpeg operations
+- src/lib/update_ytdlp.ts and src/lib/yt_dlp_update_script.ts: yt-dlp updater
+- src/lib/s3Service.ts, src/lib/s3KeyUtils.ts: S3 client and key helpers
+- src/sqsPoller.ts: SQS worker logic
+- bin/: downloaded yt-dlp, ffmpeg, ffprobe
+
+## Troubleshooting
+
+- “yt-dlp not found”: run `npm run setup` (or reinstall). Ensure Python 3 is installed; the portable script may use it.
+- “ffmpeg not found”: `npm run setup` fetches it into bin/.
+- “Cannot access S3/SQS”: check AWS creds, region, IAM role. Verify `S3_ARTIFACT_BUCKET`/`SQS_QUEUE_URL`.
+- “Stuck or slow downloads”: set `YTDLP_CONNECTIONS`, check network, and make sure cookies are valid for the content you’re downloading.
+- Alpine images: the portable yt-dlp script runs via `python3` automatically if direct exec fails.
+

@@ -163,7 +163,7 @@ export const LOGGING = {
   // CloudWatch
   DEFAULT_LOG_GROUP: 'podcast-pipeline-logs',
   DEFAULT_LOG_STREAM: 'podcast-processor',
-  DEFAULT_AWS_REGION: 'us-east-1',
+  DEFAULT_AWS_REGION: 'us-east-2',
 } as const;
 
 // =============================================================================

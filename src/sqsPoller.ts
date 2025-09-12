@@ -1,11 +1,12 @@
 import { Message, SQSClient, SendMessageCommand, GetQueueAttributesCommand, SendMessageCommandOutput, GetQueueAttributesCommandOutput } from '@aws-sdk/client-sqs';
-import { createSQSServiceFromEnv } from './lib/sqsService_new.js';
+import { createSQSServiceFromEnv } from './lib/sqsService.js';
 import { logger } from './lib/utils/logger.js';
 import { SQSJobMessage } from './types.js';
-import { processDownload, enableTaskProtection, disableTaskProtection, triggerYtdlpFatal } from './server.js';
+import { processDownload, enableTaskProtection, disableTaskProtection, triggerYtdlpFatal, bumpProtectionIfOnDemand } from './server.js';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import { metrics, computeDefaultConcurrency, isGreedyPerJob } from './lib/utils/concurrency.js';
+import { emitStepFailure, emitStepSuccess, emitStepDuration } from './lib/cloudwatchMetrics.js';
 // Removed RDS enrichment dependency
 
 // Configuration
@@ -19,8 +20,8 @@ const MAX_CONCURRENT_JOBS = (() => {
   return isGreedyPerJob() ? 1 : computeDefaultConcurrency('cpu');
 })();
 // Poll frequently by default (5s). Override with POLLING_INTERVAL_MS.
-const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS || '5000', 10);
-const AUTO_EXIT_ON_IDLE = (process.env.AUTO_EXIT_ON_IDLE || 'false').toLowerCase() === 'true';
+const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS || '20000', 10);
+const AUTO_EXIT_ON_IDLE = (process.env.AUTO_EXIT_ON_IDLE || 'true').toLowerCase() === 'true';
 const WORKER_ID = `${os.hostname()}-${process.pid}`;
 
 // Create SQS service
@@ -143,6 +144,7 @@ let shuttingDown = false;
 let pollInterval: NodeJS.Timeout | null = null;
 let healthInterval: NodeJS.Timeout | null = null;
 const REQUEUE_ON_TIMEOUT_SECONDS = parseInt(process.env.SQS_REQUEUE_ON_TIMEOUT_SECONDS || '30', 10);
+const SPOT_REQUEUE_VISIBILITY_SECONDS = parseInt(process.env.SPOT_REQUEUE_VISIBILITY_SECONDS || '5', 10);
 
 // Track empty polls for service shutdown
 let consecutiveEmptyPolls = 0;
@@ -175,6 +177,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     return false;
   }
   
+  const startedAt = Date.now();
   try {
     // Parse message
     const messageId = message.MessageId || 'unknown';
@@ -207,6 +210,8 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       // Check if we can accept more jobs
       if (!jobTracker.canAcceptMoreJobs()) {
         logger.debug(`Cannot accept new entry job ${generatedJobId}, max concurrent jobs reached`);
+        emitStepFailure('sqs_handle_message', 'MaxConcurrency', 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
+        emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
         return false; // Keep in queue
       }
       
@@ -225,6 +230,8 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     processDownload(generatedJobId, jobData.originalUri!, jobData)
         .then(async () => {
           logger.info(`New entry creation ${generatedJobId} completed successfully`);
+    emitStepSuccess('sqs_handle_message', 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
+    emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
     stopExtend();
             if (sqsService) {
               await sqsService.deleteMessage(message.ReceiptHandle!);
@@ -236,6 +243,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         })
         .catch(async error => {
           logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
+      const errName = error?.code || error?.name || 'Error';
+      emitStepFailure('sqs_handle_message', String(errName), 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
+      emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'new_entry' }]).catch(()=>{});
       stopExtend();
           jobTracker.completeJob(trackingJobId);
           try { await disableTaskProtection(); } catch {}
@@ -273,6 +283,8 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     // Check if we can accept more jobs
     if (!jobTracker.canAcceptMoreJobs()) {
       logger.debug(`Cannot accept legacy job ${jobData.jobId}, max concurrent jobs reached`);
+      emitStepFailure('sqs_handle_message', 'MaxConcurrency', 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
+      emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
       return false; // Keep in queue
     }
     
@@ -290,6 +302,8 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
   processDownload(legacyJobId, jobData.url)
       .then(async () => {
     logger.info(`Legacy download ${legacyJobId} completed successfully`);
+        emitStepSuccess('sqs_handle_message', 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
+        emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
         stopExtend();
         if (sqsService) {
           await sqsService.deleteMessage(message.ReceiptHandle!);
@@ -302,6 +316,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
       })
       .catch(async error => {
     logger.error(`Error processing legacy job ${legacyJobId}: ${error.message}`, undefined, { error });
+        const errName = error?.code || error?.name || 'Error';
+        emitStepFailure('sqs_handle_message', String(errName), 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
+        emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller', [{ Name: 'Type', Value: 'legacy' }]).catch(()=>{});
     stopExtend();
   jobTracker.completeJob(legacyJobId);
   try { await disableTaskProtection(); } catch {}
@@ -316,6 +333,8 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
     return true;
   } catch (error: any) {
     logger.error(`Error handling SQS message: ${error.message}`, undefined, { error });
+    emitStepFailure('sqs_handle_message', String(error?.code || error?.name || 'Error'), 'poller').catch(()=>{});
+    emitStepDuration('sqs_handle_message', Date.now() - startedAt, 'poller').catch(()=>{});
     return true; // Keep in queue
   }
 }
@@ -340,6 +359,8 @@ async function pollSQSMessages(): Promise<void> {
   }
   
   try {
+  // Opportunistically renew task protection on on-demand capacity
+  try { await bumpProtectionIfOnDemand(); } catch {}
     // Calculate how many messages to fetch based on capacity
     const availableCapacity = MAX_CONCURRENT_JOBS - jobTracker.count;
     const maxMessages = Math.min(availableCapacity, 10); // SQS max is 10
@@ -405,6 +426,7 @@ export async function sendToTranscriptionQueue(message: Record<string, string>):
     return;
   }
 
+  const startedAt = Date.now();
   try {
     // Convert message to JSON string
     const messageBody = JSON.stringify(message);
@@ -422,7 +444,7 @@ export async function sendToTranscriptionQueue(message: Record<string, string>):
       MessageBody: messageBody
     });
     
-    const result: SendMessageCommandOutput = await transcriptionSQSClient.send(command);
+  const result: SendMessageCommandOutput = await transcriptionSQSClient.send(command);
     
     console.log(`✅ Transcription job sent: ${message.episodeId} -> ${result.MessageId}`);
     
@@ -435,12 +457,17 @@ export async function sendToTranscriptionQueue(message: Record<string, string>):
       
       const attrs: GetQueueAttributesCommandOutput = await transcriptionSQSClient.send(attrCommand);
       console.log(`📊 Transcription queue now has: ${attrs.Attributes?.ApproximateNumberOfMessages || '0'} messages`);
-    } catch (attrError: any) {
+  } catch (attrError: any) {
       console.log('⚠️ Could not check queue attributes:', attrError.message);
     }
+  // success metric
+  await emitStepSuccess('transcription_enqueue', 'poller');
+  await emitStepDuration('transcription_enqueue', Date.now() - startedAt, 'poller');
     
   } catch (err: any) {
     console.error(`❌ Failed to send transcription job:`, err.message);
+  await emitStepFailure('transcription_enqueue', String(err?.code || err?.name || 'Error'), 'poller');
+  await emitStepDuration('transcription_enqueue', Date.now() - startedAt, 'poller');
     throw err;
   }
 }
@@ -461,7 +488,7 @@ export function startSQSPolling(): void {
   logger.info('📬 SQS Message Types Supported:');
   logger.info('  - New Entry: { "videoId": "...", "episodeTitle": "...", "originalUri": "https://youtube.com/...", "channelName": "...", "channelId": "...", ... }');
   logger.info('  - Legacy Downloads: { "jobId": "uuid" (optional), "url": "https://youtube.com/...", "channelId": "channel-id" (optional) }');
-  logger.info('  - Note: jobId will be auto-generated if not provided for legacy downloads');
+
   logger.info('  - Note: channelId will be derived from uploader if not provided');
   
   // Initial poll
@@ -523,6 +550,26 @@ export async function requestPollerShutdown(graceMs: number = parseInt(process.e
   }
 }
 
+/**
+ * Immediately requeue all in-flight messages and stop polling (used for Fargate SPOT interruptions)
+ */
+export async function requeueAllInFlightAndStop(visibilitySeconds: number = SPOT_REQUEUE_VISIBILITY_SECONDS): Promise<void> {
+  stopPolling();
+  const jobs = jobTracker.activeJobIds;
+  logger.info(`Requeuing ${jobs.length} in-flight message(s) with visibility=${visibilitySeconds}s due to SPOT interruption.`);
+  for (const jobId of jobs) {
+    const entry: any = (jobTracker as any).active.get(jobId);
+    try { entry?.stopExtend?.(); } catch {}
+    if (sqsService && entry?.receiptHandle) {
+      try {
+        await sqsService.changeMessageVisibility(entry.receiptHandle, visibilitySeconds);
+      } catch (e: any) {
+        logger.error(`Failed to requeue job ${jobId}: ${e?.message || e}`);
+      }
+    }
+  }
+}
+
 // Setup graceful shutdown handlers (best-effort; server may also coordinate)
 process.on('SIGINT', async () => {
   logger.info(`SIGINT received by poller. Initiating graceful drain with ${jobTracker.count} active job(s).`);
@@ -530,8 +577,15 @@ process.on('SIGINT', async () => {
 });
 
 process.on('SIGTERM', async () => {
+  const isSpot = (process.env.FARGATE_CAPACITY || process.env.FARGATE_CAPACITY_TYPE || '').toLowerCase() === 'spot';
+  if (isSpot) {
+    logger.info(`SIGTERM received by poller (SPOT). Requeuing all in-flight messages immediately.`);
+    await requeueAllInFlightAndStop(SPOT_REQUEUE_VISIBILITY_SECONDS);
+    return;
+  }
   logger.info(`SIGTERM received by poller. Initiating graceful drain with ${jobTracker.count} active job(s).`);
-  await requestPollerShutdown();
+  const graceMs = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
+  await requestPollerShutdown(graceMs);
 });
 
 export { jobTracker, pollSQSMessages, handleSQSMessage, };

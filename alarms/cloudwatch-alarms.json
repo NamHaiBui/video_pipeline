@@ -1,0 +1,72 @@
+{
+  "Description": "CloudWatch Alarms for Video Pipeline",
+  "Parameters": {
+    "NamespaceOps": { "Type": "String", "Default": "SPICE/VideoPipelineOps" },
+    "NamespaceValidation": { "Type": "String", "Default": "SPICE/VideoPipelineValidation" },
+    "Environment": { "Type": "String", "Default": "dev" },
+    "AlarmTopicArn": { "Type": "String", "Description": "SNS Topic ARN for alarm notifications" }
+  },
+  "Resources": {
+    "YtdlpFatalAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${Environment}-YtdlpFatalError" },
+        "Namespace": { "Ref": "NamespaceValidation" },
+        "MetricName": "YtdlpFatalError",
+        "Dimensions": [
+          { "Name": "Environment", "Value": { "Ref": "Environment" } }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "Threshold": 1,
+        "EvaluationPeriods": 1,
+        "DatapointsToAlarm": 1,
+        "Period": 60,
+        "Statistic": "Sum",
+        "TreatMissingData": "notBreaching",
+        "OKActions": [ { "Ref": "AlarmTopicArn" } ],
+        "AlarmActions": [ { "Ref": "AlarmTopicArn" } ]
+      }
+    },
+    "StepFailureAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${Environment}-PipelineStepFailure" },
+        "Namespace": { "Ref": "NamespaceOps" },
+        "MetricName": "StepFailure",
+        "Dimensions": [
+          { "Name": "Environment", "Value": { "Ref": "Environment" } }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "Threshold": 1,
+        "EvaluationPeriods": 1,
+        "DatapointsToAlarm": 1,
+        "Period": 60,
+        "Statistic": "Sum",
+        "TreatMissingData": "notBreaching",
+        "OKActions": [ { "Ref": "AlarmTopicArn" } ],
+        "AlarmActions": [ { "Ref": "AlarmTopicArn" } ]
+      }
+    },
+    "ValidationFailedAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${Environment}-PostProcessValidationFailed" },
+        "Namespace": { "Ref": "NamespaceValidation" },
+        "MetricName": "PostProcessValidationFailed",
+        "Dimensions": [
+          { "Name": "Environment", "Value": { "Ref": "Environment" } },
+          { "Name": "Stage", "Value": "post_process" }
+        ],
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "Threshold": 1,
+        "EvaluationPeriods": 1,
+        "DatapointsToAlarm": 1,
+        "Period": 300,
+        "Statistic": "Sum",
+        "TreatMissingData": "notBreaching",
+        "OKActions": [ { "Ref": "AlarmTopicArn" } ],
+        "AlarmActions": [ { "Ref": "AlarmTopicArn" } ]
+      }
+    }
+  }
+}

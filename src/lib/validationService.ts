@@ -1,7 +1,7 @@
 import { S3Service, createS3ServiceFromEnv } from './s3Service.js';
 import { RDSService, createRDSServiceFromEnv, EpisodeRecord } from './rdsService.js';
 import { logger } from './utils/logger.js';
-import { emitValidationMetric } from './cloudwatchMetrics.js';
+import { emitValidationMetric, emitStepFailure, emitStepSuccess } from './cloudwatchMetrics.js';
 import { GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import path from 'path';
 
@@ -77,7 +77,7 @@ export class ValidationService {
       logger.warn('Validation: S3 unavailable; skipping object checks');
     }
 
-    // Optional stream (HLS master) validation and duration check
+    // HLS s3 object checking and validation
     if ((params.validateStream || params.verifyDurationToleranceSeconds) && this.s3) {
       try {
         // Attempt to derive master playlist URL from provided s3Urls or RDS
@@ -142,8 +142,8 @@ export class ValidationService {
     }
 
     const ok = errors.length === 0;
-    if (ok) logger.info('✅ Post-process validation OK');
-    else logger.error('❌ Post-process validation FAILED', new Error('validation_failed'), { errors });
+  if (ok) logger.info('✅ Post-process validation OK');
+  else logger.error('❌ Post-process validation FAILED', new Error('validation_failed'), { errors });
 
     // Emit CloudWatch metric (non-blocking)
     emitValidationMetric({
@@ -153,6 +153,9 @@ export class ValidationService {
       warnings: 0,
       stage: 'post_process'
     }).catch(() => {});
+  // Also emit step success/failure for generic ops namespace
+  if (ok) emitStepSuccess('validation', 'validator').catch(()=>{});
+  else emitStepFailure('validation', 'validation_failed', 'validator').catch(()=>{});
 
     return { ok, errors, details };
   }

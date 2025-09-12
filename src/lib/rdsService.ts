@@ -5,6 +5,7 @@ import { logger } from './utils/logger.js';
 import { GuestExtractionService, GuestExtractionResult } from './guestExtractionService.js';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
+import { emitStepFailure, emitStepSuccess, emitStepDuration } from './cloudwatchMetrics.js';
 
 // Load environment variables
 dotenv.config();
@@ -272,7 +273,7 @@ export class RDSService {
       // Validate basic primitives when provided
       [
         'episodeTitle','episodeDescription','hostName','hostDescription','episodeUri','originalUri',
-        'contentType','country','genre','durationMillis','rssUrl','processingDone','isSynced',
+        'contentType','country','genre','durationMillis','rssUrl','processingDone',
         'transcriptUri','processedTranscriptUri','summaryAudioUri','summaryDurationMillis','summaryTranscriptUri'
       ].forEach(k => checkPrimitive(k as keyof EpisodeRecord));
 
@@ -665,13 +666,15 @@ export class RDSService {
         processingDone: false,
         isSynced: false,
         processingInfo: {
-          episodeTranscribingDone: false,
-          summaryTranscribingDone: false,
-          summarizingDone: false,
-          numChunks: 0,
-          numRemovedChunks: 0,
-          chunkingDone: false,
-          quotingDone: false,
+          quotingDone:false,
+          chunkingDone:false,
+          summarizingDone:false,
+          audioQuotingDone:false,
+          videoQuotingDone:false,
+          audioChunkingDone:false,
+          videoChunkingDone:false,
+          episodeTranscribingDone:false,
+          summaryTranscribingDone:false,
         },
         additionalData: messageBody.additionalData || {},
         createdAt: new Date().toISOString(),
@@ -761,7 +764,17 @@ export class RDSService {
     metadata?: VideoMetadata,
     thumbnailUrl?: string
   ): Promise<{ episodeId: string }> {
-    return this.storeNewEpisodeWithRetry(messageBody, s3AudioLink, metadata, thumbnailUrl);
+    const startedAt = Date.now();
+    try {
+      const res = await this.storeNewEpisodeWithRetry(messageBody, s3AudioLink, metadata, thumbnailUrl);
+      emitStepSuccess('rds_store_episode', 'rds').catch(()=>{});
+      emitStepDuration('rds_store_episode', Date.now() - startedAt, 'rds').catch(()=>{});
+      return res;
+    } catch (e: any) {
+      emitStepFailure('rds_store_episode', String(e?.code || e?.name || 'Error'), 'rds').catch(()=>{});
+      emitStepDuration('rds_store_episode', Date.now() - startedAt, 'rds').catch(()=>{});
+      throw e;
+    }
   }
 
   /**
@@ -944,6 +957,7 @@ export class RDSService {
    */
   async updateEpisode(episodeId: string, updateData: Partial<EpisodeRecord>): Promise<void> {
     const maxValidateRetries = parseInt(process.env.RDS_UPDATE_VALIDATE_RETRIES || '3', 10);
+    const startedAt = Date.now();
     const baseDelayMs = parseInt(process.env.RDS_UPDATE_VALIDATE_BASE_DELAY_MS || '200', 10);
 
     return withSemaphore(dbSemaphore, 'db_write', async () => {
@@ -960,6 +974,8 @@ export class RDSService {
           // Independently validate in a separate query context
           const validationOk = await this.validateEpisodeUpdate(episodeId, updateData);
           if (validationOk) {
+            emitStepSuccess('rds_update_episode', 'rds').catch(()=>{});
+            emitStepDuration('rds_update_episode', Date.now() - startedAt, 'rds').catch(()=>{});
             return; // success
           }
 
@@ -977,8 +993,11 @@ export class RDSService {
         }
       }
       // If we reached here, validation still failed or repeated errors occurred
-      throw lastError || new Error(`RDS update validation failed after ${maxValidateRetries} attempts for episode ${episodeId}`);
-    });
+      const err = lastError || new Error(`RDS update validation failed after ${maxValidateRetries} attempts for episode ${episodeId}`);
+      emitStepFailure('rds_update_episode', String((err as any)?.code || (err as any)?.name || 'Error'), 'rds').catch(()=>{});
+      emitStepDuration('rds_update_episode', Date.now() - startedAt, 'rds').catch(()=>{});
+      throw err;
+        });
   }
 
   /**
@@ -1192,9 +1211,22 @@ export class RDSService {
    * Update episode with guest extraction results using transaction
    */
   async updateEpisodeWithGuestExtraction(episodeId: string, extractionResult: GuestExtractionResult): Promise<void> {
-    return withSemaphore(dbSemaphore, 'db_write', () => this.executeWithRetry(async (client) => {
-      return this.updateEpisodeWithGuestExtractionInternal(client, episodeId, extractionResult);
-    }));
+    const startedAt = Date.now();
+    try {
+      return await withSemaphore(dbSemaphore, 'db_write', async () => this.executeWithRetry(async (client) => {
+        return this.updateEpisodeWithGuestExtractionInternal(client, episodeId, extractionResult);
+      }));
+    } catch (e: any) {
+      emitStepFailure('guest_extraction', String(e?.code || e?.name || 'Error'), 'rds').catch(()=>{});
+      emitStepDuration('guest_extraction', Date.now() - startedAt, 'rds').catch(()=>{});
+      throw e;
+    } finally {
+      // success if we didn't throw
+      if (!(typeof (globalThis as any).__lastRdsGuestExtractionError !== 'undefined')) {
+        emitStepSuccess('guest_extraction', 'rds').catch(()=>{});
+        emitStepDuration('guest_extraction', Date.now() - startedAt, 'rds').catch(()=>{});
+      }
+    }
   }
 
   /**

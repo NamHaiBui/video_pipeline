@@ -1,0 +1,113 @@
+{
+  "family": "video-pipeline-spot",
+  "cpu": "1024",
+  "memory": "4096",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/video-pipeline-task-role",
+  "ephemeralStorage": {
+    "sizeInGiB": 100
+  },
+  "containerDefinitions": [
+    {
+      "name": "video-pipeline",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/video-pipeline:latest",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 3000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "PORT", "value": "3000" },
+        { "name": "AWS_REGION", "value": "us-east-2" },
+        { "name": "ENABLE_SQS_POLLING", "value": "true" },
+        { "name": "S3_UPLOAD_ENABLED", "value": "true" },
+        { "name": "PODCAST_CONVERSION_ENABLED", "value": "true" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "S3_ARTIFACT_BUCKET", "value": "spice-episode-artifacts" },
+        { "name": "S3_BUCKET_NAME", "value": "spice-user-content-assets" },
+        { "name": "S3_VIDEO_KEY_PREFIX", "value": "" },
+        { "name": "S3_AUDIO_KEY_PREFIX", "value": "" },
+        { "name": "S3_UPLOAD_PART_SIZE_MB", "value": "32" },
+        { "name": "S3_UPLOAD_QUEUE_SIZE", "value": "8" },
+        { "name": "S3_DOWNLOAD_PART_SIZE_MB", "value": "32" },
+        { "name": "SQS_TRANSCRIBE_EPISODE_URL", "value": "https://sqs.us-east-2.amazonaws.com/577638363654/new-podcast-transcription-queue" },
+        { "name": "SQS_QUEUE_URL", "value": "" },
+        { "name": "SQS_MAX_MESSAGES", "value": "10" },
+        { "name": "SQS_ENDPOINT_URL", "value": "" },
+        { "name": "SQS_VISIBILITY_SECONDS", "value": "" },
+        { "name": "SQS_REQUEUE_ON_TIMEOUT_SECONDS", "value": "30" },
+        { "name": "SPOT_REQUEUE_VISIBILITY_SECONDS", "value": "5" },
+        { "name": "POLLING_INTERVAL_MS", "value": "5000" },
+        { "name": "AUTOSCALE_INTERVAL_MS", "value": "30000" },
+        { "name": "AUTO_EXIT_ON_IDLE", "value": "false" },
+        { "name": "MAX_CONCURRENT_JOBS", "value": "2" },
+        { "name": "GREEDY_PER_JOB", "value": "true" },
+        { "name": "DISK_CONCURRENCY", "value": "1" },
+        { "name": "HTTP_CONCURRENCY", "value": "" },
+        { "name": "S3_UPLOAD_CONCURRENCY", "value": "" },
+        { "name": "DB_MAX_INFLIGHT", "value": "" },
+        { "name": "SEMAPHORE_MAX_CONCURRENCY", "value": "" },
+        { "name": "EFFECTIVE_CPU_CORES", "value": "" },
+        { "name": "YTDLP_CONNECTIONS", "value": "" },
+        { "name": "FFMPEG_THREADS", "value": "" },
+        { "name": "PREFERRED_AUDIO_FORMAT", "value": "mp3" },
+        { "name": "YTDLP_USE_NIGHTLY", "value": "false" },
+        { "name": "BGUTIL_PROVIDER_URL", "value": "http://localhost:4416" },
+        { "name": "RETRY_ATTEMPTS", "value": "3" },
+        { "name": "RETRY_BASE_DELAY_MS", "value": "500" },
+        { "name": "RDS_UPDATE_VALIDATE_RETRIES", "value": "3" },
+        { "name": "RDS_UPDATE_VALIDATE_BASE_DELAY_MS", "value": "200" },
+        { "name": "RDS_HOST", "value": "spice-content-database.cw96a0664ksh.us-east-1.rds.amazonaws.com" },
+        { "name": "RDS_USER", "value": "app_user" },
+        { "name": "RDS_DATABASE", "value": "spice_content" },
+        { "name": "RDS_PORT", "value": "5432" },
+        { "name": "RDS_POOL_MAX", "value": "20" },
+        { "name": "RDS_IDLE_TIMEOUT", "value": "30000" },
+        { "name": "RDS_CONNECTION_TIMEOUT", "value": "2000" },
+        { "name": "VALIDATION_METRICS_ENABLED", "value": "true" },
+        { "name": "VALIDATION_METRIC_NAMESPACE", "value": "SPICE/VideoPipelineValidation" },
+        { "name": "OP_METRIC_NAMESPACE", "value": "SPICE/VideoPipelineOps" },
+        { "name": "FARGATE_CAPACITY", "value": "SPOT" },
+        { "name": "FARGATE_CAPACITY_TYPE", "value": "SPOT" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "DEFAULT_VIDEO_QUALITY", "value": "720p" },
+        { "name": "SUPPORTED_FORMATS", "value": "mp4,avi,mov,mkv" },
+        { "name": "VIDEO_INPUT_DIR", "value": "./input" },
+        { "name": "VIDEO_OUTPUT_DIR", "value": "./output" },
+        { "name": "TEMP_DIR", "value": "./temp" },
+        { "name": "YT_DLP_PATH", "value": "yt-dlp" },
+        { "name": "FFMPEG_PATH", "value": "" },
+        { "name": "SHUTDOWN_GRACE_MS", "value": "60000" }
+      ],
+      "secrets": [
+        { "name": "RDS_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/RDS_PASSWORD" },
+        { "name": "SHUTDOWN_AUTH_TOKEN", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/SHUTDOWN_AUTH_TOKEN" },
+        { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/GEMINI_API_KEY" },
+        { "name": "PERPLEXITY_API_KEY", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/PERPLEXITY_API_KEY" },
+        { "name": "SEARCH_API_KEY", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/SEARCH_API_KEY" },
+        { "name": "SEARCH_ENGINE_ID", "valueFrom": "arn:aws:ssm:us-east-2:<ACCOUNT_ID>:parameter/video-pipeline/SEARCH_ENGINE_ID" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/video-pipeline",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 40
+      }
+    }
+  ]
+}

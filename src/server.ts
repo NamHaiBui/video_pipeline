@@ -21,11 +21,8 @@ import {
 import { isValidYouTubeUrl, sanitizeYouTubeUrl } from './lib/utils/urlUtils.js';
 import { checkAndUpdateYtdlp, getUpdateStatus, UpdateOptions } from './lib/update_ytdlp.js';
 import { createS3ServiceFromEnv} from './lib/s3Service.js';
-import { getS3ArtifactBucket, generateVideoS3Key } from './lib/s3KeyUtils.js';
-import { createSQSServiceFromEnv} from './lib/sqsService_new.js';
+import { createSQSServiceFromEnv} from './lib/sqsService.js';
 import { RDSService, createRDSServiceFromEnv } from './lib/rdsService.js';
-import { createValidationServiceFromEnv } from './lib/validationService.js';
-import { emitValidationMetric } from './lib/cloudwatchMetrics.js';
 import { emitYtdlpErrorMetric } from './lib/cloudwatchMetrics.js';
 import { logger } from './lib/utils/logger.js';
 import { create_slug, inWhiteList} from './lib/utils/utils.js';
@@ -34,30 +31,6 @@ import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
 import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 import { METRICS } from './constants.js';
 import fetch from 'node-fetch';
-
-/**
- * Wrapper function to safely execute yt-dlp operations with server protection
- * This ensures that yt-dlp errors are properly caught and don't crash the server
- */
-async function safeYtdlpOperation<T>(
-  operation: () => Promise<T>, 
-  operationName: string, 
-  jobId?: string
-): Promise<T> {
-  try {
-    return await operation();
-  } catch (error: any) {
-    const errorMessage = error?.message || String(error);
-    const logPrefix = jobId ? `Job ${jobId}` : 'Operation';
-    
-    logger.error(`${logPrefix}: yt-dlp operation '${operationName}' failed - server protected`, error);
-    console.error(`${logPrefix}: Safe yt-dlp wrapper caught error in '${operationName}':`, errorMessage);
-    
-    // Re-throw the error so calling code can handle it appropriately
-    throw error;
-  }
-}
-
 import dotenv from 'dotenv';
 
 // Load environment configuration
@@ -65,9 +38,6 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-
 // Initialize S3 service
 const s3Service = createS3ServiceFromEnv();
 const isS3Enabled = s3Service !== null && process.env.S3_UPLOAD_ENABLED === 'true';
@@ -105,6 +75,19 @@ let ecsDiscoveryInFlight: Promise<void> | null = null;
 let lastProtectionExpiresAt: number | null = null; // epoch ms
 let lastEnableAttemptAt: number = 0;
 const MIN_RENEW_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+// Periodic yt-dlp updater interval handle
+let ytDlpUpdateInterval: NodeJS.Timeout | null = null;
+
+// Fargate capacity mode toggle (on-demand vs. spot)
+type FargateCapacityMode = 'on_demand' | 'spot' | 'unknown';
+const rawCapacity = (process.env.FARGATE_CAPACITY || process.env.FARGATE_CAPACITY_TYPE || '').toLowerCase();
+let fargateCapacityMode: FargateCapacityMode = rawCapacity === 'spot'
+  ? 'spot'
+  : rawCapacity === 'on_demand' || rawCapacity === 'ondemand' || rawCapacity === 'on-demand'
+  ? 'on_demand'
+  : 'unknown';
+
+export function isSpotCapacity(): boolean { return fargateCapacityMode === 'spot'; }
 
 /** Attempt to discover ECS cluster/task from Fargate metadata if not provided */
 async function ensureEcsIdentity(): Promise<void> {
@@ -127,7 +110,7 @@ async function ensureEcsIdentity(): Promise<void> {
       }
       isECSDeployment = !!(ECS_CLUSTER_NAME && ECS_TASK_ARN);
       if (isECSDeployment && !ecsClient) {
-        ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+        ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-2' });
       }
       if (isECSDeployment) {
         logger.info(`Discovered ECS identity: cluster=${ECS_CLUSTER_NAME}, taskArn=${ECS_TASK_ARN}`);
@@ -142,14 +125,13 @@ async function ensureEcsIdentity(): Promise<void> {
 }
 
 if (isECSDeployment) {
-  ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+  ecsClient = new ECSClient({ region: process.env.AWS_REGION || 'us-east-2' });
 } else {
-  // Try best-effort discovery (non-blocking)
   ensureEcsIdentity().catch(() => {});
 }
-// CloudWatch metrics client (lazy init on first use if not ECS)
+
 try {
-  cloudWatchClient = new CloudWatchClient({ region: process.env.AWS_REGION || 'us-east-1' });
+  cloudWatchClient = new CloudWatchClient({ region: process.env.AWS_REGION || 'us-east-2' });
 } catch {}
 
 async function emitMetric(name: string, value: number = 1, dimensions: { Name: string; Value: string }[] = []) {
@@ -186,8 +168,6 @@ if (isRDSEnabled) {
 } else {
   logger.warn('RDS service disabled or not configured');
 }
-
-// ...existing code...
 
 // Middleware
 app.use(cors());
@@ -250,7 +230,6 @@ export async function enableTaskProtection(durationMinutes: number = 60): Promis
   const desiredExpiry = now + durationMinutes * 60 * 1000;
   const bufferMs = 10 * 60 * 1000; // renew if less than 10 minutes remaining
   if (lastProtectionExpiresAt && lastProtectionExpiresAt - now > bufferMs) {
-    // Still protected sufficiently; skip noisy call unless last attempt older than MIN_RENEW_INTERVAL_MS
     if (now - lastEnableAttemptAt < MIN_RENEW_INTERVAL_MS) return;
   }
 
@@ -346,6 +325,16 @@ export async function manageTaskProtection(): Promise<void> {
     logger.info('Task protection disabled - no active jobs');
     console.log('🛡️ Task protection disabled - no active jobs');
   }
+}
+
+// Allow external modules (poller) to opportunistically renew protection in on-demand mode
+export async function bumpProtectionIfOnDemand(): Promise<void> {
+  await ensureEcsIdentity();
+  if (!isECSDeployment) return;
+  if (isSpotCapacity()) return; // no-op on spot
+  try {
+    await enableTaskProtection(60);
+  } catch {}
 }
 
 // Serve static files from downloads directory
@@ -541,9 +530,8 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       if (metadata.duration) {
         const durationMinutes = metadata.duration / 60;
         logger.info(`Video duration: ${durationMinutes.toFixed(1)} minutes`);
-        
         // Skip videos that are too short (less than 20 minutes) unless whitelisted
-        if (metadata.duration < 15 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
+        if (metadata.duration < 15 * 60) {
           job.status = 'completed';
           job.error = `Video duration is too short (${durationMinutes.toFixed(1)} minutes, minimum 20 minutes required)`;
           job.completedAt = new Date();
@@ -551,7 +539,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'TooShort' }]);
           return;
         }
-
         // For videos between 15-30 minutes, must be whitelisted
         if (metadata.duration >= 15 * 60 && metadata.duration < 30 * 60 && !inWhiteList(metadata.title, metadata.channel_id)) {
           job.status = 'completed';
@@ -561,7 +548,6 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
           await emitMetric(METRICS.NAMES.EPISODE_SKIPPED, 1, [{ Name: 'Reason', Value: 'NotWhitelisted' }]);
           return;
         }
-        
         // Videos 30+ minutes or whitelisted videos 20+ minutes can proceed
         logger.info(`Video meets duration requirements, proceeding with download`);
       } else {
@@ -753,10 +739,10 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
       }
 
     } catch (downloadError: any) {
-  console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
+      console.error(`Job ${jobId}: Download and merge failed:`, downloadError);
       logger.error(`yt-dlp operation failed for job ${jobId} - server protected, abandoning job`, downloadError);
-  // Emit fatal metric & schedule shutdown
-  triggerYtdlpFatal(downloadError?.message || String(downloadError), { existingEpisode: false }).catch(()=>{});
+      // Emit fatal metric & schedule shutdown
+      triggerYtdlpFatal(downloadError?.message || String(downloadError), { existingEpisode: false }).catch(()=>{});
       
       const errorJobState = downloadJobs.get(jobId);
       if (errorJobState) {
@@ -811,7 +797,7 @@ export async function processDownload(jobId: string, url: string, sqsJobMessage?
     
     // Check and manage task protection after critical failure
     await manageTaskProtection();
-  triggerYtdlpFatal(error?.message || String(error), { existingEpisode: false }).catch(()=>{});
+    triggerYtdlpFatal(error?.message || String(error), { existingEpisode: false }).catch(()=>{});
   }
 }
 
@@ -836,6 +822,7 @@ app.get('/health', (req: Request, res: Response) => {
     sqsEnabled: isSQSEnabled,
     rdsEnabled: isRDSEnabled,
     ecsDeployment: isECSDeployment,
+  fargateCapacity: fargateCapacityMode,
     activeJobs: activeJobs.length,
     taskProtectionActive: isECSDeployment && activeJobs.length > 0,
     taskProtectionMonitoring: isECSDeployment && taskProtectionTimeout !== null,
@@ -1006,6 +993,7 @@ app.get('/', (req: Request, res: Response) => {
       'SQS Queue': isSQSEnabled ? 'Enabled' : 'Disabled',
       'RDS Storage': isRDSEnabled ? 'Enabled (PostgreSQL)' : 'Disabled',
       'ECS Task Protection': isECSDeployment ? 'Enabled' : 'Disabled',
+  'Fargate Capacity': fargateCapacityMode,
       'Shutdown Protection': allowShutdown ? 'Disabled (can shutdown)' : 'Enabled (protected)',
       'yt-dlp Error Protection': 'Enabled (server protected from tool failures)',
       'Job Isolation': 'Enabled (individual job failures do not crash server)',
@@ -1053,9 +1041,47 @@ async function startServer(): Promise<void> {
       console.log(`ℹ️ yt-dlp is already up to date (${useNightly ? 'nightly' : 'stable'}) or update was not needed`);
     }
     
-    // Periodic update checks disabled for cloud deployment
-    // Updates will be handled via container orchestration or manual API calls
-    console.log('⏸️ Periodic update checks are disabled for cloud deployment');
+    // Enable periodic yt-dlp update checks for cloud deployment (every 24 hours)
+    try {
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const attemptPeriodicUpdate = async () => {
+        try {
+          // Skip if jobs are active to avoid interference
+          const activeJobs = Array.from(downloadJobs.values()).some(job =>
+            job.status === 'pending' ||
+            job.status === 'downloading_metadata' ||
+            job.status === 'extracting_guests' ||
+            job.status === 'downloading' ||
+            job.status === 'merging'
+          );
+          let pollerActiveCount = 0;
+          try {
+            const poller = await import('./sqsPoller.js');
+            pollerActiveCount = poller?.jobTracker?.count || 0;
+          } catch {}
+
+          if (activeJobs || pollerActiveCount > 0) {
+            logger.info('⏭️ Skipping periodic yt-dlp update: jobs are active', { pollerActiveCount });
+            return;
+          }
+
+          console.log('🔁 Running periodic yt-dlp update check...');
+          const wasUpdated = await checkAndUpdateYtdlp({ useNightly });
+          if (wasUpdated) {
+            console.log('✅ Periodic yt-dlp update applied');
+          } else {
+            console.log('ℹ️ yt-dlp already up to date (periodic check)');
+          }
+        } catch (e: any) {
+          console.error('⚠️ Periodic yt-dlp update failed:', e?.message || e);
+        }
+      };
+
+      ytDlpUpdateInterval = setInterval(() => { attemptPeriodicUpdate(); }, DAY_MS);
+      console.log('⏲️ Periodic yt-dlp update checks enabled (every 24 hours)');
+    } catch (e: any) {
+      console.warn('⚠️ Failed to initialize periodic yt-dlp update checks:', e?.message || e);
+    }
     
     // Start the server
   const server = app.listen(PORT, async () => {
@@ -1068,6 +1094,7 @@ async function startServer(): Promise<void> {
       console.log(`🌙 Using ${useNightly ? 'nightly' : 'stable'} yt-dlp builds`);
       console.log(`🎧 Podcast Conversion: ${isPodcastConversionEnabled ? 'Enabled' : 'Disabled'}`);
       console.log(`🛡️ ECS Task Protection: ${isECSDeployment ? 'Enabled' : 'Disabled'}`);
+  console.log(`⚙️ Fargate Capacity: ${fargateCapacityMode || 'unknown'}`);
       console.log(`🔒 Shutdown Protection: Enabled (use API endpoints to shutdown)`);
       
       // Log CPU utilization configuration
@@ -1125,6 +1152,10 @@ async function startServer(): Promise<void> {
       if (taskProtectionTimeout) {
         clearTimeout(taskProtectionTimeout);
       }
+      if (ytDlpUpdateInterval) {
+        clearInterval(ytDlpUpdateInterval);
+        ytDlpUpdateInterval = null;
+      }
       await disableTaskProtection();
       await rdsService.closeClient(); // Close RDS connection
       server.close();
@@ -1132,9 +1163,34 @@ async function startServer(): Promise<void> {
     });
     
     process.on('SIGTERM', async () => {
+      // If capacity is SPOT, treat as interrupt: drain quickly and requeue, then exit.
+      if (isSpotCapacity()) {
+        console.log('🔔 SIGTERM received on Fargate SPOT. Requeuing in-flight messages immediately, then exiting.');
+        try {
+          const { requeueAllInFlightAndStop } = await import('./sqsPoller.js');
+          const vis = parseInt(process.env.SPOT_REQUEUE_VISIBILITY_SECONDS || '5', 10);
+          await requeueAllInFlightAndStop(vis);
+        } catch (e: any) {
+          console.warn('Failed to requeue SQS messages on SPOT SIGTERM:', e?.message || e);
+        }
+        if (taskProtectionTimeout) {
+          clearTimeout(taskProtectionTimeout);
+        }
+        if (ytDlpUpdateInterval) {
+          clearInterval(ytDlpUpdateInterval);
+          ytDlpUpdateInterval = null;
+        }
+        try { await disableTaskProtection(); } catch {}
+        try { await rdsService.closeClient(); } catch {}
+        server.close();
+        process.exit(0);
+      }
+
+      // On-demand capacity
       if (!allowShutdown) {
-        console.log('🛡️ SIGTERM received. Starting graceful drain (shutdown protected).');
-        // Even when protected, begin draining to be resilient against ECS SIGKILL
+        console.log('🛡️ SIGTERM received (on-demand). Starting graceful drain; shutdown is protected.');
+        // For on-demand, keep task protection active while draining; bump protection window
+        try { await enableTaskProtection(60); } catch {}
         try {
           const { requestPollerShutdown } = await import('./sqsPoller.js');
           const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
@@ -1142,11 +1198,11 @@ async function startServer(): Promise<void> {
         } catch (e: any) {
           console.warn('Failed to drain SQS poller on protected SIGTERM:', e?.message || e);
         }
-        return; // Keep process alive; orchestrator may force-stop after timeout
+        return; // Keep running; orchestrator won't kill protected on-demand tasks
       }
-      
+
+      // Explicitly allowed shutdown
       console.log('SIGTERM received, shutting down server...');
-      // Drain SQS poller first
       try {
         const { requestPollerShutdown } = await import('./sqsPoller.js');
         const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
@@ -1156,6 +1212,10 @@ async function startServer(): Promise<void> {
       }
       if (taskProtectionTimeout) {
         clearTimeout(taskProtectionTimeout);
+      }
+      if (ytDlpUpdateInterval) {
+        clearInterval(ytDlpUpdateInterval);
+        ytDlpUpdateInterval = null;
       }
       await disableTaskProtection();
       await rdsService.closeClient(); // Close RDS connection

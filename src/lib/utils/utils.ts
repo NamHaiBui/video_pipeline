@@ -309,9 +309,28 @@ export function getThumbnailUrl(metadata: VideoMetadata): string {
 }
 
 export function inWhiteList(title: string, uploader: string): boolean {
-  //TODO: Change this to a config file or database in the future 
-    const whiteList: { [key: string]: string } = {
-        'UCM1guA1E-RHLO2OyfQPOkEQ':'cheeky',
-        'UCcefcZRL2oaA_uBNeo5UOWg':':'
-    }
-    return title.toLowerCase().includes(whiteList[uploader]);}
+  // TODO: Move to config or database; allow dynamic updates at runtime.
+  // Keys can be uploader IDs or names; values can be a string keyword or array of keywords.
+  const whiteList: Record<string, string | string[]> = {
+    'UCM1guA1E-RHLO2OyfQPOkEQ': 'cheeky',
+    'UCcefcZRL2oaA_uBNeo5UOWg': ':', // placeholder; ignored by min-length filter below
+  };
+
+  const titleLower = (title || '').toLowerCase();
+  const keyDirect = whiteList[uploader];
+  const keyLower = whiteList[(uploader || '').toLowerCase()];
+  let rawKeywords: string[] = [];
+
+  if (Array.isArray(keyDirect)) rawKeywords = keyDirect;
+  else if (typeof keyDirect === 'string') rawKeywords = [keyDirect];
+  else if (Array.isArray(keyLower)) rawKeywords = keyLower;
+  else if (typeof keyLower === 'string') rawKeywords = [keyLower];
+
+  // Normalize keywords: drop empty/very short placeholders and lowercase for match
+  const keywords = rawKeywords
+    .map(k => (k || '').toString().trim().toLowerCase())
+    .filter(k => k.length >= 2); // ignore 1-char placeholders like ":"
+
+  if (keywords.length === 0) return false;
+  return keywords.some(kw => titleLower.includes(kw));
+}

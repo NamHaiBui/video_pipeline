@@ -22,7 +22,6 @@ const YTDLP_ALTERNATIVE_URLS = {
   ],
   nightly: [
   'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp',
-    // Add more mirrors here if available
   ]
 };
 

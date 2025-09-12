@@ -5,41 +5,19 @@ import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import { VideoMetadata, ProgressInfo, DownloadOptions, CommandResult, SQSJobMessage } from '../types.js';
 import { S3Service, S3UploadResult, createS3ServiceFromEnv } from './s3Service.js';
-import { RDSService, SQSMessageBody, EpisodeRecord, createRDSServiceFromEnv } from './rdsService.js';
+import {SQSMessageBody, createRDSServiceFromEnv } from './rdsService.js';
 import { GuestExtractionResult } from './guestExtractionService.js';
-import { isValidYouTubeUrl } from './utils/urlUtils.js';
-import { generateAudioS3Key, generateLowerDefVideoS3Key, generateM3U8S3Key, generateThumbnailS3Key, generateVideoS3Key, getPublicUrl, getS3ArtifactBucket } from './s3KeyUtils.js';
-import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getManifestUrl, getThumbnailUrl } from './utils/utils.js';
+import { generateAudioS3Key,  generateThumbnailS3Key, generateVideoS3Key, getPublicUrl, getS3ArtifactBucket } from './s3KeyUtils.js';
+import { sanitizeFilename, sanitizeOutputTemplate, create_slug, getThumbnailUrl } from './utils/utils.js';
 import { logger } from './utils/logger.js';
-import { v4 as uuidv4 } from 'uuid';
 import { withSemaphore, diskSemaphore, httpSemaphore, computeDefaultConcurrency } from './utils/concurrency.js';
 import { ValidationService } from './validationService.js';
-import { emitValidationMetric } from './cloudwatchMetrics.js';
+import { emitValidationMetric, emitStepFailure, emitStepSuccess, emitStepDuration } from './cloudwatchMetrics.js';
 import { sendToTranscriptionQueue } from '../sqsPoller.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 type VideoQuality = '1080p' | '720p' | '480p' | '360p';
-function parseVideoDate(dateString: string): Date | null {
-  if (!dateString) return null;
-  
-  try {
-    // Handle YouTube date format (YYYYMMDD)
-    if (/^\d{8}$/.test(dateString)) {
-      const year = dateString.substring(0, 4);
-      const month = dateString.substring(4, 6);
-      const day = dateString.substring(6, 8);
-      return new Date(`${year}-${month}-${day}`);
-    }
-    
-    // Try parsing the string normally
-    const date = new Date(dateString);
-    return isNaN(date.getTime()) ? null : date;
-  } catch (error) {
-    logger.error(`Failed to parse date: ${dateString}`, error as Error);
-    return null;
-  }
-}
 
 // --- Paths to Local Binaries ---
 const BIN_DIR = path.resolve(__dirname, '..', '..', 'bin');
@@ -121,7 +99,6 @@ function ensureCookiesInOptions(options: DownloadOptions): DownloadOptions {
  */
 function prepareOutputTemplate(template: string, metadata?: VideoMetadata, useSubdirectory: boolean = true): string {
   const sanitizedTemplate = sanitizeOutputTemplate(template);
-  
   // If we have metadata and should use subdirectory structure,
   // create slugified template in podcast-title/episode-name format
   if (metadata && useSubdirectory) {
@@ -163,9 +140,6 @@ function checkBinaries(): void {
   }
 }
 
-/**
- * Get optimal audio format for podcast content - always returns MP3
- */
 /**
  * Get optimal audio format for podcast content
  */
@@ -232,10 +206,6 @@ function buildYtdlpArgs(
       resolvedPath: resolvedCookiesFile
     });
   }
-  // browserHeaders.forEach(header => {
-  //   baseArgs.push('--add-header', header);
-  // });
-  // Add additional headers if specified
   if (options.additionalHeaders) {
     options.additionalHeaders.forEach(header => {
       baseArgs.push('--add-header', header);
@@ -353,6 +323,7 @@ function executeDownloadProcess(
 export async function getVideoMetadata(videoUrl: string, options: DownloadOptions = {}): Promise<VideoMetadata> {
   checkBinaries();
   const optionsWithCookies = ensureCookiesInOptions(options);
+  const __metaStart = Date.now();
   
   let args = [
     '--dump-json',
@@ -408,10 +379,14 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
     try {
       const metadata = JSON.parse(stdout) as VideoMetadata;
       logger.info('Video metadata extracted successfully');
+      emitStepSuccess('metadata_fetch', 'yt_dlp').catch(()=>{});
+      emitStepDuration('metadata_fetch', Date.now() - __metaStart, 'yt_dlp').catch(()=>{});
       
       return metadata;
     } catch (parseError: any) {
       logger.error('Failed to parse JSON metadata', parseError, { url: videoUrl, stdout: stdout.substring(0, 200) });
+      emitStepFailure('metadata_fetch', 'ParseError', 'yt_dlp').catch(()=>{});
+      emitStepDuration('metadata_fetch', Date.now() - __metaStart, 'yt_dlp').catch(()=>{});
       throw new Error(`Failed to parse JSON metadata for ${videoUrl}. Raw output: ${stdout.substring(0, 200)}...`);
     }
   } catch (error: any) {
@@ -419,6 +394,8 @@ export async function getVideoMetadata(videoUrl: string, options: DownloadOption
     if (error.stderrContent) {
         logger.error('Detailed yt-dlp error output', undefined, { stderr: error.stderrContent });
     }
+    emitStepFailure('metadata_fetch', String(error?.code || error?.name || 'Error'), 'yt_dlp').catch(()=>{});
+    emitStepDuration('metadata_fetch', Date.now() - __metaStart, 'yt_dlp').catch(()=>{});
     throw error;
   }
 }
@@ -503,7 +480,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
                   
                   // Clean up empty directories after deleting the audio file - use podcast cleanup
                   const audioDir = path.dirname(finalPath);
-                  await cleanupEmptyPodcastDirectories(audioDir);
+                  await cleanupPath(audioDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                 } catch (deleteError) {
                   logger.warn('Failed to delete local audio file', { error: deleteError, filename: path.basename(finalPath) });
                 }
@@ -522,7 +499,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
                   
                   // Clean up empty directories after deleting the audio file - use podcast cleanup
                   const audioDir = path.dirname(finalPath);
-                  await cleanupEmptyPodcastDirectories(audioDir);
+                  await cleanupPath(audioDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                 } catch (deleteError) {
                   logger.warn('Failed to delete local audio file after failed upload', { error: deleteError, filename: path.basename(finalPath) });
                 }
@@ -533,7 +510,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
             const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
             if (shouldDeleteLocal) {
               try {
-                await cleanupPodcastFileAndDirectories(finalPath);
+                await cleanupPath(finalPath, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                 logger.info('Deleted local audio file (S3 service unavailable)', { filename: path.basename(finalPath) });
               } catch (deleteError) {
                 logger.warn('Failed to delete local audio file', { error: deleteError, filename: path.basename(finalPath) });
@@ -547,7 +524,7 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
           const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
           if (shouldDeleteLocal) {
             try {
-              await cleanupPodcastFileAndDirectories(finalPath);
+              await cleanupPath(finalPath, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
               logger.info('Deleted local audio file after S3 upload error', { filename: path.basename(finalPath) });
             } catch (deleteError) {
               logger.warn('Failed to delete local audio file after upload error', { error: deleteError, filename: path.basename(finalPath) });
@@ -556,8 +533,10 @@ export function downloadPodcastAudioWithProgress(videoUrl: string, options: Down
         }
       }
       
+      emitStepSuccess('audio_download', 'yt_dlp').catch(()=>{});
       resolve(finalPath);
     } catch (error) {
+      emitStepFailure('audio_download', String((error as any)?.code || (error as any)?.name || 'Error'), 'yt_dlp').catch(()=>{});
       reject(error);
     }
   });
@@ -588,7 +567,10 @@ export function downloadVideoNoAudioWithProgress(videoUrl: string, options: Down
     const baseArgs = buildYtdlpArgs(videoUrl, outputPathAndFilename, format, options);
 
     logger.info(`Starting video-only download for: ${videoUrl}`);
-    return executeDownloadProcess(baseArgs, options);
+    const __vStart = Date.now();
+    return executeDownloadProcess(baseArgs, options)
+      .then((res) => { emitStepSuccess('video_download', 'yt_dlp').catch(()=>{}); emitStepDuration('video_download', Date.now()-__vStart, 'yt_dlp').catch(()=>{}); return res; })
+      .catch((e) => { emitStepFailure('video_download', String(e?.code || e?.name || 'Error'), 'yt_dlp').catch(()=>{}); emitStepDuration('video_download', Date.now()-__vStart, 'yt_dlp').catch(()=>{}); throw e; });
 }
 
 /**
@@ -712,7 +694,7 @@ export function downloadAndMergeVideo(
                   try {
                     if (fs.existsSync(localVideoPath)) {
                       await fsPromises.unlink(localVideoPath);
-                      await cleanupEmptyPodcastDirectories(podcastDir);
+                      await cleanupPath(podcastDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                     }
                   } catch {}
                 }
@@ -754,7 +736,6 @@ export function downloadAndMergeVideo(
       // Create slug-based temporary filenames
       const podcastSlug = videoMetadata ? create_slug(videoMetadata.uploader || 'unknown') : 'unknown-podcast';
       const episodeSlug = videoMetadata ? create_slug(videoMetadata.title || 'untitled') : 'untitled-episode';
-      // const m3u8PlayList = await downloadContent(getManifestUrl(videoMetadata));
       const thumbnail = await downloadContent(getThumbnailUrl(videoMetadata));
       
       const timestamp = Date.now();
@@ -1046,7 +1027,10 @@ export function downloadAndMergeVideo(
       }
 
       // Merge video and audio with validation
-      await mergeVideoAudioWithValidation(tempVideoPath, tempAudioPath, finalMergedPath, options);
+  const __mergeStart = Date.now();
+  await mergeVideoAudioWithValidation(tempVideoPath, tempAudioPath, finalMergedPath, options);
+  emitStepSuccess('merge', 'ffmpeg').catch(()=>{});
+  emitStepDuration('merge', Date.now()-__mergeStart, 'ffmpeg').catch(()=>{});
 
       // Verify the merge was successful before cleaning up temp files
       if (!fs.existsSync(finalMergedPath)) {
@@ -1058,7 +1042,7 @@ export function downloadAndMergeVideo(
         throw new Error(`Merged file is empty: ${finalMergedPath}`);
       }
 
-      logger.info(`✅ Merge validation successful - file exists and has size: ${(mergedStats.size / 1024 / 1024).toFixed(2)} MB`);
+  logger.info(`✅ Merge validation successful - file exists and has size: ${(mergedStats.size / 1024 / 1024).toFixed(2)} MB`);
 
       logger.info('Cleaning up temporary files...');
       try {
@@ -1077,15 +1061,15 @@ export function downloadAndMergeVideo(
         
         if (tempVideoDir === tempAudioDir) {
           // Same directory for both files
-          await cleanupEmptyDirectories(tempVideoDir);
+          await cleanupPath(tempVideoDir);
         } else {
           // Different directories
-          await cleanupEmptyDirectories(tempVideoDir);
-          await cleanupEmptyDirectories(tempAudioDir);
+          await cleanupPath(tempVideoDir);
+          await cleanupPath(tempAudioDir);
         }
         
         // Clean up the main temp directory if it's empty
-        await cleanupEmptyDirectories(tempDir);
+        await cleanupPath(tempDir);
       } catch (cleanupError) {
         logger.warn('Warning: Failed to clean up temporary files', { error: cleanupError });
       }
@@ -1099,7 +1083,8 @@ export function downloadAndMergeVideo(
         });
       }
 
-      logger.info(`Video download and merge completed successfully: ${finalMergedPath}`);
+  logger.info(`Video download and merge completed successfully: ${finalMergedPath}`);
+  emitStepSuccess('pipeline', 'yt_dlp').catch(()=>{});
 
   let hlsMasterLink: string = '';
 
@@ -1120,6 +1105,7 @@ export function downloadAndMergeVideo(
               return reject(new Error('Failed to generate S3 key for video upload'));
             }
             const bucketName = getS3ArtifactBucket();
+            const __upStart = Date.now();
             const videoUploadResult = await s3Service.uploadFile(finalMergedPath, bucketName, videoKey);
 
             
@@ -1137,19 +1123,21 @@ export function downloadAndMergeVideo(
                   });
                   logger.info(`✅ Episode ${episodeId} updated with video S3 URL in additionalData`);
 
-                  try {
+          try {
                     const metaForHls = videoMetadata || await getVideoMetadata(videoUrl);
                     const originalQuality: 1080 | 720 = videoDefinition === '1080' ? 1080 : 720;
                     const bucketName = getS3ArtifactBucket();
-                    const renditionResult = await withRetry(
+            const __hlsStart = Date.now();
+            const renditionResult = await withRetry(
                       () => renderingLowerDefinitionVersions(finalMergedPath, metaForHls, originalQuality, s3Service, bucketName),
                       3,
                       2000,
                       2
                     );
+            emitStepSuccess('hls_render', 'ffmpeg').catch(()=>{});
+            emitStepDuration('hls_render', Date.now()-__hlsStart, 'ffmpeg').catch(()=>{});
                     hlsMasterLink = renditionResult.masterPlaylists3Link || '';
                     if (hlsMasterLink) {
-                      // Store master_m3u8, mark processingDone immediately, and set isSynced false for downstream sync
                       await rdsService.updateEpisode(episodeId, {
                         additionalData: { master_m3u8: hlsMasterLink },
                         processingDone: true,
@@ -1162,6 +1150,7 @@ export function downloadAndMergeVideo(
                     }
                   } catch (renditionError: any) {
                     logger.error('❌ HLS rendering/upload failed (post-upload phase):', renditionError?.message || renditionError);
+                    emitStepFailure('hls_render', String(renditionError?.code || renditionError?.name || 'Error'), 'ffmpeg').catch(()=>{});
                   }
 
                   // Independent validation: RDS + S3 existence checks
@@ -1200,7 +1189,7 @@ export function downloadAndMergeVideo(
                   logger.info(`🗑️ Deleted local video file after S3 upload: ${path.basename(finalMergedPath)}`);
                   
                   const videoDir = path.dirname(finalMergedPath);
-                  await cleanupEmptyPodcastDirectories(videoDir);
+                  await cleanupPath(videoDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                 } catch (deleteError) {
                   logger.warn(`⚠️ Failed to delete local video file: ${deleteError}`);
                 }
@@ -1215,23 +1204,24 @@ export function downloadAndMergeVideo(
                   await s3Service.deleteLocalFile(finalMergedPath);
                   logger.info(`🗑️ Deleted local video file after failed S3 upload: ${path.basename(finalMergedPath)}`);
                   const videoDir = path.dirname(finalMergedPath);
-                  await cleanupEmptyPodcastDirectories(videoDir);
+                  await cleanupPath(videoDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
                 } catch (deleteError) {
                   logger.warn(`⚠️ Failed to delete local video file after failed upload: ${deleteError}`);
                 }
               }
             }
-          } else {
+            } else {
             logger.warn('⚠️ S3 service not available; per policy, skipping HLS and aborting further processing');
             // Optionally keep or delete local; keep by default since HLS will not proceed
           }
         } catch (error: any) {
           logger.error('❌ Error during S3 video upload:', error.message);
+            emitStepFailure('s3_upload_video', String(error?.code || error?.name || 'Error'), 's3').catch(()=>{});
           // Clean up local file if S3 upload was requested but failed
           const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
           if (shouldDeleteLocal) {
             try {
-              await cleanupPodcastFileAndDirectories(finalMergedPath);
+              await cleanupPath(finalMergedPath, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
               logger.info(`🗑️ Deleted local video file after S3 upload error: ${path.basename(finalMergedPath)}`);
             } catch (deleteError) {
               logger.warn(`⚠️ Failed to delete local video file after upload error: ${deleteError}`);
@@ -1248,21 +1238,23 @@ export function downloadAndMergeVideo(
 
     } catch (error: any) {
       logger.error(`Error during download and merge process: ${error.message}`);
+      const errName = error?.code || error?.name || 'Error';
+      emitStepFailure('pipeline', String(errName), 'yt_dlp').catch(()=>{});
       
       // Clean up temp files on error
       try {
         if (tempVideoPath && fs.existsSync(tempVideoPath)) {
-          await cleanupFileAndDirectories(tempVideoPath, tempDir);
+          await cleanupPath(tempVideoPath, { stopAtRoot: tempDir });
           logger.info('🗑️ Cleaned up temporary video file after error');
         }
         if (tempAudioPath && fs.existsSync(tempAudioPath)) {
-          await cleanupFileAndDirectories(tempAudioPath, tempDir);
+          await cleanupPath(tempAudioPath, { stopAtRoot: tempDir });
           logger.info('🗑️ Cleaned up temporary audio file after error');
         }
         
         // Clean up final merged file if it was created but process failed later
         if (finalMergedPath && fs.existsSync(finalMergedPath)) {
-          await cleanupPodcastFileAndDirectories(finalMergedPath);
+          await cleanupPath(finalMergedPath, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
           logger.info('🗑️ Cleaned up partial merged file after error');
         }
         
@@ -1272,26 +1264,26 @@ export function downloadAndMergeVideo(
           const tempAudioDir = path.dirname(tempAudioPath);
           
           if (tempVideoDir === tempAudioDir) {
-            await cleanupEmptyDirectories(tempVideoDir);
+            await cleanupPath(tempVideoDir);
           } else {
-            await cleanupEmptyDirectories(tempVideoDir);
-            await cleanupEmptyDirectories(tempAudioDir);
+            await cleanupPath(tempVideoDir);
+            await cleanupPath(tempAudioDir);
           }
         }
         
         // Clean up final merged file directory if it exists
         if (finalMergedPath) {
           const finalVideoDir = path.dirname(finalMergedPath);
-          await cleanupEmptyPodcastDirectories(finalVideoDir);
+          await cleanupPath(finalVideoDir, { stopAtRoot: path.dirname(DEFAULT_OUTPUT_DIR), logContext: 'podcast' });
         }
         
         // Clean up the main temp directory if it's empty
-        await cleanupEmptyDirectories(tempDir);
+        await cleanupPath(tempDir);
       } catch (cleanupError) {
         logger.warn('Warning: Failed to clean up temporary files after error', { error: cleanupError });
       }
       
-      reject(error);
+  reject(error);
     }
   });
 }
@@ -1440,100 +1432,80 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
 }
 
 /**
- * Recursively clean up empty directories
+ * Unified cleanup internals
+ * removeEmptyDirsUpwards: remove dir if empty, then walk up until stopAtRoot (exclusive)
  */
-async function cleanupEmptyDirectories(dirPath: string, stopAtRoot: string = DEFAULT_OUTPUT_DIR): Promise<void> {
+async function removeEmptyDirsUpwards(dirPath: string, stopAtRoot: string = DEFAULT_OUTPUT_DIR, logContext?: string): Promise<void> {
   try {
-    // Normalize paths to avoid issues with path comparison
     const normalizedDirPath = path.resolve(dirPath);
     const normalizedStopAtRoot = path.resolve(stopAtRoot);
-    
-    // Don't clean up if directory doesn't exist, is the root, or is above the root
-    if (!fs.existsSync(normalizedDirPath) || 
-        normalizedDirPath === normalizedStopAtRoot || 
+
+    // Don't operate if dir doesn't exist, is the stop root, or is outside the allowed scope
+    if (!fs.existsSync(normalizedDirPath) ||
+        normalizedDirPath === normalizedStopAtRoot ||
         !normalizedDirPath.startsWith(normalizedStopAtRoot)) {
       return;
     }
-    
-    // Get directory contents
-    const files = await fsPromises.readdir(normalizedDirPath);
-    
-    // If directory is empty, remove it
-    if (files.length === 0) {
+
+    const entries = await fsPromises.readdir(normalizedDirPath);
+    if (entries.length === 0) {
+      // Remove the empty dir
       await fsPromises.rmdir(normalizedDirPath);
-      logger.info(`🗑️ Removed empty directory: ${path.basename(normalizedDirPath)}`);
-      
-      // Recursively clean up parent directory if it's now empty
+      logger.info(`🗑️ Removed empty directory${logContext ? ` (${logContext})` : ''}: ${path.basename(normalizedDirPath)}`);
+
+      // Recurse to parent until reaching stopAtRoot
       const parentDir = path.dirname(normalizedDirPath);
       if (parentDir !== normalizedStopAtRoot && parentDir !== normalizedDirPath) {
-        await cleanupEmptyDirectories(parentDir, normalizedStopAtRoot);
+        await removeEmptyDirsUpwards(parentDir, normalizedStopAtRoot, logContext);
       }
     } else {
-      logger.debug(`Directory not empty, keeping: ${path.basename(normalizedDirPath)} (${files.length} items)`);
+      logger.debug(`Directory not empty, keeping${logContext ? ` (${logContext})` : ''}: ${path.basename(normalizedDirPath)} (${entries.length} items)`);
     }
   } catch (error: any) {
-    if (error.code === 'ENOENT') {
+    if (error?.code === 'ENOENT') {
       logger.debug(`Directory already removed: ${dirPath}`);
-    } else if (error.code === 'ENOTEMPTY') {
+    } else if (error?.code === 'ENOTEMPTY') {
+      // Race: became non-empty between readdir and rmdir
       logger.debug(`Directory not empty (race condition): ${dirPath}`);
     } else {
-      logger.warn(`Failed to clean up directory ${dirPath}:`, error.message);
+      logger.warn(`Failed to clean up directory ${dirPath}: ${error?.message || error}`);
     }
   }
 }
 
 /**
- * Clean up empty directories for podcast episodes - goes one level above podcast title
- * This allows cleanup of the podcast-title directory if all episodes are removed
+ * Unified public cleanup: accepts a file or directory and cleans up empties up to stopAtRoot
  */
-async function cleanupEmptyPodcastDirectories(dirPath: string): Promise<void> {
+async function cleanupPath(targetPath: string, options?: { stopAtRoot?: string; logContext?: string }): Promise<void> {
+  const stopAtRoot = options?.stopAtRoot ?? DEFAULT_OUTPUT_DIR;
+  const logContext = options?.logContext;
   try {
-    // For podcast cleanup, we want to go one level above the DEFAULT_OUTPUT_DIR
-    // so that if a podcast-title directory becomes empty, it gets cleaned up
-    const podcastStopAtRoot = path.dirname(DEFAULT_OUTPUT_DIR);
-    await cleanupEmptyDirectories(dirPath, podcastStopAtRoot);
+    const absTarget = path.resolve(targetPath);
+    if (!fs.existsSync(absTarget)) {
+      logger.debug(`Cleanup skipped; path does not exist${logContext ? ` (${logContext})` : ''}: ${absTarget}`);
+      return;
+    }
+
+    const stat = await fsPromises.stat(absTarget);
+    if (stat.isDirectory()) {
+      await removeEmptyDirsUpwards(absTarget, stopAtRoot, logContext);
+    } else {
+      // Delete file then clean parent directories
+      await fsPromises.unlink(absTarget);
+      logger.info(`🗑️ Deleted file${logContext ? ` (${logContext})` : ''}: ${path.basename(absTarget)}`);
+      const parentDir = path.dirname(absTarget);
+      await removeEmptyDirsUpwards(parentDir, stopAtRoot, logContext);
+    }
   } catch (error: any) {
-    logger.warn(`Failed to cleanup podcast directories for ${dirPath}:`, error.message);
+    if (error?.code === 'ENOENT') {
+      logger.debug(`Cleanup skipped; already removed: ${targetPath}`);
+    } else {
+      logger.warn(`Failed during cleanup for ${targetPath}: ${error?.message || error}`);
+    }
   }
 }
 
-/**
- * Comprehensive cleanup helper that removes files and cleans up empty directories
- */
-async function cleanupFileAndDirectories(filePath: string, stopAtRoot: string = DEFAULT_OUTPUT_DIR): Promise<void> {
-  try {
-    // First, delete the file if it exists
-    if (fs.existsSync(filePath)) {
-      await fsPromises.unlink(filePath);
-      logger.info(`🗑️ Deleted file: ${path.basename(filePath)}`);
-    }
-    
-    // Then clean up empty directories
-    const fileDir = path.dirname(filePath);
-    await cleanupEmptyDirectories(fileDir, stopAtRoot);
-  } catch (error: any) {
-    logger.warn(`Failed to cleanup file and directories for ${filePath}:`, error.message);
-  }
-}
-
-/**
- * Comprehensive cleanup helper for podcast files - uses extended cleanup range
- */
-async function cleanupPodcastFileAndDirectories(filePath: string): Promise<void> {
-  try {
-    // First, delete the file if it exists
-    if (fs.existsSync(filePath)) {
-      await fsPromises.unlink(filePath);
-      logger.info(`🗑️ Deleted podcast file: ${path.basename(filePath)}`);
-    }
-    
-    // Then clean up empty directories with extended range for podcasts
-    const fileDir = path.dirname(filePath);
-    await cleanupEmptyPodcastDirectories(fileDir);
-  } catch (error: any) {
-    logger.warn(`Failed to cleanup podcast file and directories for ${filePath}:`, error.message);
-  }
-}
+// (Deprecated wrappers removed) All cleanup is unified in cleanupPath/removeEmptyDirsUpwards
 
 
 export async function downloadContent(url: string): Promise<Buffer | null> {
@@ -1567,44 +1539,6 @@ export async function downloadContent(url: string): Promise<Buffer | null> {
     }
 }
 
-function transcodeRendition(inputPath: string, outputPath: string, resolution: VideoQuality): Promise<void> {
-  return withSemaphore(diskSemaphore, 'disk_ffmpeg_transcode', () => new Promise((resolve, reject) => {
-        const height = parseInt(resolution.replace('p', ''), 10);
-        logger.info(`Starting transcoding to ${resolution}...`);
-
-    const args = [
-            '-i', inputPath,
-            '-vf', `scale=-2:${height}`, 
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            '-y', 
-            outputPath
-        ];
-
-        const ffmpegProcess = spawn(FFMPEG_PATH, args);
-        let ffmpegError = '';
-
-        ffmpegProcess.stderr?.on('data', (data: Buffer) => {
-            ffmpegError += data.toString();
-        });
-
-        ffmpegProcess.on('error', (error: Error) => {
-            logger.error(`Failed to start ffmpeg process for ${resolution} rendition: ${error.message}`);
-            reject(error);
-        });
-
-    ffmpegProcess.on('close', (code: number | null) => {
-            if (code === 0) {
-                logger.info(`Finished transcoding to ${resolution}.`);
-                resolve();
-            } else {
-                logger.error(`ffmpeg process for ${resolution} exited with error code ${code}`);
-                logger.error(`ffmpeg error output: ${ffmpegError}`);
-                reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
-            }
-        });
-  }));
-}
 /**
  * Retry wrapper for operations that may fail due to transient issues
  * @param operation - The async operation to retry

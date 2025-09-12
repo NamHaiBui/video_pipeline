@@ -83,7 +83,7 @@ export class GuestExtractionService {
     constructor(config: Partial<GuestExtractionConfig>, rdsService?: RDSService) {
         this.config = {
             geminiBaseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
-            geminiModel: "gemini-1.5-pro",
+            geminiModel: "gemini-2.0-flash",
             geminiFlashModel: "gemini-2.5-flash",
             perplexityBaseUrl: "https://api.perplexity.ai",
             perplexityModel: "sonar",
@@ -115,15 +115,6 @@ export class GuestExtractionService {
     }
 
     // ========================= Database Functions =========================
-
-    private normalizeName(name: string): string {
-        return name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-()]/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-    }
-
     private isGuestInfoComplete(guest: any): boolean {
         // Check if all required fields are properly populated
         const hasValidName = guest.guestName && guest.guestName.trim() !== '';
@@ -483,7 +474,6 @@ private validateImageUrl(imageUrl: string): boolean {
                         imageUrl: imageInfo.url!, 
                         reason: `S3 upload failed: ${error}` 
                     });
-                    // Continue to next attempt instead of returning immediately
                 }
             } catch (error) {
                 logger.error(`Attempt ${attempt} failed with error:`, error as Error);

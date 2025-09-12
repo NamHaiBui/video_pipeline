@@ -272,7 +272,7 @@ export class RDSService {
       // Validate basic primitives when provided
       [
         'episodeTitle','episodeDescription','hostName','hostDescription','episodeUri','originalUri',
-        'contentType','country','genre','durationMillis','rssUrl','processingDone','isSynced',
+        'contentType','country','genre','durationMillis','rssUrl','processingDone',
         'transcriptUri','processedTranscriptUri','summaryAudioUri','summaryDurationMillis','summaryTranscriptUri'
       ].forEach(k => checkPrimitive(k as keyof EpisodeRecord));
 
@@ -672,6 +672,7 @@ export class RDSService {
           numRemovedChunks: 0,
           chunkingDone: false,
           quotingDone: false,
+          
         },
         additionalData: messageBody.additionalData || {},
         createdAt: new Date().toISOString(),
@@ -999,7 +1000,7 @@ export class RDSService {
       
       // First check if episode exists and lock it
       const episodeExistsQuery = `
-        SELECT "episodeId", "additionalData" 
+        SELECT "episodeId", "additionalData","isSynced" 
         FROM public."Episodes" 
         WHERE "episodeId" = $1 AND "deletedAt" IS NULL
         FOR UPDATE NOWAIT

@@ -1159,21 +1159,25 @@ export function downloadAndMergeVideo(
                       logger.warn('⚠️ HLS master link missing after upload; skipping RDS update for master_m3u8');
                     }
                   } catch (renditionError: any) {
-                    logger.error('❌ HLS rendering/upload failed (post-upload phase):', renditionError?.message || renditionError);
+                    const errObj = renditionError instanceof Error ? renditionError : undefined;
+                    logger.error('❌ HLS rendering/upload failed (post-upload phase)', errObj, {
+                      details: typeof renditionError === 'string' ? renditionError : (renditionError?.message || 'unknown'),
+                    });
                   }
 
                   // Independent validation: RDS + S3 existence checks
                   try {
                     const validation = new ValidationService(createS3ServiceFromEnv(), rdsService);
-                    const expectAdditionalData = hlsMasterLink ? ['videoLocation', 'master_m3u8'] : ['videoLocation'];
+                    const hasMaster = !!hlsMasterLink;
+                    const expectAdditionalData = hasMaster ? ['videoLocation', 'master_m3u8'] : ['videoLocation'];
                     const result = await validation.validateAfterProcessing({
                       episodeId,
                       expectAdditionalData,
                       s3Urls: [videoUploadResult.location, hlsMasterLink].filter(Boolean) as string[],
-                      validateStream: !!hlsMasterLink,
-                      requireProcessingDone: !!hlsMasterLink,
+                      validateStream: hasMaster,
+                      requireProcessingDone: hasMaster,
                       verifyContentTypeVideo: true,
-                      verifyDurationToleranceSeconds: 2
+                      verifyDurationToleranceSeconds: hasMaster ? 2 : undefined
                     });
                     if (!result.ok) {
                       logger.error('❌ Post-process validation failed', new Error('validation_failed'), { errors: result.errors });
@@ -1222,7 +1226,10 @@ export function downloadAndMergeVideo(
             // Optionally keep or delete local; keep by default since HLS will not proceed
           }
         } catch (error: any) {
-          logger.error('❌ Error during S3 video upload:', error.message);
+          const errObj = error instanceof Error ? error : undefined;
+          logger.error('❌ Error during S3 video upload', errObj, {
+            details: typeof error === 'string' ? error : (error?.message || 'unknown')
+          });
           // Clean up local file if S3 upload was requested but failed
           const shouldDeleteLocal = options.s3Upload?.deleteLocalAfterUpload !== false;
           if (shouldDeleteLocal) {
@@ -1243,7 +1250,9 @@ export function downloadAndMergeVideo(
       resolve({ mergedFilePath: finalMergedPath, episodeId });
 
     } catch (error: any) {
-      logger.error(`Error during download and merge process: ${error.message}`);
+      logger.error('Error during download and merge process', error instanceof Error ? error : undefined, {
+        details: error?.message || String(error)
+      });
       
       // Clean up temp files on error
       try {
@@ -1391,8 +1400,8 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
     });
 
     ffmpegProcess.on('error', (error: Error) => {
-      logger.error(`Failed to start ffmpeg process: ${error.message}`);
-      reject(error);
+  logger.error('Failed to start ffmpeg process', error, { message: error.message });
+  reject(error);
     });
 
     ffmpegProcess.on('close', async (code: number | null) => {
@@ -1402,15 +1411,15 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
         
         // Post-merge validation with detailed logging
         if (!fs.existsSync(outputPath)) {
-          logger.error(`❌ Merged file was not created: ${outputPath}`);
+          logger.error('❌ Merged file was not created', undefined, { outputPath });
           
           // Debug output directory contents
           const outputDir = path.dirname(outputPath);
           if (fs.existsSync(outputDir)) {
             const files = fs.readdirSync(outputDir);
-            logger.error(`Files in output directory ${outputDir}:`, undefined, { directory: outputDir, files });
+            logger.error('Files in output directory after failed merge', undefined, { directory: outputDir, files });
           } else {
-            logger.error(`Output directory does not exist: ${outputDir}`);
+            logger.error('Output directory does not exist after failed merge', undefined, { outputDir });
           }
           
           return reject(new Error(`Merged file was not created: ${outputPath}`));
@@ -1418,7 +1427,7 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
 
         const mergedStats = fs.statSync(outputPath);
         if (mergedStats.size === 0) {
-          logger.error(`❌ Merged file is empty: ${outputPath}`);
+          logger.error('❌ Merged file is empty', undefined, { outputPath });
           return reject(new Error(`Merged file is empty: ${outputPath}`));
         }
 
@@ -1427,8 +1436,8 @@ export function mergeVideoAudioWithValidation(videoPath: string, audioPath: stri
         
         resolve(outputPath);
       } else {
-        logger.error(`❌ ffmpeg process exited with error code ${code}`);
-        logger.error(`ffmpeg error output: ${ffmpegError}`);
+  logger.error('❌ ffmpeg process exited with error code', undefined, { code });
+  logger.error('ffmpeg error output', undefined, { ffmpegError });
         reject(new Error(`ffmpeg process exited with code ${code}. Error: ${ffmpegError}`));
       }
     });
@@ -1660,20 +1669,122 @@ export async function renderingLowerDefinitionVersions(
     const episodeName = sanitizeFilename(metadata.title);
     let masterPlaylists3Link = '';
 
-    const renditions = topEdition === 1080 ? 
-        [
-            { resolution: '1920x1080', bitrate: '2500k', name: '1080p' },
-            { resolution: '1280x720', bitrate: '1200k', name: '720p' },
-            { resolution: '854x480', bitrate: '700k', name: '480p' },
-            { resolution: '640x360', bitrate: '400k', name: '360p' },
-        ] : 
-        [
-            { resolution: '1280x720', bitrate: '1200k', name: '720p' },
-            { resolution: '854x480', bitrate: '700k', name: '480p' },
-            { resolution: '640x360', bitrate: '400k', name: '360p' },
-        ];
+  const renditions = topEdition === 1080 ? 
+    [
+      // { resolution: '1920x1080', bitrate: '2500k', name: '1080p' }, // temporarily disabled
+      { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+      { resolution: '854x480', bitrate: '700k', name: '480p' },
+      { resolution: '640x360', bitrate: '400k', name: '360p' },
+    ] : 
+    [
+      { resolution: '1280x720', bitrate: '1200k', name: '720p' },
+      { resolution: '854x480', bitrate: '700k', name: '480p' },
+      { resolution: '640x360', bitrate: '400k', name: '360p' },
+    ];
 
   try {
+    // Local HLS validation before upload
+    const validateLocalHls = async (baseDir: string, masterPath: string, originalDurationSec?: number, toleranceSec?: number) => {
+      const errors: string[] = [];
+      const warn = (m: string) => logger.warn(m);
+      const info = (m: string) => logger.info(m);
+
+      const readText = async (p: string) => await fsPromises.readFile(p, 'utf-8');
+      const fileExists = async (p: string) => {
+        try { await fsPromises.access(p); return true; } catch { return false; }
+      };
+
+      if (!(await fileExists(masterPath))) {
+        throw new Error(`HLS validation: master playlist missing at ${masterPath}`);
+      }
+      const masterBody = await readText(masterPath);
+      const lines = masterBody.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const variantUris: string[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.startsWith('#EXT-X-STREAM-INF')) {
+          // next non-comment line is the URI
+          let uri: string | null = null;
+          for (let j = i + 1; j < lines.length; j++) {
+            const l = lines[j];
+            if (!l || l.startsWith('#')) continue;
+            uri = l; break;
+          }
+          if (uri) variantUris.push(uri);
+        }
+      }
+      if (variantUris.length === 0) {
+        errors.push('HLS validation: no variants in master.m3u8');
+      }
+
+      // Ensure variant playlists exist
+      const masterDir = path.dirname(masterPath);
+      for (const uri of variantUris) {
+        const variantPath = path.isAbsolute(uri) ? uri : path.join(masterDir, uri);
+        if (!(await fileExists(variantPath))) {
+          errors.push(`HLS validation: variant playlist missing: ${variantPath}`);
+        } else {
+          // Basic variant check: contains at least one #EXTINF and the referenced segment(s) exist
+          try {
+            const vBody = await readText(variantPath);
+            const vLines = vBody.split(/\r?\n/).map(l => l.trim());
+            const extinfCount = vLines.filter(l => l.startsWith('#EXTINF:')).length;
+            if (extinfCount === 0) {
+              errors.push(`HLS validation: no #EXTINF entries in ${variantPath}`);
+            }
+            // Check referenced segments exist (best-effort)
+            const mediaDir = path.dirname(variantPath);
+            const segmentFiles = vLines.filter(l => l && !l.startsWith('#'));
+            // Limit to first few to avoid heavy I/O
+            for (const seg of segmentFiles.slice(0, 5)) {
+              const segPath = path.isAbsolute(seg) ? seg : path.join(mediaDir, seg);
+              if (!(await fileExists(segPath))) {
+                errors.push(`HLS validation: missing segment referenced by ${path.basename(variantPath)} -> ${seg}`);
+                break;
+              }
+            }
+          } catch (e: any) {
+            errors.push(`HLS validation: error reading variant ${variantPath}: ${e?.message || e}`);
+          }
+        }
+      }
+
+      // Optional duration check against highest-quality variant
+      const durTol = Math.max(0, toleranceSec ?? parseInt(process.env.HLS_LOCAL_DURATION_TOLERANCE_SEC || '10', 10));
+      const origSec = Math.max(0, Math.round(originalDurationSec || 0));
+      if (origSec > 0 && variantUris.length > 0) {
+        // Prefer 720p if present, else first
+        const pick = variantUris.find(u => u.includes('720p/720p.m3u8')) || variantUris[0];
+        const pickedPath = path.isAbsolute(pick) ? pick : path.join(masterDir, pick);
+        try {
+          const vBody = await readText(pickedPath);
+          let total = 0;
+          const re = /#EXTINF:([0-9]+(?:\.[0-9]+)?)/g;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(vBody)) !== null) {
+            const s = parseFloat(m[1]);
+            if (!Number.isNaN(s)) total += s;
+          }
+          const hlsSec = Math.round(total);
+          const diff = Math.abs(hlsSec - origSec);
+          if (diff > durTol) {
+            errors.push(`HLS validation: duration mismatch: HLS=${hlsSec}s vs original=${origSec}s (diff ${diff}s > ${durTol}s)`);
+          } else {
+            info(`HLS validation: duration OK (HLS=${hlsSec}s, original=${origSec}s, diff=${diff}s <= ${durTol}s)`);
+          }
+        } catch (e: any) {
+          warn(`HLS validation: duration check skipped due to error reading ${pickedPath}: ${e?.message || e}`);
+        }
+      } else if (origSec === 0) {
+        warn('HLS validation: original duration unavailable; skipping duration check');
+      }
+
+      if (errors.length) {
+        logger.error('❌ Local HLS validation failed; aborting upload', undefined, { errors });
+        throw new Error('hls_local_validation_failed');
+      }
+      info('✅ Local HLS validation passed');
+    };
     // Helper to generate a master playlist if FFmpeg doesn't
     const ensureMasterPlaylist = async () => {
       const masterPath = path.join(outputDir, 'master.m3u8');
@@ -1831,33 +1942,61 @@ export async function renderingLowerDefinitionVersions(
             }
         };
         
-        await withRetry(executeFFmpegWithFallback, 1, 1500, 2);
+      await withRetry(executeFFmpegWithFallback, 1, 1500, 2);
     logger.info('✅ All renditions transcoded successfully in a single run.');
-    await ensureMasterPlaylist();
+      const masterPathLocal = await ensureMasterPlaylist();
+
+      // Validate locally before uploading to S3
+      const originalDurationSec = Number.isFinite(metadata?.duration as any) ? (metadata.duration as any as number) : 0;
+      await validateLocalHls(outputDir, masterPathLocal, originalDurationSec);
 
     // Conditionally upload to S3 if available; otherwise, skip upload and return empty link
-    const masterPathLocal = path.join(outputDir, 'master.m3u8');
-    try {
-      await fsPromises.access(masterPathLocal);
-      logger.info('🧾 master.m3u8 present; proceeding to upload step');
-    } catch {
-      logger.warn('⚠️ master.m3u8 still not found before upload; upload (if any) will proceed but playback may fail');
-    }
+  // masterPathLocal is already validated above
+  logger.info('🧾 master.m3u8 validated; proceeding to upload step');
 
     if (s3Service && bucketName) {
       logger.info(`☁️ Uploading HLS files to S3 bucket: ${bucketName}...`);
-      const filesToUpload = await fsPromises.readdir(outputDir, { recursive: true });
+      // Recursively list all files in outputDir
+      const listFilesRecursive = async (baseDir: string): Promise<string[]> => {
+        const out: string[] = [];
+        const walk = async (current: string, relBase = '') => {
+          const entries = await fsPromises.readdir(current, { withFileTypes: true } as any);
+          for (const entry of entries as any[]) {
+            const rel = relBase ? path.posix.join(relBase, entry.name) : entry.name;
+            const abs = path.join(current, entry.name);
+            if (entry.isDirectory && entry.isDirectory()) {
+              await walk(abs, rel);
+            } else {
+              out.push(rel.replace(/\\/g, '/'));
+            }
+          }
+        };
+        await walk(baseDir);
+        return out;
+      };
 
-      const uploadPromises = filesToUpload.map(async (relativeFilePath: string) => {
-        const filePath = path.join(outputDir, relativeFilePath);
-        const fileStat = await fsPromises.stat(filePath);
-        if (fileStat.isFile()) {
-          const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath.replace(/\\/g, '/')}`;
-          return withRetry(() => s3Service.uploadFile(filePath, bucketName, s3Key), 2, 1000, 2);
+      const filesToUpload = await listFilesRecursive(outputDir);
+      if (!filesToUpload.length) {
+        logger.warn('⚠️ No HLS files found to upload');
+      }
+
+      const errors: Array<{ file: string; error: string }> = [];
+      await Promise.all(filesToUpload.map(async (relativeFilePath: string) => {
+        try {
+          const filePath = path.join(outputDir, relativeFilePath);
+          const fileStat = await fsPromises.stat(filePath);
+          if (!fileStat.isFile()) return;
+          const s3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/${relativeFilePath}`;
+          await withRetry(() => s3Service.uploadFile(filePath, bucketName, s3Key), 2, 1000, 2);
+        } catch (e: any) {
+          errors.push({ file: relativeFilePath, error: e?.message || String(e) });
         }
-      });
+      }));
 
-      await Promise.all(uploadPromises.filter(p => p));
+      if (errors.length) {
+        logger.error('❌ Some HLS files failed to upload', undefined, { errors });
+        throw new Error(`hls_upload_partial_failure: ${errors.length} file(s) failed`);
+      }
       logger.info('✅ All HLS files uploaded successfully.');
 
       const masterPlaylistS3Key = `${create_slug(metadata.uploader)}/${create_slug(episodeName)}/original/video_stream/master.m3u8`;

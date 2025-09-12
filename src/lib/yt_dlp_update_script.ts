@@ -46,7 +46,6 @@ async function main() {
     }
   } catch (error: any) {
     console.error('💥 Fatal error during update check:', error.message);
-    
     // Provide helpful suggestions based on error type
     if (error.message.includes('503') || error.message.includes('Service Unavailable')) {
       console.log('💡 GitHub API appears to be unavailable. Try again later or use --skip-version-check');

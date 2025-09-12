@@ -325,13 +325,17 @@ export interface AnalysisConfig {
  * Processing information for episodes matching the new RDS schema
  */
 export interface EpisodeProcessingInfo {
+  num_quotes: number;
+  num_chunks: number;
+  quotingDone: boolean;
+  chunkingDone: boolean;
+  summarizingDone: boolean;
+  audioQuotingDone: boolean;
+  videoQuotingDone: boolean;
+  audioChunkingDone: boolean;
+  videoChunkingDone: boolean;
   episodeTranscribingDone: boolean;
   summaryTranscribingDone: boolean;
-  summarizingDone: boolean;
-  numChunks: number;
-  numRemovedChunks: number;
-  chunkingDone: boolean;
-  quotingDone: boolean;
 }
 
 /**

@@ -1080,8 +1080,18 @@ async function startServer(): Promise<void> {
     // Setup graceful shutdown with protection against external signals
     process.on('SIGINT', async () => {
       if (!allowShutdown) {
-        console.log('🛡️ SIGINT received but shutdown is protected - ignoring external signal');
+        console.log('🛡️ SIGINT received. Starting graceful drain (shutdown protected).');
+        // Maintain/extend task protection while draining if any jobs are running
+        try { await manageTaskProtection(); } catch {}
         console.log('💡 Use the shutdown API endpoint or internal shutdown functions to terminate');
+        // Begin draining SQS poller to reduce risk of abrupt termination
+        try {
+          const { requestPollerShutdown } = await import('./sqsPoller.js');
+          const grace = parseInt(process.env.SHUTDOWN_GRACE_MS || '180000', 10);
+          await requestPollerShutdown(grace);
+        } catch (e: any) {
+          console.warn('Failed to drain SQS poller on protected SIGINT:', e?.message || e);
+        }
         return;
       }
       
@@ -1106,6 +1116,8 @@ async function startServer(): Promise<void> {
     process.on('SIGTERM', async () => {
       if (!allowShutdown) {
         console.log('🛡️ SIGTERM received. Starting graceful drain (shutdown protected).');
+        // Maintain/extend task protection while draining if any jobs are running
+        try { await manageTaskProtection(); } catch {}
         // Even when protected, begin draining to be resilient against ECS SIGKILL
         try {
           const { requestPollerShutdown } = await import('./sqsPoller.js');

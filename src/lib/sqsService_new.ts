@@ -132,7 +132,20 @@ export class SQSService {
       });
       await this.client.send(command);
     } catch (error: any) {
-      logger.error(`Failed to change message visibility: ${error.message}`, undefined, { error });
+      const msg = (error?.message || '').toString();
+      const name = (error?.name || '').toString();
+      const terminal = name === 'InvalidParameterValue'
+        || msg.includes('ReceiptHandle is invalid')
+        || msg.includes('Message does not exist')
+        || msg.includes('not available for visibility');
+      if (terminal) {
+        logger.info('Skipping SQS visibility change: message no longer available/eligible', {
+          reason: name || 'InvalidParameterValue',
+          message: msg
+        });
+        return; // swallow terminal error
+      }
+      logger.error('Failed to change message visibility', error, { message: msg });
       throw error;
     }
   }
@@ -144,6 +157,14 @@ export class SQSService {
   startVisibilityExtender(receiptHandle: string, extendEverySec = 60, extendBySec = 300): () => void {
     let stopped = false;
     let failures = 0;
+    // Fire an immediate extension to reduce race with initial visibility timeout
+    (async () => {
+      try {
+        if (!stopped) await this.changeMessageVisibility(receiptHandle, extendBySec);
+      } catch {
+        // handled inside changeMessageVisibility
+      }
+    })();
     const timer = setInterval(async () => {
       if (stopped) return;
       try {
@@ -190,7 +211,16 @@ export class SQSService {
 
       await this.client.send(command);
     } catch (error: any) {
-      logger.error(`Failed to delete SQS message: ${error.message}`, undefined, { error });
+      const msg = (error?.message || '').toString();
+      const name = (error?.name || '').toString();
+      const terminal = name === 'InvalidParameterValue'
+        || msg.includes('ReceiptHandle is invalid')
+        || msg.includes('Message does not exist');
+      if (terminal) {
+        logger.info('Skipping SQS delete: message already gone/invalid receipt handle', { message: msg });
+        return;
+      }
+      logger.error('Failed to delete SQS message', error, { message: msg });
       throw error;
     }
   }

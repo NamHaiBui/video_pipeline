@@ -223,9 +223,9 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
   jobTracker.attachMessageContext(trackingJobId, message.ReceiptHandle!, stopExtend);
   // Process new entry job async - pass the full jobData with new entry structure
   processDownload(generatedJobId, jobData.originalUri!, jobData)
-        .then(async () => {
+    .then(async () => {
           logger.info(`New entry creation ${generatedJobId} completed successfully`);
-    stopExtend();
+  try { stopExtend(); } catch {}
             if (sqsService) {
               await sqsService.deleteMessage(message.ReceiptHandle!);
             }
@@ -237,7 +237,7 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
         })
         .catch(async error => {
           logger.error(`Error processing new entry job ${generatedJobId}: ${error.message}`, undefined, { error });
-      stopExtend();
+      try { stopExtend(); } catch {}
           jobTracker.completeJob(trackingJobId);
           try { await manageTaskProtection(); } catch {}
           if (jobTracker.canAcceptMoreJobs()) {
@@ -288,21 +288,23 @@ async function handleSQSMessage(message: Message): Promise<boolean> {
   processDownload(legacyJobId, jobData.url)
       .then(async () => {
     logger.info(`Legacy download ${legacyJobId} completed successfully`);
-        stopExtend();
+        try { stopExtend(); } catch {}
         if (sqsService) {
           await sqsService.deleteMessage(message.ReceiptHandle!);
         }
   jobTracker.completeJob(legacyJobId);
-    try { await disableTaskProtection(); } catch {}
+    // Recompute protection state based on remaining jobs
+    try { await manageTaskProtection(); } catch {}
         if (jobTracker.canAcceptMoreJobs()) {
           pollSQSMessages();
         }
       })
       .catch(async error => {
     logger.error(`Error processing legacy job ${legacyJobId}: ${error.message}`, undefined, { error });
-    stopExtend();
+    try { stopExtend(); } catch {}
   jobTracker.completeJob(legacyJobId);
-  try { await disableTaskProtection(); } catch {}
+  // Recompute protection state based on remaining jobs
+  try { await manageTaskProtection(); } catch {}
         if (jobTracker.canAcceptMoreJobs()) {
           pollSQSMessages();
         }
@@ -477,6 +479,10 @@ export function startSQSPolling(): void {
       maxJobs: MAX_CONCURRENT_JOBS,
       activeJobIds: jobTracker.activeJobIds
     });
+    // Periodically extend ECS task protection if there are still active jobs
+    if (jobTracker.count > 0) {
+      manageTaskProtection().catch(() => {});
+    }
   }, 60000); // Every minute
 }
 
